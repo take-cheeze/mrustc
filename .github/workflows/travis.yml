@@ -18,7 +18,7 @@ jobs:
     - uses: actions/checkout@v2
     - name: Install packages
       run: sudo apt install g++ zlib1g-dev valgrind
-      if: startsWith(matrix.os, "ubuntu")
+      if: startsWith(matrix.os, 'ubuntu')
     - run: make RUSTCSRC
     - run: make -j$(nproc)
     - run: make -j$(nproc) -C tools/minicargo
