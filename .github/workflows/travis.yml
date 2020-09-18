@@ -1,0 +1,32 @@
+name: Travis
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  build:
+
+    runs-on: [ubuntu-18.04 ubuntu-20.04]
+
+    steps:
+    - uses: actions/checkout@v2
+    - name: Install packages
+      run: sudo apt install g++ zlib1g-dev valgrind
+    - run: make RUSTCSRC
+    - run: make -j$(nproc)
+    - run: make -j$(nproc) -C tools/minicargo
+    - run: make -j$(nproc) -C tools/mir_opt_test
+    - run: make -j$(nproc) -C tools/mir_opt_test run
+    - run: make -j$(nproc) -f minicargo.mk output/libtest.rlib      # libstd
+    - run: make test    # hello_world
+    - run: make local_tests -k
+# rustc_driver - Takes too long
+# - run: RUST_CHECK=1 make -f minicargo.mk output/rustc-build/librustc_driver.rlib
+# rustc (DISABLED: llvm build)
+# - run: make -f minicargo.mk output/rustc
+# cargo (DISABLED: why?)
+# - run: make -f minicargo.mk output/cargo
+# - run: cat output/cargo-build/cargo_dbg.txt
