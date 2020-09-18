@@ -8,13 +8,17 @@ on:
 
 jobs:
   build:
-
-    runs-on: [ubuntu-18.04, ubuntu-20.04]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-18.04, ubuntu-20.04, macos-latest]
+    runs-on: ${{ matrix.os }}
 
     steps:
     - uses: actions/checkout@v2
     - name: Install packages
       run: sudo apt install g++ zlib1g-dev valgrind
+      if: startsWith("ubuntu", ${{ matrix.os }})
     - run: make RUSTCSRC
     - run: make -j$(nproc)
     - run: make -j$(nproc) -C tools/minicargo
