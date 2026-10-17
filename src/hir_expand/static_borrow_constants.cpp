@@ -397,7 +397,16 @@ namespace static_borrow_constants {
             {
             case StaticTraitResolve::ValuePtr::TAG_Constant:
                 if( monomorphise_path_needed(node.m_path) ) {
-                    DEBUG("Constant path is still generic, can't transform into a `static`");
+                    // A generic constant (e.g. `Owned::<T>::VTABLE`) is promotable when its type is
+                    // concrete enough to be checked: any generic type is `Fuzzy` for interior mutability
+                    // and for drop glue, so it is not promoted. The `extract_node` call in the borrow
+                    // visitors keeps the generic parameters, so the promoted static is generic too.
+                    // Types with drop glue are never promoted: a promoted value is never dropped, so
+                    // `&CONST` must keep its temporary. This is type-based; rustc is value-based and also
+                    // promotes some drop types (e.g. `None::<String>`), which are rejected here.
+                    m_is_constant = !is_maybe_interior_mut(node)
+                        && !m_resolve.type_needs_drop_glue(node.span(), node.m_res_type);
+                    DEBUG(node.m_path << " (generic) m_is_constant=" << m_is_constant);
                 }
                 else {
                     m_is_constant = !is_maybe_interior_mut(node);
