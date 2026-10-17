@@ -1870,6 +1870,14 @@ namespace
             if( ! lex.consume_if(TOK_RWORD_FN) )
                 return false;
             goto fn;
+        // async [unsafe] fn
+        case TOK_RWORD_ASYNC:
+            lex.consume();
+            if(lex.next() == TOK_RWORD_UNSAFE)
+                lex.consume();
+            if( !lex.consume_if(TOK_RWORD_FN) )
+                return false;
+            goto fn;
         case TOK_RWORD_FN:
             lex.consume();
         fn:
