@@ -1324,6 +1324,9 @@ namespace MIR { namespace eval {
                 auto temp_pp_impl = impl_params_def ? impl_params_def->make_nop_params(0) : HIR::PathParams();
                 auto temp_pp_method = c.m_params.make_nop_params(1);
                 MonomorphState  temp_ms;
+                // `Self` in a trait's provided value is the type that `get_ent_fullpath` resolved
+                // the path to. Without it, `Self` is an unbound ivar, which matches every impl of the trait.
+                temp_ms.self_ty = const_ms.self_ty.clone();
                 temp_ms.pp_impl = &temp_pp_impl;
                 temp_ms.pp_method = &temp_pp_method;
                 DEBUG("- Evaluate " << p);
