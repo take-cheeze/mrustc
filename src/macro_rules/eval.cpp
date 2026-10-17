@@ -1965,9 +1965,37 @@ namespace
             if( lex.next() == TOK_INTERPOLATED_META ) {
                 lex.consume();
             }
-            else if( lex.next() == TOK_IDENT )
+            else
             {
-                lex.consume();
+                // MetaItem: SimplePath ( DelimTokenTree | `=` Expression )?
+                // SimplePath: `::`? segment (`::` segment)*
+                // (e.g. `#[::core::prelude::v1::derive(Clone)]`)
+                lex.consume_if(TOK_DOUBLE_COLON);
+                switch(lex.next())
+                {
+                case TOK_IDENT:
+                case TOK_RWORD_SELF:
+                case TOK_RWORD_SUPER:
+                case TOK_RWORD_CRATE:
+                    lex.consume();
+                    break;
+                default:
+                    return false;
+                }
+                while( lex.consume_if(TOK_DOUBLE_COLON) )
+                {
+                    switch(lex.next())
+                    {
+                    case TOK_IDENT:
+                    case TOK_RWORD_SELF:
+                    case TOK_RWORD_SUPER:
+                    case TOK_RWORD_CRATE:
+                        lex.consume();
+                        break;
+                    default:
+                        return false;
+                    }
+                }
                 switch(lex.next())
                 {
                 case TOK_PAREN_OPEN:
@@ -1978,9 +2006,6 @@ namespace
                 default:
                     break;
                 }
-            }
-            else {
-                return false;
             }
             break;
         case MacroPatEnt::PAT_ITEM:
