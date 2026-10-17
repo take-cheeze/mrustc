@@ -16,6 +16,8 @@ Every fix changes mrustc's output, so the nfcxx rewrites in `scripts/mrustc-prep
 | 5 | `f64` and `f32` mismatch in a type check: `Mismatched types - f64 and f32` (zmij 1.0.23, the float formatter of serde_json 1.0.154). | `zmij` 1.0.23 from crates.io | `src/hir/hir_ops.cpp:286` | open |
 | 6 | `No arm matched` in libc 0.2.191's `custom_struct` macro. | libc 0.2.191 (not minimised) | `src/macro_rules/eval.cpp` | open |
 | 7 | An `async fn` inside a function body is parsed as an async block: `async fn inner() {}` in a block gives `Unexpected token TOK_RWORD_FN, expected TOK_BRACE_OPEN`. Found by tokio's `wait_with_output` (`tokio/src/process/mod.rs`). | `fn outer() -> u32 { async fn inner(x: u32) -> u32 { x + 1 } 5 } fn main() { println!("{}", outer()); }` | `src/parse/expr.cpp`, statement parsing: `async [unsafe] fn` is an item, as `unsafe fn` already was | fixed in this branch (`async {` and `async move {` remain expressions) |
+| 8 | A macro item fragment that is itself a macro call, substituted into an `impl` body, is a TODO: `Parse_Impl_Item - Interpolated item into impl: MacroInv`. Found by tokio's `cfg_unstable_metrics!`. | `macro_rules! gen { () => { pub fn hi(&self) -> u32 { 9 } }; } macro_rules! mk { ($i:item) => { impl S { $i } }; } struct S; mk! { gen!(); } fn main() { println!("{}", S.hi()); }` should print `9` | `src/parse/root.cpp`, `Parse_Impl_Item`: the interpolated `MacroInv` is added as an impl macro invocation | fixed in this branch |
+| 9 | tokio 1.53.3 (`rt,sync,time,io-util`) stops with `Unspecified lifetime in outer context`, with no source location. | not minimised: the error is raised in `src/hir_conv/lifetime_elision.cpp`, `visit_lifetime`, when an elided lifetime has no enclosing parameters; it has no span, so the item is not known yet | `src/hir_conv/lifetime_elision.cpp:150` | open |
 
 Reproductions were run with rustc accepting the program (rustc 1.9x) and mrustc at the base commit.
 
@@ -29,3 +31,4 @@ Reproductions were run with rustc accepting the program (rustc 1.9x) and mrustc 
 - #3: the repro above compiled with rustc and printed `3`; the old compiler aborts with `No arm matched` and the fixed one
   prints `3`. `consume_item` had no case for `async`, so its default returned no match.
 - #7: the repro prints `7` with rustc and the fixed compiler. `unsafe` blocks, `async {}` and `async move {}` are unchanged.
+- #8: the repro prints `9` with rustc and the fixed compiler; the pinned compiler aborts with the TODO.
