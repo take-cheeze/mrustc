@@ -1741,8 +1741,14 @@ namespace {
                 dst.write_uint(state, ti.bits, res);
                 break; }
             case ::MIR::eBinOp::MUL: {
-                auto res =  ti.mask(l * r);
-                if( l != 0 && r != 0 ) {
+                // Below 128 bits the operands are under 2^64, so the product is exact in 128 bits, and it overflows the
+                // type if truncating it changes it. (A wrapped product can still be above both operands: 300 * 300 as u16.)
+                auto full = l * r;
+                auto res =  ti.mask(full);
+                if( ti.bits < 128 ) {
+                    did_overflow = full != res;
+                }
+                else if( l != 0 && r != 0 ) {
                     did_overflow = res < l || res < r;
                 }
                 if( did_overflow && saturate ) {
@@ -1830,7 +1836,15 @@ namespace {
                 break; }
             case ::MIR::eBinOp::MUL: {
                 auto res = l * r;
-                if( l != 0 && r != 0 ) {
+                if( ti.bits < 128 ) {
+                    // Below 128 bits the operands are under 2^63 in magnitude, so the product is exact in 128 bits. It
+                    // overflows the type if it is not the sign extension of its low `ti.bits` bits: -30000 * 2 as i16.
+                    // The low bits of the two's complement value (TypeInfo::mask(S128) negates a negative value instead).
+                    auto m = res.get_inner() & ((U128(1) << ti.bits) - 1u);
+                    auto ext = (m >> (ti.bits - 1)) != U128(0) ? (m | (~U128(0) << ti.bits)) : m;
+                    did_overflow = ext != res.get_inner();
+                }
+                else if( l != 0 && r != 0 ) {
                     if( res.u_abs() < l.u_abs() || res.u_abs() < r.u_abs() ) {
                         did_overflow = true;
                     }
