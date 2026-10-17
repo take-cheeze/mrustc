@@ -572,6 +572,8 @@ namespace typecheck
                 : ret_type(&ret_type), resume_type(&resume_type), yield_type(&yield_type) {}
         };
         ::std::vector<RetTarget>   closure_ret_types;
+        // The body block of the async block being visited (its output type comes from its `return`s, not from `!`)
+        const ::HIR::ExprNode*  async_body = nullptr;
 
         ::std::vector<bool> inner_coerce_enabled_stack;
 
@@ -652,9 +654,25 @@ namespace typecheck
                 auto& snp = node.m_value_node;
                 DEBUG("Block yields final value");
                 this->context.add_ivars( snp->m_res_type );
-                this->context.equate_types(snp->span(), node.m_res_type, snp->m_res_type);
-                this->context.require_sized(snp->span(), snp->m_res_type);
-                snp->visit(*this);
+                if( static_cast<const ::HIR::ExprNode*>(&node) == this->async_body )
+                {
+                    // The final value of an async body may be a `return` (or diverge): visit it first, so that a
+                    // diverging value does not force the output type to `!`
+                    this->context.require_sized(snp->span(), snp->m_res_type);
+                    snp->visit(*this);
+                    if( is_diverge(snp->m_res_type) ) {
+                        this->defer_async_output_diverge(node);
+                    }
+                    else {
+                        this->context.equate_types(snp->span(), node.m_res_type, snp->m_res_type);
+                    }
+                }
+                else
+                {
+                    this->context.equate_types(snp->span(), node.m_res_type, snp->m_res_type);
+                    this->context.require_sized(snp->span(), snp->m_res_type);
+                    snp->visit(*this);
+                }
             }
             else if( node.m_nodes.size() > 0 )
             {
@@ -688,6 +706,9 @@ namespace typecheck
                 if( defer ) {
                     DEBUG("Block final node returns _, derfer diverge check");
                     this->context.add_revisit(node);
+                }
+                else if( diverges && static_cast<const ::HIR::ExprNode*>(&node) == this->async_body ) {
+                    this->defer_async_output_diverge(node);
                 }
                 else if( diverges ) {
                     DEBUG("Block diverges, yield !");
@@ -2079,11 +2100,44 @@ namespace typecheck
             // TODO: Save/clear/restore loop labels
             auto _ = this->push_inner_coerce_scoped(true);
             this->closure_ret_types.push_back(RetTarget(node.m_code->m_res_type));
+            auto saved_async_body = this->async_body;
+            this->async_body = &*node.m_code;
             node.m_code->visit( *this );
+            this->async_body = saved_async_body;
             this->closure_ret_types.pop_back();
         }
 
     private:
+        /// The output type of an async body is `!` only if nothing else constrains it (e.g. `async { panic!() }`)
+        void defer_async_output_diverge(::HIR::ExprNode& node) {
+            struct RevisitDefaultDiverge: public Context::Revisitor {
+                HIR::ExprNode* node;
+                RevisitDefaultDiverge(HIR::ExprNode* node): node(node) {}
+                const Span& span(void) const { return node->span(); }
+                void fmt(std::ostream& os) const {
+                    os << "RevisitDefaultDiverge(" << node << ": " << node->m_res_type << ")";
+                }
+                bool revisit(Context& context, bool is_fallback) {
+                    const auto& ty = context.get_type(node->m_res_type);
+                    if(const auto* i = ty.data().opt_Infer()) {
+                        if( i->ty_class != HIR::InferClass::None ) {
+                            // Bounded ivar (integer/float literal), remove this rule.
+                            return true;
+                        }
+                        if( is_fallback ) {
+                            context.equate_types(node->span(), ty, HIR::TypeRef::new_diverge());
+                            return true;
+                        }
+                        return false;
+                    }
+                    else {
+                        return true;
+                    }
+                }
+            };
+            DEBUG("Async body diverges, yield ! if otherwise unconstrained");
+            this->context.add_revisit_adv(std::make_unique<RevisitDefaultDiverge>(&node));
+        }
         void push_traits(const ::HIR::t_trait_list& list) {
             this->m_traits.insert( this->m_traits.end(), list.begin(), list.end() );
         }
