@@ -21,7 +21,7 @@ TypeRef Parse_Type_ErasedType(TokenStream& lex, bool allow_trait_list);
 // === CODE ===
 TypeRef Parse_Type(TokenStream& lex, bool allow_trait_list)
 {
-    ProtoSpan ps = lex.start_span();
+    //ProtoSpan ps = lex.start_span();
     TypeRef rv = Parse_Type_Int(lex, allow_trait_list);
     //rv.set_span(lex.end_span(ps));
     return rv;
@@ -59,6 +59,7 @@ TypeRef Parse_Type_Int(TokenStream& lex, bool allow_trait_list)
 
     // '<' - An associated type cast
     case TOK_LT:
+    case TOK_THINARROW_LEFT:
     case TOK_DOUBLE_LT: {
         PUTBACK(tok, lex);
         auto path = Parse_Path(lex, PATH_GENERIC_TYPE);
@@ -77,26 +78,17 @@ TypeRef Parse_Type_Int(TokenStream& lex, bool allow_trait_list)
             return Parse_Type_Path(lex, hrls, true);
         }
         }
+    case TOK_RWORD_DYN: {
+        ::AST::HigherRankedBounds hrbs = Parse_HRB_Opt(lex);
+        return Parse_Type_TraitObject(lex, mv$(hrbs));
+        }
     // <ident> - Either a primitive, or a path
     case TOK_IDENT:
-        if( lex.lookahead(0) == TOK_EXCLAM )
+        // TODO: Only allow if the next token isn't `::` or `!`
+        if( TARGETVER_LEAST_1_29 && tok.ident().name == "dyn" )
         {
-            lex.getToken();
-            // TODO: path macros
-            return TypeRef(TypeRef::TagMacro(), Parse_MacroInvocation(ps, tok.istr(), lex));
-        }
-        if( TARGETVER_LEAST_1_29 && tok.istr() == "dyn" )
-        {
-            if( lex.lookahead(0) == TOK_PAREN_OPEN ) {
-                GET_TOK(tok, lex);
-                auto rv = Parse_Type_TraitObject(lex, {});
-                GET_CHECK_TOK(tok, lex, TOK_PAREN_CLOSE);
-                return rv;
-            }
-            else {
-                ::AST::HigherRankedBounds hrbs = Parse_HRB_Opt(lex);
-                return Parse_Type_TraitObject(lex, mv$(hrbs));
-            }
+            ::AST::HigherRankedBounds hrbs = Parse_HRB_Opt(lex);
+            return Parse_Type_TraitObject(lex, mv$(hrbs));
         }
         // or a primitive
         //if( auto ct = coretype_fromstring(tok.str()) )
@@ -128,7 +120,7 @@ TypeRef Parse_Type_Int(TokenStream& lex, bool allow_trait_list)
         // Reference
         tok = lex.getToken();
         if( tok.type() == TOK_LIFETIME ) {
-            lifetime = AST::LifetimeRef(/*lex.point_span(), */lex.get_ident(::std::move(tok)));
+            lifetime = AST::LifetimeRef(/*lex.point_span(), */tok.ident());
             tok = lex.getToken();
         }
         bool is_mut = false;
@@ -160,10 +152,17 @@ TypeRef Parse_Type_Int(TokenStream& lex, bool allow_trait_list)
         // Array
         TypeRef inner = Parse_Type(lex);
         if( GET_TOK(tok, lex)  == TOK_SEMICOLON ) {
-            // Sized array
-            AST::Expr array_size = Parse_Expr(lex);
-            GET_CHECK_TOK(tok, lex, TOK_SQUARE_CLOSE);
-            return TypeRef(TypeRef::TagSizedArray(), lex.end_span(ps), mv$(inner), array_size.take_node());
+            // Inferred size - unspecified
+            if( lex.getTokenIf(TOK_UNDERSCORE) ) {
+                GET_CHECK_TOK(tok, lex, TOK_SQUARE_CLOSE);
+                return TypeRef(TypeRef::TagSizedArray(), lex.end_span(ps), mv$(inner), nullptr);
+            }
+            else {
+                // Sized array
+                AST::Expr array_size = Parse_Expr(lex);
+                GET_CHECK_TOK(tok, lex, TOK_SQUARE_CLOSE);
+                return TypeRef(TypeRef::TagSizedArray(), lex.end_span(ps), mv$(inner), array_size.take_node());
+            }
         }
         else if( tok.type() == TOK_SQUARE_CLOSE )
         {
@@ -286,7 +285,12 @@ TypeRef Parse_Type_Path(TokenStream& lex, ::AST::HigherRankedBounds hrbs, bool a
     auto ps = lex.start_span();
 
     auto path = Parse_Path(lex, PATH_GENERIC_TYPE);
-    if( hrbs.empty() && !allow_trait_list )
+    if( lex.lookahead(0) == TOK_EXCLAM )
+    {
+        GET_CHECK_TOK(tok, lex, TOK_EXCLAM);
+        return TypeRef(TypeRef::TagMacro(), Parse_MacroInvocation(ps, path, lex));
+    }
+    else if( hrbs.empty() && !allow_trait_list )
     {
         return TypeRef(TypeRef::TagPath(), lex.end_span(ps), mv$(path));
     }
@@ -299,11 +303,10 @@ TypeRef Parse_Type_Path(TokenStream& lex, ::AST::HigherRankedBounds hrbs, bool a
 
         if( allow_trait_list )
         {
-            while( GET_TOK(tok, lex) == TOK_PLUS )
+            while( lex.getTokenIf(TOK_PLUS) )
             {
-                if( LOOK_AHEAD(lex) == TOK_LIFETIME ) {
-                    GET_TOK(tok, lex);
-                    lifetimes.push_back(AST::LifetimeRef( /*lex.point_span(),*/ lex.get_ident(mv$(tok)) ));
+                if( lex.getTokenIf(TOK_LIFETIME, tok) ) {
+                    lifetimes.push_back(AST::LifetimeRef( /*lex.point_span(),*/ tok.ident() ));
                 }
                 else
                 {
@@ -314,7 +317,6 @@ TypeRef Parse_Type_Path(TokenStream& lex, ::AST::HigherRankedBounds hrbs, bool a
                     traits.push_back({ mv$(hrbs), Parse_Path(lex, PATH_GENERIC_TYPE) });
                 }
             }
-            PUTBACK(tok, lex);
         }
 
         if( !traits[0].hrbs.empty() || traits.size() > 1 || lifetimes.size() > 0 )
@@ -325,7 +327,7 @@ TypeRef Parse_Type_Path(TokenStream& lex, ::AST::HigherRankedBounds hrbs, bool a
         }
         else
         {
-            return TypeRef(TypeRef::TagPath(), lex.end_span(ps), mv$(traits.at(0).path));
+            return TypeRef(TypeRef::TagPath(), lex.end_span(ps), mv$(*traits.at(0).path));
         }
     }
 }
@@ -337,27 +339,42 @@ TypeRef Parse_Type_TraitObject(TokenStream& lex, ::AST::HigherRankedBounds hrbs)
     ::std::vector<Type_TraitPath>   traits;
     ::std::vector<AST::LifetimeRef> lifetimes;
 
-    traits.push_back(Type_TraitPath { mv$(hrbs), Parse_Path(lex, PATH_GENERIC_TYPE) });
-
-    while( lex.lookahead(0) == TOK_PLUS )
+    for( ;; )
     {
-        GET_CHECK_TOK(tok, lex, TOK_PLUS);
+        bool is_first = traits.empty() && lifetimes.empty();
         if( LOOK_AHEAD(lex) == TOK_LIFETIME ) {
             GET_TOK(tok, lex);
-            lifetimes.push_back(AST::LifetimeRef( /*lex.point_span(),*/ lex.get_ident(mv$(tok)) ));
+
+            if( is_first && !hrbs.empty() ) {
+                // TODO: Error
+            }
+
+            lifetimes.push_back(AST::LifetimeRef( /*lex.point_span(),*/ tok.ident() ));
         }
         else
         {
-            if( lex.lookahead(0) == TOK_RWORD_FOR )
-            {
+            if( lex.getTokenIf(TOK_RWORD_FOR) ) {
                 hrbs = Parse_HRB(lex);
             }
+            else {
+            }
+
+            bool is_paren = lex.getTokenIf(TOK_PAREN_OPEN);
+
             traits.push_back({ mv$(hrbs), Parse_Path(lex, PATH_GENERIC_TYPE) });
+
+            if( is_paren ) {
+                GET_CHECK_TOK(tok, lex, TOK_PAREN_CLOSE);
+            }
         }
+
+        if( !lex.getTokenIf(TOK_PLUS) )
+            break;
     }
 
-    if( lifetimes.empty())
+    if( lifetimes.empty() ) {
         lifetimes.push_back(AST::LifetimeRef());
+    }
     return TypeRef(lex.end_span(ps), mv$(traits), mv$(lifetimes));
 }
 TypeRef Parse_Type_ErasedType(TokenStream& lex, bool allow_trait_list)
@@ -365,21 +382,41 @@ TypeRef Parse_Type_ErasedType(TokenStream& lex, bool allow_trait_list)
     Token   tok;
 
     auto ps = lex.start_span();
-    ::std::vector<Type_TraitPath>   traits;
-    ::std::vector<AST::LifetimeRef>   lifetimes;
+    Type_ErasedType   rv_data;
+    rv_data.is_edition_2024_or_later = lex.edition_after(AST::Edition::Rust2024);
     do {
-        if( LOOK_AHEAD(lex) == TOK_LIFETIME ) {
-            GET_TOK(tok, lex);
-            lifetimes.push_back(AST::LifetimeRef( /*lex.point_span(),*/ lex.get_ident(mv$(tok)) ));
+        if( lex.getTokenIf(TOK_LIFETIME, tok) ) {
+            rv_data.lifetimes.push_back(AST::LifetimeRef( /*lex.point_span(),*/ tok.ident() ));
+        }
+        else if( lex.getTokenIf(TOK_QMARK) ) {
+            AST::HigherRankedBounds hrbs = Parse_HRB_Opt(lex);
+            rv_data.maybe_traits.push_back({ mv$(hrbs), Parse_Path(lex, PATH_GENERIC_TYPE) });
+        }
+        else if( lex.getTokenIf(TOK_PAREN_OPEN) )
+        {
+            AST::HigherRankedBounds hrbs = Parse_HRB_Opt(lex);
+            rv_data.traits.push_back({ mv$(hrbs), Parse_Path(lex, PATH_GENERIC_TYPE) });
+            lex.getTokenCheck(TOK_PAREN_CLOSE);
+        }
+        else if( lex.getTokenIf(TOK_RWORD_USE) ) {
+            lex.getTokenCheck(TOK_LT);
+            if( rv_data.use ) {
+                ERROR(lex.point_span(), E0000, "Multiple `use` seen in erased type");
+            }
+            rv_data.use.reset(new ::AST::PathParams(Parse_Path_GenericList(lex)));
         }
         else
         {
+            if( lex.getTokenIf(TOK_TILDE) ) {
+                GET_CHECK_TOK(tok, lex, TOK_RWORD_CONST);
+            }
+            else if( lex.getTokenIf(TOK_RWORD_CONST) ) {
+            }
             AST::HigherRankedBounds hrbs = Parse_HRB_Opt(lex);
-            traits.push_back({ mv$(hrbs), Parse_Path(lex, PATH_GENERIC_TYPE) });
+            rv_data.traits.push_back({ mv$(hrbs), Parse_Path(lex, PATH_GENERIC_TYPE) });
         }
-    } while( GET_TOK(tok, lex) == TOK_PLUS );
-    PUTBACK(tok, lex);
+    } while( lex.getTokenIf(TOK_PLUS) );
 
-    return TypeRef(lex.end_span(ps), TypeData::make_ErasedType({ mv$(traits), mv$(lifetimes) }));
+    return TypeRef(lex.end_span(ps), box$(rv_data));
 }
 

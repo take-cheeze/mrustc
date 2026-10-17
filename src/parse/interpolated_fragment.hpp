@@ -11,8 +11,9 @@
 
 class TypeRef;
 class TokenTree;
+struct Ident;
 namespace AST {
-    typedef bool Visibility;
+    class Visibility;
     class Pattern;
     class Path;
     class ExprNode;
@@ -47,6 +48,7 @@ public:
     InterpolatedFragment(InterpolatedFragment&& );
     InterpolatedFragment& operator=(InterpolatedFragment&& );
     //InterpolatedFragment(const InterpolatedFragment& );
+
     InterpolatedFragment(TokenTree );
     InterpolatedFragment(::AST::Pattern);
     InterpolatedFragment(::AST::Path);

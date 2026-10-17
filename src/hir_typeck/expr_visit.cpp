@@ -16,6 +16,7 @@ void Typecheck_Code(const typeck::ModuleState& ms, t_args& args, const ::HIR::Ty
     {
         //Typecheck_Code_Simple(ms, args, result_type, expr);
         Typecheck_Code_CS(ms, args, result_type, expr);
+        expr.m_state->stage = ::HIR::ExprState::Stage::Typecheck;
     }
 }
 
@@ -127,11 +128,23 @@ namespace {
 
         // NOTE: This is left here to ensure that any expressions that aren't handled by higher code cause a failure
         void visit_expr(::HIR::ExprPtr& exp) override {
+            if( exp.m_mir ) {
+                return ;
+            }
             BUG(exp->m_span, "Reached expression");
         }
 
         void visit_trait(::HIR::ItemPath p, ::HIR::Trait& item) override
         {
+            HIR::GenericPath    trait_gpath;
+            trait_gpath.m_path = p.get_simple_path();
+            for(size_t i = 0; i < item.m_params.m_types.size(); i ++) {
+                trait_gpath.m_params.m_types.push_back(HIR::TypeRef(item.m_params.m_types[i].m_name, i));
+            }
+            for(size_t i = 0; i < item.m_params.m_values.size(); i ++) {
+                trait_gpath.m_params.m_values.push_back(HIR::GenericRef(item.m_params.m_values[i].m_name, i));
+            }
+            auto _1 = this->m_ms.set_current_trait(trait_gpath);
             auto _ = this->m_ms.set_impl_generics(item.m_params);
             ::HIR::Visitor::visit_trait(p, item);
         }
@@ -148,7 +161,9 @@ namespace {
         }
         void visit_trait_impl(const ::HIR::SimplePath& trait_path, ::HIR::TraitImpl& impl) override
         {
-            TRACE_FUNCTION_F("impl " << trait_path << " for " << impl.m_type);
+            TRACE_FUNCTION_F("impl " << trait_path << impl.m_trait_args << " for " << impl.m_type);
+            auto trait_gpath = ::HIR::GenericPath(trait_path, impl.m_trait_args.clone());
+            auto _1 = this->m_ms.set_current_trait(trait_gpath);
             auto _ = this->m_ms.set_impl_generics(impl.m_params);
 
             const auto& mod = this->m_ms.m_crate.get_mod_by_path(Span(), impl.m_src_module);
@@ -177,7 +192,9 @@ namespace {
                 DEBUG("Array size " << ty);
                 t_args  tmp;
                 if( auto* se = e->size.opt_Unevaluated() ) {
-                    Typecheck_Code( m_ms, tmp, ::HIR::TypeRef(::HIR::CoreType::Usize), **se );
+                    if( se->is_Unevaluated() ) {
+                        Typecheck_Code( m_ms, tmp, ::HIR::TypeRef(::HIR::CoreType::Usize), *se->as_Unevaluated()->expr );
+                    }
                 }
             }
             else {
@@ -222,7 +239,7 @@ namespace {
 
             if( auto* e = item.m_data.opt_Value() )
             {
-                auto enum_type = ::HIR::Enum::get_repr_type(e->repr);
+                auto enum_type = ::HIR::Enum::get_repr_type(item.m_tag_repr);
 
                 for(auto& var : e->variants)
                 {

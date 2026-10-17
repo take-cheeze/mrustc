@@ -6,6 +6,7 @@
  * - MIR Interpreter State (HEADER)
  */
 #pragma once
+#include <cstdint>
 #include "module_tree.hpp"
 #include "value.hpp"
 
@@ -42,10 +43,30 @@ struct GlobalState
 {
     typedef bool    override_handler_t(InterpreterThread& thread, Value& ret, const ::HIR::Path& path, ::std::vector<Value> args);
 
-    ModuleTree& m_modtree;
+    const ModuleTree& m_modtree;
+
+    std::map<const Static*, Value>  m_statics;
+
     std::map<RcString, override_handler_t*>  m_fcn_overrides;
 
-    GlobalState(ModuleTree& modtree);
+    GlobalState(const ModuleTree& modtree);
+};
+
+struct VaArgsState {
+    struct Inner {
+        // TODO: how to handle advancing along with va_copy
+        std::vector<Value>  args;
+        Inner(const std::vector<Value>& args, size_t ofs);
+    };
+    FFIPointer  pointer;
+
+    ~VaArgsState() {
+        release("drop");
+    }
+
+    static const Inner& get_inner(Value& arg);
+    FFIPointer init(const std::vector<Value>& args, size_t ofs);
+    void release(const char* where);
 };
 
 class InterpreterThread
@@ -63,6 +84,7 @@ class InterpreterThread
         ::std::vector<Value>    args;
         ::std::vector<Value>    locals;
         ::std::vector<bool>     drop_flags;
+        VaArgsState va_args;
 
         unsigned    bb_idx;
         unsigned    stmt_idx;

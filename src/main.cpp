@@ -30,12 +30,7 @@
 #include "expand/cfg.hpp"
 #include <target_detect.h>	// tools/common/target_detect.h
 #include <debug_inner.hpp>
-
-#ifdef _WIN32
-# define NOGDI
-# include <Windows.h>
-# include <DbgHelp.h>
-#endif
+#include "memory_dump.hpp"
 
 TargetVersion	gTargetVersion = TargetVersion::Rustc1_29;
 
@@ -73,6 +68,9 @@ struct ProgramParams
     // NOTE: if true, no parse/compilation performed (target is loaded though)
     bool    print_cfgs = false;
 
+    // 
+    bool    run_borrowcheck = false;
+
     ::std::vector<const char*> lib_search_dirs;
     ::std::vector<const char*> libraries;
     ::std::map<::std::string, ::std::string>    crate_overrides;    // --extern name=path
@@ -80,6 +78,9 @@ struct ProgramParams
     ::std::set< ::std::string> features;
 
     struct {
+        /// Testing hack: Pause just after startup (to allow a debugger to attach)
+        bool pause = false;
+
         bool disable_mir_optimisations = false;
         bool full_validate = false;
         bool full_validate_early = false;
@@ -91,6 +92,7 @@ struct ProgramParams
     struct {
         ::std::string   codegen_type;
         ::std::string   emit_build_command;
+        ::std::string   panic_type;
     } codegen;
 
     ProgramParams(int argc, char *argv[]);
@@ -125,10 +127,12 @@ void init_debug_list()
 
         "HIR Lower",
 
+        "Lifetime Elision",
         "Resolve Type Aliases",
         "Resolve Bind",
         "Resolve UFCS Outer",
         "Resolve UFCS paths",
+        "Resolve HIR Self Type",
         "Resolve HIR Markings",
         "Sort Impls",
         "Constant Evaluate",
@@ -137,13 +141,16 @@ void init_debug_list()
         "Typecheck Expressions",
 
         "Expand HIR Annotate",
-        "Expand HIR Static Borrow",
+        "Expand HIR Static Borrow Mark",
+        "Expand HIR Lifetimes",
         "Expand HIR Closures",
+        "Expand HIR Static Borrow",
         "Expand HIR Calls",
         "Expand HIR VTables",
         "Expand HIR Reborrows",
         "Expand HIR ErasedType",
         "Typecheck Expressions (validate)",
+        "Expand HIR Lifetimes (validate)",
 
         "Dump HIR",
         "Lower MIR",
@@ -152,6 +159,7 @@ void init_debug_list()
         "Dump MIR",
         "Constant Evaluate Full",
         "MIR Cleanup",
+        "MIR Borrowcheck",
         "MIR Optimise",
         "MIR Validate PO",
         "MIR Validate Full",
@@ -161,67 +169,13 @@ void init_debug_list()
         "Trans Auto Impls",
         "Trans Monomorph",
         "MIR Optimise Inline",
+        "MIR Cleanup 2",
+        "MIR Optimise Inline PostSave",
         "Trans Enumerate Cleanup",
         "Trans Codegen"
         });
 }
 
-void memory_dump(const char* phase) {
-#ifdef _MSC_VER
-#pragma comment(lib, "dbghelp.lib")
-    if( getenv("MRUSTC_DUMPMEM") )
-    {
-        struct H {
-            static int GenerateDump(const char* phase, EXCEPTION_POINTERS* pExceptionPointers)
-            {
-                static unsigned s_count;
-                auto idx = s_count ++;
-                char filename[256];
-                sprintf_s(filename, "mrustc-%i-%s.dmp", idx, phase);
-                HANDLE outfile = CreateFileA(filename, GENERIC_READ|GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-                if( outfile != NULL && outfile != INVALID_HANDLE_VALUE )
-                {
-                    MINIDUMP_EXCEPTION_INFORMATION ExpParam;
-                    ExpParam.ThreadId = GetCurrentThreadId();
-                    ExpParam.ExceptionPointers = pExceptionPointers;
-                    ExpParam.ClientPointers = TRUE;
-
-                    if( !MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), outfile, MiniDumpWithFullMemory, &ExpParam, NULL, NULL) )
-                    {
-                        std::cerr << "Unable to dump to " << filename << ": (MiniDumpWriteDump) " << std::hex << GetLastError() << std::endl;
-                    }
-                    else
-                    {
-                        std::cerr << "Wrote dump to  " << filename << std::endl;
-                    }
-                    CloseHandle(outfile);
-                }
-                else
-                {
-                    std::cerr << "Unable to dump to " << filename << ": (CreateFileA) " << std::hex << GetLastError() << std::endl;
-                }
-
-                return EXCEPTION_EXECUTE_HANDLER;
-            }
-        };
-
-        __try
-        {
-            int *pBadPtr = NULL;
-            *pBadPtr = 0;
-        }
-        __except(H::GenerateDump(phase, GetExceptionInformation()))
-        {
-        }
-    }
-#endif
-    
-    if( false )
-    {
-        std::cerr << "Press enter to continue after '" << phase << "'" << std::endl;
-        std::cin.get();
-    }
-}
 
 /// main!
 int main(int argc, char *argv[])
@@ -229,13 +183,19 @@ int main(int argc, char *argv[])
     init_debug_list();
     ProgramParams   params(argc, argv);
 
+    if(params.debug.pause) {
+        char c;
+        ::std::cerr << "Pausing to attach a debugger\nType any text to continue" << std::endl;
+        ::std::cin >> c;
+    }
+
     // Set up cfg values
     CompilePhaseV("Setup", [&]() {
         Cfg_SetValue("rust_compiler", "mrustc");
         Cfg_SetValueCb("feature", [&params](const ::std::string& s) {
             return params.features.count(s) != 0;
             });
-
+#if 0
         DEBUG("sizeof(AST::TypeRef) = " << sizeof(TypeRef));
         DEBUG("sizeof(AST::Item) = " << sizeof(AST::Item));
         DEBUG("sizeof(AST::Impl) = " << sizeof(AST::Impl));
@@ -243,6 +203,7 @@ int main(int argc, char *argv[])
         DEBUG("sizeof(AST::Module) = " << sizeof(AST::Module));
         DEBUG("sizeof(HIR::TypeRef) = " << sizeof(HIR::TypeRef));
         DEBUG("sizeof(HIR::Path) = " << sizeof(HIR::Path));
+#endif
         });
     CompilePhaseV("Target Load", [&]() {
         Target_SetCfg(params.target);
@@ -296,21 +257,39 @@ int main(int argc, char *argv[])
                 AST::g_crate_load_dirs.push_back(ld);
             }
             crate.load_externs();
+            if( params.test_harness )
+            {
+                auto test_crate_name = RcString::new_interned("test");
+                AST::g_implicit_crates.insert( std::make_pair(test_crate_name, crate.load_extern_crate(Span(), test_crate_name)) );
+            }
             });
 
         if( params.crate_name != "" ) {
-            crate.m_crate_name = params.crate_name;
+
+            // Extract the crate type and name from the crate attributes
+            auto crate_type = params.crate_type;
+            if( crate_type == ::AST::Crate::Type::Unknown ) {
+                crate_type = crate.m_crate_type;
+            }
+            if( crate_type == ::AST::Crate::Type::Unknown ) {
+                // Assume to be executable
+                crate_type = ::AST::Crate::Type::Executable;
+            }
+            crate.m_crate_type = crate_type;
+
+            crate.set_crate_name(params.crate_name);
+            crate.m_crate_type = ::AST::Crate::Type::Unknown;
         }
 
         // Iterate all items in the AST, applying syntax extensions
         CompilePhaseV("Expand", [&]() {
             Expand(crate);
-            });
 
-        if( params.test_harness )
-        {
-            Expand_TestHarness(crate);
-        }
+            if( params.test_harness )
+            {
+                Expand_TestHarness(crate);
+            }
+            });
 
         // Extract the crate type and name from the crate attributes
         auto crate_type = params.crate_type;
@@ -331,7 +310,7 @@ int main(int argc, char *argv[])
         auto crate_name = params.crate_name;
         if( crate_name == "" )
         {
-            crate_name = crate.m_crate_name;
+            crate_name = crate.m_crate_name_set;
         }
         if( crate_name == "" ) {
             auto s = params.infile.find_last_of('/');
@@ -339,6 +318,12 @@ int main(int argc, char *argv[])
                 s = 0;
             else
                 s += 1;
+            auto s2 = params.infile.find_last_of('\\');
+            if( s2 == ::std::string::npos )
+                s2 = 0;
+            else
+                s2 += 1;
+            s = std::max(s, s2);
             auto e = params.infile.find_first_of('.', s);
             if( e == ::std::string::npos )
                 e = params.infile.size() - s;
@@ -360,23 +345,35 @@ int main(int argc, char *argv[])
                 }
             }
         }
-        crate.m_crate_name = crate_name;
         if( params.test_harness )
         {
-            crate.m_crate_name += "$test";
+            crate_name += "$test";
+            if(params.codegen.panic_type == "")
+            {
+                params.codegen.panic_type = "unwind";
+            }
         }
+        crate.set_crate_name( crate_name );
 
         if( params.outfile == "" ) {
+        #ifdef WIN32
+        # define EXESUF ".exe"
+        #else
+        # define EXESUF ""
+        #endif
             switch( crate.m_crate_type )
             {
             case ::AST::Crate::Type::RustLib:
-                params.outfile = FMT(params.output_dir << "lib" << crate.m_crate_name << ".rlib");
+                params.outfile = FMT(params.output_dir << "lib" << crate.m_crate_name_set << ".rlib");
                 break;
             case ::AST::Crate::Type::Executable:
-                params.outfile = FMT(params.output_dir << crate.m_crate_name);
+                params.outfile = FMT(params.output_dir << crate.m_crate_name_set << EXESUF);
+                break;
+            case ::AST::Crate::Type::ProcMacro:
+                params.outfile = FMT(params.output_dir << "lib" << crate.m_crate_name_set << "-plugin" EXESUF);
                 break;
             default:
-                params.outfile = FMT(params.output_dir << crate.m_crate_name << ".o");
+                params.outfile = FMT(params.output_dir << crate.m_crate_name_set << ".o");
                 break;
             }
             DEBUG("params.outfile = " << params.outfile);
@@ -396,10 +393,6 @@ int main(int argc, char *argv[])
 
         // Allocator and panic strategies
         CompilePhaseV("Implicit Crates", [&]() {
-            if( params.test_harness )
-            {
-                crate.load_extern_crate(Span(), "test");
-            }
             if( crate.m_crate_type == ::AST::Crate::Type::Executable || params.test_harness || crate.m_crate_type == ::AST::Crate::Type::ProcMacro )
             {
                 bool allocator_crate_loaded = false;
@@ -424,30 +417,39 @@ int main(int argc, char *argv[])
                     if(ec.second.m_hir->m_lang_items.count("mrustc-panic_runtime"))
                     {
                         if( panic_runtime_loaded ) {
-                            ERROR(Span(), E0000, "Multiple panic_runtime crates loaded - " << panic_crate_name << " and " << ec.first);
+                            //ERROR(Span(), E0000, "Multiple panic_runtime crates loaded - " << panic_crate_name << " and " << ec.first);
+                            WARNING(Span(), W0000, "Multiple panic_runtime crates loaded - " << panic_crate_name << " and " << ec.first);
                         }
-                        panic_crate_name = ec.first;
-                        panic_runtime_loaded = true;
+                        else {
+                            panic_crate_name = ec.first;
+                            panic_runtime_loaded = true;
+                        }
                     }
                     if(ec.second.m_hir->m_lang_items.count("mrustc-needs_panic_runtime"))
                     {
                         panic_runtime_needed = true;
                     }
                 }
+                if( TARGETVER_LEAST_1_39 )
+                {
+                    // 1.39 has the default (system) allocator in liballoc
+                    allocator_crate_loaded = true;
+                }
                 if( !allocator_crate_loaded )
                 {
                     crate.load_extern_crate(Span(), "alloc_system");
                 }
 
-                if( panic_runtime_needed && !panic_runtime_loaded )
+                if( panic_runtime_needed /*&& !panic_runtime_loaded*/ )
                 {
                     // TODO: Get a panic method from the command line
                     // - Fall back to abort by default, because mrustc doesn't do unwinding yet.
-                    crate.load_extern_crate(Span(), "panic_abort");
+                    auto panic_crate = params.codegen.panic_type == "" ? "panic_abort" : "panic_"+params.codegen.panic_type;
+                    crate.load_extern_crate(Span(), panic_crate.c_str());
                 }
 
                 // - `mrustc-main` lang item default
-                crate.m_lang_items.insert(::std::make_pair( ::std::string("mrustc-main"), ::AST::Path("", {AST::PathNode("main")}) ));
+                crate.m_lang_items.insert(::std::make_pair( ::std::string("mrustc-main"), ::AST::AbsolutePath("", {"main"}) ));
             }
             });
 
@@ -536,8 +538,13 @@ int main(int argc, char *argv[])
         }
         memory_dump("HIR");
 
+        CompilePhaseV("Lifetime Elision", [&]() {
+            ConvertHIR_LifetimeElision(*hir_crate);
+            });
+
         // Replace type aliases (`type`) into the actual type
-        // - Also inserts defaults in trait impls
+        // - Does simple replacements
+        // - Done before bind so type alises can be used in patterns?
         CompilePhaseV("Resolve Type Aliases", [&]() {
             ConvertHIR_ExpandAliases(*hir_crate);
             });
@@ -545,16 +552,23 @@ int main(int argc, char *argv[])
         CompilePhaseV("Resolve Bind", [&]() {
             ConvertHIR_Bind(*hir_crate);
             });
+
+        // Determine what trait to use for <T>::Foo in outer scope
+        // - Also inserts defaults in trait impls
+        CompilePhaseV("Resolve UFCS Outer", [&]() {
+            ConvertHIR_ResolveUFCS_Outer(*hir_crate);
+            });
+        // Expand `Self` into the true type
+        // - TODO: Move this later on, but that requires fixing some of the resolve logic around trait impl lookup
+        CompilePhaseV("Resolve HIR Self Type", [&]() {
+            ConvertHIR_ExpandAliases_Self(*hir_crate);
+            });
         // Enumerate marker impls on types and other useful metadata
         CompilePhaseV("Resolve HIR Markings", [&]() {
             ConvertHIR_Markings(*hir_crate);
             });
         CompilePhaseV("Sort Impls", [&]() {
             ConvertHIR_ResolveUFCS_SortImpls(*hir_crate);
-            });
-        // Determine what trait to use for <T>::Foo in outer scope
-        CompilePhaseV("Resolve UFCS Outer", [&]() {
-            ConvertHIR_ResolveUFCS_Outer(*hir_crate);
             });
         // Determine what trait to use for <T>::Foo (and does some associated type expansion)
         CompilePhaseV("Resolve UFCS paths", [&]() {
@@ -566,6 +580,8 @@ int main(int argc, char *argv[])
                 HIR_Dump( os, *hir_crate );
                 });
         }
+        // TODO: Expand vtables here?
+        // - Some parts of constant evaluate require it
         // Basic constant evalulation (intergers/floats only)
         CompilePhaseV("Constant Evaluate", [&]() {
             ConvertHIR_ConstantEvaluate(*hir_crate);
@@ -597,15 +613,24 @@ int main(int argc, char *argv[])
         CompilePhaseV("Expand HIR Annotate", [&]() {
             HIR_Expand_AnnotateUsage(*hir_crate);
             });
-        CompilePhaseV("Expand HIR Static Borrow", [&]() {
-            HIR_Expand_StaticBorrowConstants(*hir_crate);
+        CompilePhaseV("Expand HIR Static Borrow Mark", [&]() {
+            HIR_Expand_StaticBorrowConstants_Mark(*hir_crate);
+            });
+        // - Needs to be done after static borrows, but before closures
+        CompilePhaseV("Expand HIR Lifetimes", [&]() {
+            HIR_Expand_LifetimeInfer(*hir_crate);
             });
         // - Now that all types are known, closures can be desugared
         CompilePhaseV("Expand HIR Closures", [&]() {
             HIR_Expand_Closures(*hir_crate);
             });
+        CompilePhaseV("Expand HIR Static Borrow", [&]() {
+            HIR_Expand_StaticBorrowConstants(*hir_crate);
+            });
         // - Construct VTables for all traits and impls.
         //  TODO: How early can this be done?
+        //  > Requires consteval completed for types to be fully valid?
+        //  TODO: Would prefer to have this done before consteval, as consteval might reference a vtable
         CompilePhaseV("Expand HIR VTables", [&]() {
             HIR_Expand_VTables(*hir_crate);
             });
@@ -631,6 +656,11 @@ int main(int argc, char *argv[])
         CompilePhaseV("Typecheck Expressions (validate)", [&]() {
             Typecheck_Expressions_Validate(*hir_crate);
             });
+        // HACK?: Run lifetime inference again, so that bad closures are caught
+        // - Doesn't quite work, can't seem to run this twice?
+        //CompilePhaseV("Expand HIR Lifetimes (validate)", [&]() {
+        //    HIR_Expand_LifetimeInfer_Validate(*hir_crate);
+        //    });
 
         if( params.last_stage == ProgramParams::STAGE_TYPECK ) {
             return 0;
@@ -665,6 +695,14 @@ int main(int argc, char *argv[])
         {
             CompilePhaseV("MIR Validate Full Early", [&]() {
                 MIR_CheckCrate_Full(*hir_crate);
+                });
+        }
+
+        // Optional for now
+        if( params.run_borrowcheck )
+        {
+            CompilePhaseV("MIR Borrowcheck", [&]() {
+                MIR_BorrowCheck_Crate(*hir_crate);
                 });
         }
 
@@ -704,6 +742,7 @@ int main(int argc, char *argv[])
         trans_opt.mode = params.codegen.codegen_type == "" ? "c" : params.codegen.codegen_type;
         trans_opt.build_command_file = params.codegen.emit_build_command;
         trans_opt.opt_level = params.opt_level;
+        trans_opt.panic_crate = params.codegen.panic_type == "" ? "panic_abort" : "panic_"+params.codegen.panic_type;
         for(const char* libdir : params.lib_search_dirs ) {
             // Store these paths for use in final linking.
             hir_crate->m_link_paths.push_back( libdir );
@@ -721,6 +760,26 @@ int main(int argc, char *argv[])
         }
 
         // TODO: For 1.29 executables/dylibs, add oom/panic shims
+        if( crate_type == ::AST::Crate::Type::ProcMacro )
+        {
+            // - Save a very basic HIR dump, making sure that there's no lang items in it (e.g. `mrustc-main`)
+            CompilePhaseV("HIR Serialise", [&]() {
+                HIR::Crate  crate_for_ser;
+                crate_for_ser.m_crate_name = hir_crate->m_crate_name;
+                crate_for_ser.m_edition    = hir_crate->m_edition;
+                for(const auto& i : hir_crate->m_root_module.m_macro_items) {
+                    DEBUG(i.first << ": " << i.second->ent.tag_str());
+                    if( const auto* e = i.second->ent.opt_ProcMacro() ) {
+                        crate_for_ser.m_root_module.m_macro_items.insert(std::make_pair(
+                            i.first,
+                            box$(HIR::VisEnt<HIR::MacroItem>{ i.second->publicity, *e })
+                            ));
+                    }
+                }
+                crate_for_ser.m_exported_macro_names = hir_crate->m_exported_macro_names;
+                HIR_Serialise(params.outfile + ".hir", crate_for_ser);
+                });
+        }
 
         // Enumerate items to be passed to codegen
         TransList items = CompilePhase<TransList>("Trans Enumerate", [&]() {
@@ -735,8 +794,6 @@ int main(int argc, char *argv[])
             case ::AST::Crate::Type::CDylib:
                 return Trans_Enumerate_Public(*hir_crate);
             case ::AST::Crate::Type::ProcMacro:
-                // TODO: proc macros enumerate twice, once as a library (why?) and again as an executable
-                return Trans_Enumerate_Public(*hir_crate);
             case ::AST::Crate::Type::Executable:
                 return Trans_Enumerate_Main(*hir_crate);
             }
@@ -750,54 +807,62 @@ int main(int argc, char *argv[])
         // - Generate monomorphised versions of all functions
         CompilePhaseV("Trans Monomorph", [&]() { Trans_Monomorphise_List(*hir_crate, items); });
         // - Do post-monomorph inlining
-        CompilePhaseV("MIR Optimise Inline", [&]() { MIR_OptimiseCrate_Inlining(*hir_crate, items); });
-        // - Clean up no-unused functions
-        CompilePhaseV("Trans Enumerate Cleanup", [&]() { Trans_Enumerate_Cleanup(*hir_crate, items); });
+        CompilePhaseV("MIR Optimise Inline", [&]() { MIR_OptimiseCrate_Inlining(*hir_crate, items, false); });
+
+        // - Expand constants in HIR (using ones that were monomorphised above)
+        CompilePhaseV("MIR Cleanup 2", [&]() {
+            MIR_Cleanup_SetPostMonomorph();
+            MIR_CleanupCrate(*hir_crate);
+            });
 
         memory_dump("Trans");
+
+        std::string hir_file;
+        switch(crate_type)
+        {
+        case ::AST::Crate::Type::RustLib:
+            // Save a loadable HIR dump
+            hir_file = params.outfile + ".hir";
+            CompilePhaseV("HIR Serialise", [&]() { HIR_Serialise(hir_file, *hir_crate); });
+            break;
+        case ::AST::Crate::Type::RustDylib:
+            // Save a loadable HIR dump
+            CompilePhaseV("HIR Serialise", [&]() {
+                //auto saved_ext_crates = ::std::move(hir_crate->m_ext_crates);
+                HIR_Serialise(hir_file, *hir_crate);
+                //hir_crate->m_ext_crates = ::std::move(saved_ext_crates);
+                });
+            break;
+        default:
+            break;
+        }
+
+
+        // - Do post-monomorph inlining
+        CompilePhaseV("MIR Optimise Inline PostSave", [&]() { MIR_OptimiseCrate_Inlining(*hir_crate, items, true); });
+        // - Clean up ununused functions
+        CompilePhaseV("Trans Enumerate Cleanup", [&]() { Trans_Enumerate_Cleanup(*hir_crate, items); });
 
         switch(crate_type)
         {
         case ::AST::Crate::Type::Unknown:
             throw "";
         case ::AST::Crate::Type::RustLib:
-            // Save a loadable HIR dump
-            CompilePhaseV("HIR Serialise", [&]() { HIR_Serialise(params.outfile + ".hir", *hir_crate); });
-            // Generate a loadable .o
-            CompilePhaseV("Trans Codegen", [&]() { Trans_Codegen(params.outfile, CodegenOutput::StaticLibrary, trans_opt, *hir_crate, items, params.outfile + ".hir"); });
+            // Generate a linkable .o
+            CompilePhaseV("Trans Codegen", [&]() { Trans_Codegen(params.outfile, CodegenOutput::StaticLibrary, trans_opt, std::move(hir_crate), std::move(items), hir_file); });
             break;
         case ::AST::Crate::Type::RustDylib:
-            // Save a loadable HIR dump
-            CompilePhaseV("HIR Serialise", [&]() {
-                //auto saved_ext_crates = ::std::move(hir_crate->m_ext_crates);
-                HIR_Serialise(params.outfile + ".hir", *hir_crate);
-                //hir_crate->m_ext_crates = ::std::move(saved_ext_crates);
-                });
-            // Generate a .so
-            CompilePhaseV("Trans Codegen", [&]() { Trans_Codegen(params.outfile, CodegenOutput::DynamicLibrary, trans_opt, *hir_crate, items, params.outfile + ".hir"); });
-            break;
         case ::AST::Crate::Type::CDylib:
             // Generate a .so/.dll
-            CompilePhaseV("Trans Codegen", [&]() { Trans_Codegen(params.outfile, CodegenOutput::DynamicLibrary, trans_opt, *hir_crate, items, ""); });
+            CompilePhaseV("Trans Codegen", [&]() { Trans_Codegen(params.outfile, CodegenOutput::DynamicLibrary, trans_opt, std::move(hir_crate), std::move(items), hir_file); });
             break;
         case ::AST::Crate::Type::ProcMacro: {
             // Needs: An executable (the actual macro handler), metadata (for `extern crate foo;`)
-
-            // 1. Generate code for the plugin itself
-            TransList items = CompilePhase<TransList>("Trans Enumerate PM", [&]() { return Trans_Enumerate_Main(*hir_crate); });
-            CompilePhaseV("Trans Auto Impls PM", [&]() { Trans_AutoImpls(*hir_crate, items); });
-            CompilePhaseV("Trans Monomorph PM", [&]() { Trans_Monomorphise_List(*hir_crate, items); });
-            CompilePhaseV("MIR Optimise Inline PM", [&]() { MIR_OptimiseCrate_Inlining(*hir_crate, items); });
-            // - Save a very basic HIR dump, making sure that there's no lang items in it (e.g. `mrustc-main`)
-            CompilePhaseV("HIR Serialise", [&]() {
-                auto saved_lang_items = ::std::move(hir_crate->m_lang_items); hir_crate->m_lang_items.clear();
-                HIR_Serialise(params.outfile + ".hir", *hir_crate);
-                hir_crate->m_lang_items = ::std::move(saved_lang_items);
-                });
-            CompilePhaseV("Trans Codegen", [&]() { Trans_Codegen(params.outfile, CodegenOutput::Executable, trans_opt, *hir_crate, items, params.outfile + ".hir"); });
+            // - Metadata was done before enumerate
+            CompilePhaseV("Trans Codegen", [&]() { Trans_Codegen(params.outfile, CodegenOutput::Executable, trans_opt, std::move(hir_crate), std::move(items), hir_file); });
             break; }
         case ::AST::Crate::Type::Executable:
-            CompilePhaseV("Trans Codegen", [&]() { Trans_Codegen(params.outfile, CodegenOutput::Executable, trans_opt, *hir_crate, items, ""); });
+            CompilePhaseV("Trans Codegen", [&]() { Trans_Codegen(params.outfile, CodegenOutput::Executable, trans_opt, std::move(hir_crate), std::move(items), ""); });
             break;
         }
     }
@@ -821,14 +886,79 @@ int main(int argc, char *argv[])
     return 0;
 }
 
+namespace {
+    const char* target_version_str(TargetVersion tv) {
+        switch(tv)
+        {
+        case TargetVersion::Rustc1_19:  return "1.19";
+        case TargetVersion::Rustc1_29:  return "1.29";
+        case TargetVersion::Rustc1_39:  return "1.39";
+        case TargetVersion::Rustc1_54:  return "1.54";
+        case TargetVersion::Rustc1_74:  return "1.74";
+        case TargetVersion::Rustc1_90:  return "1.90";
+        }
+        return "?";
+    }
+}
+
 ProgramParams::ProgramParams(int argc, char *argv[])
 {
+    if( const auto* a = getenv("MRUSTC_TARGET_VER") )
+    {
+        if( strcmp(a, "1.19") == 0 ) {
+            gTargetVersion = TargetVersion::Rustc1_19;
+        }
+        else if( strcmp(a, "1.29") == 0 ) {
+            gTargetVersion = TargetVersion::Rustc1_29;
+        }
+        else if( strcmp(a, "1.39") == 0 ) {
+            gTargetVersion = TargetVersion::Rustc1_39;
+        }
+        else if( strcmp(a, "1.54") == 0 ) {
+            gTargetVersion = TargetVersion::Rustc1_54;
+        }
+        else if( strcmp(a, "1.74") == 0 ) {
+            gTargetVersion = TargetVersion::Rustc1_74;
+        }
+        else if( strcmp(a, "1.90") == 0 ) {
+            gTargetVersion = TargetVersion::Rustc1_90;
+        }
+        else {
+            ::std::cerr << "$MRUSTC_TARGET_VER set to an unknown value\n";
+            exit(1);
+        }
+    }
+    else {
+        ::std::cerr << "WARNING: $MRUSTC_TARGET_VER not set, defaulting to 1.29 mode (likely not intended)\n";
+    }
+
+    if( const auto* a = getenv("MRUSTC_LIBDIR") )
+    {
+        this->lib_search_dirs.push_back(a);
+    }
+
     // Hacky command-line parsing
     for( int i = 1; i < argc; i ++ )
     {
         const char* arg = argv[i];
 
-        if( arg[0] != '-' )
+        // The following imitates rustc's version output (which the crate `rustc_version` tries to parse)
+        // - Very much a hack
+        if( strcmp(arg, "-vV") == 0 ) {
+            const char* rustc_target = target_version_str(gTargetVersion);
+
+            ::std::cout << "rustc " << rustc_target << ".100 (mrustc " << Version_GetString() << ")" << ::std::endl;
+            ::std::cout << "binary: rustc" << ::std::endl;
+            ::std::cout << "commit-hash: " << gsVersion_GitHash << ::std::endl;
+            ::std::cout << "commit-date: UNKNOWN" << ::std::endl;
+            ::std::cout << "build-date: " << gsVersion_BuildTime << ::std::endl;
+            ::std::cout << "host: UNKNOWN" << ::std::endl;
+            ::std::cout << "release: " << rustc_target << ".100" << ::std::endl;
+
+            exit(0);
+        }
+
+        if( arg[0] != '-' || arg[1] == '\0' )
         {
             if (this->infile == "")
             {
@@ -890,13 +1020,13 @@ ProgramParams::ProgramParams(int argc, char *argv[])
                 }
                 auto get_optval = [&]() {
                     if( eq_pos == ::std::string::npos ) {
-                        ::std::cerr << "Flag -Z " << optname << " requires an argument" << ::std::endl;
+                        ::std::cerr << "Flag -C " << optname << " requires an argument" << ::std::endl;
                         exit(1);
                     }
                     };
                 //auto no_optval = [&]() {
                 //    if(eq_pos != ::std::string::npos) {
-                //        ::std::cerr << "Flag -Z " << optname << " doesn't take an argument" << ::std::endl;
+                //        ::std::cerr << "Flag -C " << optname << " doesn't take an argument" << ::std::endl;
                 //        exit(1);
                 //    }
                 //    };
@@ -912,6 +1042,10 @@ ProgramParams::ProgramParams(int argc, char *argv[])
                 else if( optname == "emit-depfile" ) {
                     get_optval();
                     this->emit_depfile = optval;
+                }
+                else if( optname == "panic" ) {
+                    get_optval();
+                    this->codegen.panic_type = optval;
                 }
                 else {
                     ::std::cerr << "Unknown codegen option: '" << optname << "'" << ::std::endl;
@@ -990,12 +1124,19 @@ ProgramParams::ProgramParams(int argc, char *argv[])
                         exit(1);
                     }
                 }
+                else if( optname == "pause-after-start" ) {
+                    this->debug.pause = true;
+                }
                 else if( optname == "print-cfgs") {
                     no_optval();
                     this->print_cfgs = true;
                 }
+                else if( optname == "borrowcheck" ) {
+                    no_optval();
+                    this->run_borrowcheck = true;
+                }
                 else {
-                    ::std::cerr << "Unknown debug option: '" << optname << "'" << ::std::endl;
+                    ::std::cerr << "Unknown -Z flag: '" << optname << "'" << ::std::endl;
                     exit(1);
                 }
                 } continue;
@@ -1031,31 +1172,36 @@ ProgramParams::ProgramParams(int argc, char *argv[])
         }
         else
         {
+            auto check_with_arg = [&](const char* name)->const char* {
+                if( strcmp(arg+2, name) == 0 ) {
+                    if (i == argc - 1) {
+                        ::std::cerr << "Flag " << arg << " requires an argument" << ::std::endl;
+                        exit(1);
+                    }
+                    return argv[++i];
+                }
+                if( strncmp(arg+2, name, strlen(name)) == 0 && arg[2+strlen(name)] == '=' ) {
+                    return arg + 2 + strlen(name) + 1;
+                }
+                return nullptr;
+                };
+
             if( strcmp(arg, "--help") == 0 ) {
                 this->show_help();
                 exit(0);
             }
             else if( strcmp(arg, "--version" ) == 0 ) {
-                const char* rustc_target = "unknown";
-                switch(gTargetVersion)
-                {
-                case TargetVersion::Rustc1_19:  rustc_target = "1.19";  break;
-                case TargetVersion::Rustc1_29:  rustc_target = "1.29";  break;
-                case TargetVersion::Rustc1_39:  rustc_target = "1.39";  break;
-                }
+                const char* rustc_target = target_version_str(gTargetVersion);
                 // NOTE: Starts the version with "rustc 1.29.100" so build scripts don't get confused
                 ::std::cout << "rustc " << rustc_target << ".100 (mrustc " << Version_GetString() << ")" << ::std::endl;
+                ::std::cout << "release: " << rustc_target << ".100" << ::std::endl;    // `autoconfig` looks for this line
                 ::std::cout << "- Build time: " << gsVersion_BuildTime << ::std::endl;
                 ::std::cout << "- Commit: " << gsVersion_GitHash << (gbVersion_GitDirty ? " (dirty tree)" : "") << ::std::endl;
                 exit(0);
             }
             // --out-dir <dir>  >> Set the output directory for automatically-named files
-            else if( strcmp(arg, "--out-dir") == 0) {
-                if (i == argc - 1) {
-                    ::std::cerr << "Flag " << arg << " requires an argument" << ::std::endl;
-                    exit(1);
-                }
-                this->output_dir = argv[++i];
+            else if( const char* out_dir = check_with_arg("out-dir") ) {
+                this->output_dir = out_dir;
                 if( this->output_dir != "" && this->output_dir.back() != '/' )
                 {
                     this->output_dir += '/';
@@ -1079,32 +1225,16 @@ ProgramParams::ProgramParams(int argc, char *argv[])
                 this->crate_overrides.insert(::std::make_pair( mv$(name), mv$(path) ));
             }
             // --crate-tag <name>  >> Specify a version/identifier suffix for the crate
-            else if( strcmp(arg, "--crate-tag") == 0 ) {
-                if( i == argc - 1 ) {
-                    ::std::cerr << "Flag " << arg << " requires an argument" << ::std::endl;
-                    exit(1);
-                }
-                const char* name_str = argv[++i];
+            else if( const auto* name_str = check_with_arg("crate-tag") ) {
                 this->crate_name_suffix = name_str;
             }
             // --crate-name <name>  >> Specify the crate name (overrides `#![crate_name="<name>"]`)
-            else if( strcmp(arg, "--crate-name") == 0 ) {
-                if( i == argc - 1 ) {
-                    ::std::cerr << "Flag --crate-name requires an argument" << ::std::endl;
-                    exit(1);
-                }
-                const char* name_str = argv[++i];
+            else if( const auto* name_str = check_with_arg("crate-name") ) {
                 this->crate_name = name_str;
             }
             // `--crate-type <name>`    - Specify the crate type (overrides `#![crate_type="<name>"]`)
-            else if( strcmp(arg, "--crate-type") == 0 ) {
-                if( i == argc - 1 ) {
-                    ::std::cerr << "Flag --crate-type requires an argument" << ::std::endl;
-                    exit(1);
-                }
-                const char* type_str = argv[++i];
-
-                if( strcmp(type_str, "rlib") == 0 ) {
+            else if( const char* type_str = check_with_arg("crate-type") ) {
+                if( strcmp(type_str, "lib") == 0 || strcmp(type_str, "rlib") == 0 ) {
                     this->crate_type = ::AST::Crate::Type::RustLib;
                 }
                 else if( strcmp(type_str, "dylib") == 0 ) {
@@ -1117,7 +1247,7 @@ ProgramParams::ProgramParams(int argc, char *argv[])
                     this->crate_type = ::AST::Crate::Type::ProcMacro;
                 }
                 else {
-                    ::std::cerr << "Unknown value for --crate-type" << ::std::endl;
+                    ::std::cerr << "Unknown value for --crate-type: " << type_str << ::std::endl;
                     exit(1);
                 }
             }
@@ -1133,35 +1263,33 @@ ProgramParams::ProgramParams(int argc, char *argv[])
                     *p = '\0';
                     const char* opt = opt_and_val;
                     const char* val = p + 1;
+                    std::string s;
                     // TODO: Correctly parse the values.
                     // - Value should be a double-quoted string.
+                    if( val[0] == '"' ) {
+                        // TODO: Something cleaner than this.
+                        s = val+1;
+                        assert(s.back() == '"');
+                        s.pop_back();
+                        val = s.c_str();
+                    }
                     if( ::std::strcmp(opt, "feature") == 0 ) {
                         this->features.insert( ::std::string(val) );
                     }
                     else {
-                        if( val[0] == '"' ) {
-                            // TODO: Something cleaner than this.
-                            ::std::string   s = val+1;
-                            assert(s.back() == '"');
-                            s.pop_back();
-                            Cfg_SetValue(opt, s);
-                        }
-                        else {
-                            Cfg_SetValue(opt, val);
-                        }
+                        Cfg_SetValue(opt, val);
                     }
                 }
                 else {
                     Cfg_SetFlag(opt_and_val);
                 }
             }
+            else if( const char* emit = check_with_arg("emit") ) {
+                ::std::cerr << "Ignoring `--emit " << emit << "` for compatability with rustc" << std::endl;
+            }
             // `--target <triple>`  - Override the default compiler target
-            else if( strcmp(arg, "--target") == 0 ) {
-                if (i == argc - 1) {
-                    ::std::cerr << "Flag " << arg << " requires an argument" << ::std::endl;
-                    exit(1);
-                }
-                this->target = argv[++i];
+            else if( const char* target_name = check_with_arg("target") ) {
+                this->target = target_name;
             }
             else if( strcmp(arg, "--dump-target-spec") == 0 ) {
                 if (i == argc - 1) {
@@ -1173,18 +1301,18 @@ ProgramParams::ProgramParams(int argc, char *argv[])
             else if( strcmp(arg, "--test") == 0 ) {
                 this->test_harness = true;
             }
-            else if( strcmp(arg, "--edition") == 0 ) {
-                if (i == argc - 1) {
-                    ::std::cerr << "Flag " << arg << " requires an argument" << ::std::endl;
-                    exit(1);
-                }
-
-                const char* edition_str = argv[++i];
+            else if( const char* edition_str = check_with_arg("edition") ) {
                 if( strcmp(edition_str, "2015") == 0 ) {
                     this->edition = AST::Edition::Rust2015;
                 }
                 else if( strcmp(edition_str, "2018") == 0 ) {
                     this->edition = AST::Edition::Rust2018;
+                }
+                else if( strcmp(edition_str, "2021") == 0 ) {
+                    this->edition = AST::Edition::Rust2021;
+                }
+                else if( strcmp(edition_str, "2024") == 0 ) {
+                    this->edition = AST::Edition::Rust2024;
                 }
                 else {
                     ::std::cerr << "Unknown value for " << arg << " - '" << edition_str << "'" << ::std::endl;
@@ -1198,21 +1326,6 @@ ProgramParams::ProgramParams(int argc, char *argv[])
         }
     }
 
-
-    if( const auto* a = getenv("MRUSTC_TARGET_VER") )
-    {
-        if( strcmp(a, "1.19") == 0 ) {
-            gTargetVersion = TargetVersion::Rustc1_19;
-        }
-        else if( strcmp(a, "1.29") == 0 ) {
-            gTargetVersion = TargetVersion::Rustc1_29;
-        }
-        else if( strcmp(a, "1.39") == 0 ) {
-            gTargetVersion = TargetVersion::Rustc1_39;
-        }
-        else {
-        }
-    }
 
     if( const auto* a = getenv("MRUSTC_DUMP") )
     {

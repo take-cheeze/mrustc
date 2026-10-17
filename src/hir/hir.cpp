@@ -15,6 +15,8 @@
 #include "expr_state.hpp"
 #include <hir_expand/main_bindings.hpp>
 #include <mir/main_bindings.hpp>
+#include <mir/mir.hpp>
+#include <hir/expr.hpp>
 
 namespace HIR {
     ::std::ostream& operator<<(::std::ostream& os, const Publicity& x)
@@ -31,87 +33,141 @@ namespace HIR {
         return os;
     }
 
-    ::std::ostream& operator<<(::std::ostream& os, const ::HIR::Literal& v)
+    ::std::ostream& operator<<(::std::ostream& os, const ConstGeneric& x)
     {
-        TU_MATCH(::HIR::Literal, (v), (e),
-        (Invalid,
-            os << "!";
-            ),
-        (Defer,
-            os << "?";
-            ),
-        (Generic,
-            os << e;
-            ),
-        (List,
-            os << "[";
-            for(const auto& val : e)
-                os << " " << val << ",";
-            os << " ]";
-            ),
-        (Variant,
-            os << "#" << e.idx << ":" << *e.val;
-            ),
-        (Integer,
-            os << e;
-            ),
-        (Float,
-            os << e;
-            ),
-        (BorrowPath,
-            os << "&" << e;
-            ),
-        (BorrowData,
-            os << "&" << *e;
-            ),
-        (String,
-            os << "\"" << FmtEscaped(e) << "\"";
-            )
-        )
+        TU_MATCH_HDRA( (x), {)
+        TU_ARMA(Infer, e) {
+            os << "Infer";
+            if(e.index != ~0u) {
+                os << "(";
+                os << e.index;
+                os << ")";
+            }
+            }
+        TU_ARMA(Unevaluated, e) {
+            os << "Unevaluated(";
+            e->fmt(os);
+            os << ")";
+            }
+        TU_ARMA(Generic, e) os << "Generic(" << e << ")";
+        TU_ARMA(Evaluated, e)   os << "Evaluated(" << *e << ")";
+        }
         return os;
     }
-
-    bool operator==(const Literal& l, const Literal& r)
+    bool ConstGeneric::operator==(const ConstGeneric& x) const
     {
-        if( l.tag() != r.tag() )
+        if(this->tag() != x.tag())
             return false;
-        TU_MATCH(::HIR::Literal, (l,r), (le,re),
-        (Invalid,
-            ),
-        (Defer,
-            ),
-        (Generic,
-            return le == re;
-            ),
-        (List,
-            if( le.size() != re.size() )
-                return false;
-            for(unsigned int i = 0; i < le.size(); i ++)
-                if( le[i] != re[i] )
-                    return false;
-            ),
-        (Variant,
-            if( le.idx != re.idx )
-                return false;
-            return *le.val == *re.val;
-            ),
-        (Integer,
-            return le == re;
-            ),
-        (Float,
-            return le == re;
-            ),
-        (BorrowPath,
-            return le == re;
-            ),
-        (BorrowData,
-            return *le == *re;
-            ),
-        (String,
-            return le == re;
-            )
-        )
+        TU_MATCH_HDRA( (*this, x), {)
+        TU_ARMA(Infer, te, xe) return te.index == xe.index;
+        TU_ARMA(Unevaluated, te, xe)    return te == xe;
+        TU_ARMA(Generic, te, xe)    return te == xe;
+        TU_ARMA(Evaluated, te, xe)  return EncodedLiteralSlice(*te) == EncodedLiteralSlice(*xe);
+        }
         return true;
+    }
+
+    Ordering ConstGeneric::ord(const ConstGeneric& x) const
+    {
+        if(auto cmp = ::ord(static_cast<int>(this->tag()), static_cast<int>(x.tag())))  return cmp;
+        TU_MATCH_HDRA( (*this, x), {)
+        TU_ARMA(Infer, te, xe) {
+            if(auto cmp = ::ord(te.index, xe.index))    return cmp;
+            }
+        TU_ARMA(Unevaluated, te, xe) {
+            return te->ord(*xe);
+            }
+        TU_ARMA(Generic, te, xe) {
+            if(auto cmp = ::ord(te, xe))    return cmp;
+            }
+        TU_ARMA(Evaluated, te, xe) {
+            if(auto cmp = ::ord(EncodedLiteralSlice(*te), EncodedLiteralSlice(*xe)))    return cmp;
+            }
+        }
+        return OrdEqual;
+    }
+
+    ::std::ostream& operator<<(::std::ostream& os, const ConstGeneric_Unevaluated& x)
+    {
+        x.fmt(os);
+        return os;
+    }
+    ConstGeneric_Unevaluated::ConstGeneric_Unevaluated(HIR::ExprPtr ep)
+        : expr(std::make_shared<HIR::ExprPtr>(std::move(ep)))
+    {
+    }
+    ConstGeneric_Unevaluated ConstGeneric_Unevaluated::clone() const
+    {
+        return monomorph(Span(), MonomorphiserNop());
+    }
+    ConstGeneric_Unevaluated ConstGeneric_Unevaluated::monomorph(const Span& sp, const Monomorphiser& ms, bool allow_infer/*=true*/) const
+    {
+        ConstGeneric_Unevaluated    rv;
+        rv.params_impl = ms.monomorph_path_params(sp, params_impl, allow_infer);
+        rv.params_item = ms.monomorph_path_params(sp, params_item, allow_infer);
+        rv.expr = this->expr;
+        return rv;
+    }
+    Ordering ConstGeneric_Unevaluated::ord(const ConstGeneric_Unevaluated& x) const
+    {
+        if( this->expr.get() != x.expr.get() ) {
+            // If only one has populated MIR, they can't be equal (sort populated MIR after)
+            if( !this->expr->m_mir != !x.expr->m_mir ) {
+                return (this->expr->m_mir ? OrdGreater : OrdLess);
+            }
+
+            // HACK: If the inner is a const param on both, sort based on that.
+            // - Very similar to the ordering of TypeRef::Generic
+            const auto* tn = dynamic_cast<const HIR::ExprNode_ConstParam*>(&**this->expr);
+            const auto* xn = dynamic_cast<const HIR::ExprNode_ConstParam*>(&**x.expr);
+            if( tn && xn )
+            {
+                // Is this valid? What if they're from different scopes?
+                return ::ord(tn->m_binding, xn->m_binding);
+            }
+
+            // EVIL OPTION: Just compare the string representations
+            // - The fmt() routine prints MIR blocks (when populated) or the source expression
+            //   (when not) in a deterministic, pointer-free form, so this gives a stable order.
+            auto v_t = FMT(*this);
+            auto v_x = FMT(x);
+            return ::ord(v_t, v_x);
+        }
+        if(auto cmp = this->params_impl.ord(x.params_impl)) return cmp;
+        if(auto cmp = this->params_item.ord(x.params_item)) return cmp;
+        return OrdEqual;
+    }
+    void ConstGeneric_Unevaluated::fmt(::std::ostream& os) const
+    {
+        os << "{";
+        os << "0=" << this->params_impl;
+        os << "1=" << this->params_item;
+        os << "}";
+        if(expr->m_mir) {
+            for(const auto& b : expr->m_mir->blocks) {
+                os << "bb" << (&b - expr->m_mir->blocks.data()) << ":{ ";
+                for(const auto& s : b.statements) {
+                    os << s << "; ";
+                }
+                os << b.terminator;
+                os << " }";
+            }
+        }
+        else {
+            struct NoNewline: public ::std::ostream, ::std::streambuf {
+                ::std::ostream& inner;
+                NoNewline(::std::ostream& inner): ::std::ostream(this), inner(inner) {}
+                int overflow(int c) override {
+                    switch(c)
+                    {
+                    case '\n':  inner.put(' '); break;
+                    default:    inner.put(c);   break;
+                    }
+                    return 0;
+                }
+            } inner_os(os);
+            HIR_DumpExpr(inner_os, *expr);
+        }
     }
 
     ::std::ostream& operator<<(::std::ostream& os, const Struct::Repr& x) {
@@ -120,9 +176,7 @@ namespace HIR {
         {
         case Struct::Repr::Rust:    os << "Rust";   break;
         case Struct::Repr::C:   os << "C";  break;
-        case Struct::Repr::Packed:  os << "packed"; break;
         case Struct::Repr::Simd:    os << "simd";   break;
-        case Struct::Repr::Aligned: os << "align(?)";   break;
         case Struct::Repr::Transparent: os << "transparent";    break;
         }
         os << ")";
@@ -130,44 +184,14 @@ namespace HIR {
     }
 }
 
-HIR::Literal HIR::Literal::clone() const
+HIR::ConstGeneric HIR::ConstGeneric::clone() const
 {
-    TU_MATCH(::HIR::Literal, (*this), (e),
-    (Invalid,
-        return ::HIR::Literal();
-        ),
-    (Defer,
-        return ::HIR::Literal::make_Defer({});
-        ),
-    (Generic,
-        return ::HIR::Literal(e);
-        ),
-    (List,
-        ::std::vector< ::HIR::Literal>  vals;
-        for(const auto& val : e) {
-            vals.push_back( val.clone() );
-        }
-        return ::HIR::Literal( mv$(vals) );
-        ),
-    (Variant,
-        return ::HIR::Literal::make_Variant({ e.idx, box$(e.val->clone()) });
-        ),
-    (Integer,
-        return ::HIR::Literal(e);
-        ),
-    (Float,
-        return ::HIR::Literal(e);
-        ),
-    (BorrowPath,
-        return ::HIR::Literal(e.clone());
-        ),
-    (BorrowData,
-        return ::HIR::Literal(box$( e->clone() ));
-        ),
-    (String,
-        return ::HIR::Literal(e);
-        )
-    )
+    TU_MATCH_HDRA( (*this), {)
+    TU_ARMA(Infer, e) return e;
+    TU_ARMA(Unevaluated, e) return ::std::make_unique<ConstGeneric_Unevaluated>(e->clone());
+    TU_ARMA(Generic, e) return e;
+    TU_ARMA(Evaluated, e)   return EncodedLiteralPtr(e->clone());
+    }
     throw "";
 }
 
@@ -175,6 +199,7 @@ HIR::Literal HIR::Literal::clone() const
 
 bool HIR::Publicity::is_visible(const ::HIR::SimplePath& p) const
 {
+    DEBUG(*this << " " << p);
     // No path = global public
     if( !vis_path )
         return true;
@@ -182,18 +207,33 @@ bool HIR::Publicity::is_visible(const ::HIR::SimplePath& p) const
     if( *vis_path == *none_path ) {
         return false;
     }
-    // Crate names must match
-    if(p.m_crate_name != vis_path->m_crate_name)
-        return false;
-    // `p` must be a child of vis_path
-    if(p.m_components.size() < vis_path->m_components.size())
-        return false;
-    for(size_t i = 0; i < vis_path->m_components.size(); i ++)
-    {
-        if(p.m_components[i] != vis_path->m_components[i])
-            return false;
-    }
-    return true;
+    // `p` must be a child of vis_path (i.e. starts with it)
+    return p.starts_with(*vis_path);
+}
+
+::HIR::TypeRef HIR::Function::make_ptr_ty(const Span& sp, const Monomorphiser& ms) const
+{
+    ::HIR::TypeData_FunctionPointer ft;
+    ft.is_unsafe   = this->m_unsafe;
+    ft.is_variadic = this->m_variadic;
+    ft.m_abi = this->m_abi;
+    ft.m_rettype = ms.monomorph_type(sp, this->m_return);
+    ft.m_arg_types.reserve(this->m_args.size());
+    for(const auto& arg : this->m_args)
+        ft.m_arg_types.push_back( ms.monomorph_type(sp, arg.second) );
+    return HIR::TypeRef(std::move(ft));
+}
+::HIR::TypeRef HIR::fn_ptr_tuple_constructor(const Span& sp, const Monomorphiser& ms, HIR::TypeRef ret_ty, const t_tuple_fields& fields)
+{
+    ::HIR::TypeData_FunctionPointer ft;
+    ft.is_unsafe   = false;
+    ft.is_variadic = false;
+    ft.m_abi = RcString::new_interned(ABI_RUST);
+    ft.m_rettype = std::move(ret_ty);
+    ft.m_arg_types.reserve(fields.size());
+    for(const auto& fld : fields)
+        ft.m_arg_types.push_back( ms.monomorph_type(sp, fld.ent) );
+    return HIR::TypeRef(std::move(ft));
 }
 
 size_t HIR::Enum::find_variant(const RcString& name) const
@@ -235,12 +275,11 @@ uint32_t HIR::Enum::get_value(size_t idx) const
         throw "";
     }
 }
-/*static*/ ::HIR::TypeRef HIR::Enum::get_repr_type(Repr r)
+/*static*/ ::HIR::CoreType HIR::Enum::get_repr_type(Repr r)
 {
     switch(r)
     {
-    case ::HIR::Enum::Repr::Rust:
-    case ::HIR::Enum::Repr::C:
+    case ::HIR::Enum::Repr::Auto:
         return ::HIR::CoreType::Isize;
         break;
     case ::HIR::Enum::Repr::Usize: return ::HIR::CoreType::Usize; break;
@@ -248,6 +287,11 @@ uint32_t HIR::Enum::get_value(size_t idx) const
     case ::HIR::Enum::Repr::U16: return ::HIR::CoreType::U16; break;
     case ::HIR::Enum::Repr::U32: return ::HIR::CoreType::U32; break;
     case ::HIR::Enum::Repr::U64: return ::HIR::CoreType::U64; break;
+    case ::HIR::Enum::Repr::Isize: return ::HIR::CoreType::Isize; break;
+    case ::HIR::Enum::Repr::I8 : return ::HIR::CoreType::I8 ; break;
+    case ::HIR::Enum::Repr::I16: return ::HIR::CoreType::I16; break;
+    case ::HIR::Enum::Repr::I32: return ::HIR::CoreType::I32; break;
+    case ::HIR::Enum::Repr::I64: return ::HIR::CoreType::I64; break;
     }
     throw "";
 }
@@ -271,36 +315,57 @@ const ::HIR::SimplePath& ::HIR::Crate::get_lang_item_path_opt(const char* name) 
     return it->second;
 }
 
+namespace {
+    const ::HIR::Module& get_containing_module(const ::HIR::Crate& crate, const Span& sp, const ::HIR::SimplePath& path, bool ignore_crate_name, bool ignore_last_node)
+    {
+        ASSERT_BUG(sp, path.components().size() > 0u, "Invalid path (no nodes) - " << path);
+        ASSERT_BUG(sp, path.components().size() > (ignore_last_node ? 1u : 0u), "Invalid path (only one node with `ignore_last_node` - " << path);
+
+        const ::HIR::Module* mod;
+        if( !ignore_crate_name && path.crate_name() != crate.m_crate_name ) {
+            ASSERT_BUG(sp, crate.m_ext_crates.count(path.crate_name()) > 0, "Crate '" << path.crate_name() << "' not loaded for " << path);
+            mod = &crate.m_ext_crates.at(path.crate_name()).m_data->m_root_module;
+        }
+        else {
+            mod =  &crate.m_root_module;
+        }
+        for( unsigned int i = 0; i < path.components().size() - (ignore_last_node ? 2 : 1); i ++ )
+        {
+            const auto& pc = path.components()[i];
+            auto it = mod->m_mod_items.find( pc );
+            if( it == mod->m_mod_items.end() ) {
+                BUG(sp, "Couldn't find component " << i << " of " << path);
+            }
+            if(const auto* e = it->second->ent.opt_Module()) {
+                mod = e;
+            }
+            else {
+                BUG(sp, "Node " << i << " of path " << path << " wasn't a module");
+            }
+        }
+        return *mod;
+    }
+}
+
+const ::HIR::MacroItem& ::HIR::Crate::get_macroitem_by_path(const Span& sp, const ::HIR::SimplePath& path, bool ignore_crate_name, bool ignore_last_node) const
+{
+    const auto& mod = get_containing_module(*this, sp, path, ignore_crate_name, ignore_last_node);
+
+    auto it = mod.m_macro_items.find( ignore_last_node ? path.components()[path.components().size()-2] : path.components().back() );
+    if( it == mod.m_macro_items.end() ) {
+        BUG(sp, "Could not find macro name in " << path);
+    }
+
+    return it->second->ent;
+}
+
 const ::HIR::TypeItem& ::HIR::Crate::get_typeitem_by_path(const Span& sp, const ::HIR::SimplePath& path, bool ignore_crate_name, bool ignore_last_node) const
 {
-    ASSERT_BUG(sp, path.m_components.size() > 0u, "get_typeitem_by_path received invalid path - " << path);
-    ASSERT_BUG(sp, path.m_components.size() > (ignore_last_node ? 1u : 0u), "get_typeitem_by_path received invalid path - " << path);
+    const auto& mod = get_containing_module(*this, sp, path, ignore_crate_name, ignore_last_node);
 
-    const ::HIR::Module* mod;
-    if( !ignore_crate_name && path.m_crate_name != m_crate_name ) {
-        ASSERT_BUG(sp, m_ext_crates.count(path.m_crate_name) > 0, "Crate '" << path.m_crate_name << "' not loaded for " << path);
-        mod = &m_ext_crates.at(path.m_crate_name).m_data->m_root_module;
-    }
-    else {
-        mod =  &this->m_root_module;
-    }
-    for( unsigned int i = 0; i < path.m_components.size() - (ignore_last_node ? 2 : 1); i ++ )
-    {
-        const auto& pc = path.m_components[i];
-        auto it = mod->m_mod_items.find( pc );
-        if( it == mod->m_mod_items.end() ) {
-            BUG(sp, "Couldn't find component " << i << " of " << path);
-        }
-        TU_IFLET(::HIR::TypeItem, it->second->ent, Module, e,
-            mod = &e;
-        )
-        else {
-            BUG(sp, "Node " << i << " of path " << path << " wasn't a module");
-        }
-    }
-    auto it = mod->m_mod_items.find( ignore_last_node ? path.m_components[path.m_components.size()-2] : path.m_components.back() );
-    if( it == mod->m_mod_items.end() ) {
-        BUG(sp, "Could not find type name in " << path);
+    auto it = mod.m_mod_items.find( ignore_last_node ? path.components()[path.components().size()-2] : path.components().back() );
+    if( it == mod.m_mod_items.end() ) {
+        BUG(sp, "Could not find type " << path);
     }
 
     return it->second->ent;
@@ -310,14 +375,15 @@ const ::HIR::Module& ::HIR::Crate::get_mod_by_path(const Span& sp, const ::HIR::
 {
     if( ignore_last_node )
     {
-        ASSERT_BUG(sp, path.m_components.size() > 0, "get_mod_by_path received invalid path with ignore_last_node=true - " << path);
+        ASSERT_BUG(sp, path.components().size() > 0, "get_mod_by_path received invalid path with ignore_last_node=true - " << path);
     }
-    if( path.m_components.size() == (ignore_last_node ? 1 : 0) )
+    // Special handling for empty paths with `ignore_last_node`
+    if( path.components().size() == (ignore_last_node ? 1 : 0) )
     {
-        if( !ignore_crate_name && path.m_crate_name != m_crate_name )
+        if( !ignore_crate_name && path.crate_name() != m_crate_name )
         {
-            ASSERT_BUG(sp, m_ext_crates.count(path.m_crate_name) > 0, "Crate '" << path.m_crate_name << "' not loaded");
-            return m_ext_crates.at(path.m_crate_name).m_data->m_root_module;
+            ASSERT_BUG(sp, m_ext_crates.count(path.crate_name()) > 0, "Crate '" << path.crate_name() << "' not loaded");
+            return m_ext_crates.at(path.crate_name()).m_data->m_root_module;
         }
         else
         {
@@ -327,9 +393,10 @@ const ::HIR::Module& ::HIR::Crate::get_mod_by_path(const Span& sp, const ::HIR::
     else
     {
         const auto& ti = this->get_typeitem_by_path(sp, path, ignore_crate_name, ignore_last_node);
-        TU_IFLET(::HIR::TypeItem, ti, Module, e,
-            return e;
-        )
+        if(auto* e = ti.opt_Module())
+        {
+            return *e;
+        }
         else {
             if( ignore_last_node )
                 BUG(sp, "Parent path of " << path << " didn't point to a module");
@@ -345,7 +412,7 @@ const ::HIR::Trait& ::HIR::Crate::get_trait_by_path(const Span& sp, const ::HIR:
         return e;
     )
     else {
-        BUG(sp, "Trait path " << path << " didn't point to a trait");
+        BUG(sp, "Trait path " << path << " didn't point to a trait (" << ti.tag_str() << ")");
     }
 }
 const ::HIR::Struct& ::HIR::Crate::get_struct_by_path(const Span& sp, const ::HIR::SimplePath& path) const
@@ -355,7 +422,7 @@ const ::HIR::Struct& ::HIR::Crate::get_struct_by_path(const Span& sp, const ::HI
         return e;
     )
     else {
-        BUG(sp, "Struct path " << path << " didn't point to a struct");
+        BUG(sp, "Struct path " << path << " didn't point to a struct (" << ti.tag_str() << ")");
     }
 }
 const ::HIR::Union& ::HIR::Crate::get_union_by_path(const Span& sp, const ::HIR::SimplePath& path) const
@@ -365,49 +432,56 @@ const ::HIR::Union& ::HIR::Crate::get_union_by_path(const Span& sp, const ::HIR:
         return e;
     )
     else {
-        BUG(sp, "Path " << path << " didn't point to a union");
+        BUG(sp, "Path " << path << " didn't point to a union (" << ti.tag_str() << ")");
     }
 }
-const ::HIR::Enum& ::HIR::Crate::get_enum_by_path(const Span& sp, const ::HIR::SimplePath& path) const
+const ::HIR::Enum& ::HIR::Crate::get_enum_by_path(const Span& sp, const ::HIR::SimplePath& path, bool ignore_crate_name, bool ignore_last_node) const
 {
-    const auto& ti = this->get_typeitem_by_path(sp, path);
+    const auto& ti = this->get_typeitem_by_path(sp, path, ignore_crate_name, ignore_last_node);
     TU_IFLET(::HIR::TypeItem, ti, Enum, e,
         return e;
     )
     else {
-        BUG(sp, "Enum path " << path << " didn't point to an enum");
+        BUG(sp, "Enum path " << path << " didn't point to an enum (" << ti.tag_str() << ")");
     }
+}
+
+namespace {
+    ::HIR::ValueItem    g_val_item_intrnsic_offsetof {
+        ::HIR::Function {
+            ::HIR::Function::Receiver::Free,
+            ::HIR::GenericParams {},
+            {},
+            HIR::TypeRef(HIR::CoreType::Usize),
+            {}
+        }
+    };
 }
 
 const ::HIR::ValueItem& ::HIR::Crate::get_valitem_by_path(const Span& sp, const ::HIR::SimplePath& path, bool ignore_crate_name) const
 {
-    if( path.m_components.size() == 0) {
-        BUG(sp, "get_valitem_by_path received invalid path");
-    }
-    const ::HIR::Module* mod;
-    if( !ignore_crate_name && path.m_crate_name != m_crate_name ) {
-        ASSERT_BUG(sp, m_ext_crates.count(path.m_crate_name) > 0, "Crate '" << path.m_crate_name << "' not loaded");
-        mod = &m_ext_crates.at(path.m_crate_name).m_data->m_root_module;
-    }
-    else {
-        mod =  &this->m_root_module;
-    }
-    for( unsigned int i = 0; i < path.m_components.size() - 1; i ++ )
-    {
-        const auto& pc = path.m_components[i];
-        auto it = mod->m_mod_items.find( pc );
-        if( it == mod->m_mod_items.end() ) {
-            BUG(sp, "Couldn't find component " << i << " of " << path);
+    if( path.crate_name() == "#intrinsics" ) {
+        ASSERT_BUG(sp, path.components().size() == 1, "");
+        if( path.components().back() == "offset_of" ) {
+            if( ! g_val_item_intrnsic_offsetof.as_Function().m_variadic ) {
+                auto& v =  g_val_item_intrnsic_offsetof.as_Function();
+                v.m_variadic = true;
+                v.m_params.m_types.push_back(HIR::TypeParamDef { RcString::new_interned("T"), {}, true });
+            }
+            return g_val_item_intrnsic_offsetof;
         }
-        TU_IFLET(::HIR::TypeItem, it->second->ent, Module, e,
-            mod = &e;
-        )
-        else {
-            BUG(sp, "Node " << i << " of path " << path << " wasn't a module");
+        TODO(sp, "Get intrinsic " << path.components().back());
+    }
+    if( path.crate_name() == this->m_crate_name && path.components().size() == 1 ) {
+        auto i = std::find_if(m_new_values.begin(), m_new_values.end(), [&](const auto& v){ return v.first == path.components().back(); });
+        if( i != m_new_values.end() ) {
+            return i->second->ent;
         }
     }
-    auto it = mod->m_value_items.find( path.m_components.back() );
-    if( it == mod->m_value_items.end() ) {
+    const auto& mod = get_containing_module(*this, sp, path, ignore_crate_name, /*ignore_last_node=*/false);
+
+    auto it = mod.m_value_items.find( path.components().back() );
+    if( it == mod.m_value_items.end() ) {
         BUG(sp, "Could not find value name " << path);
     }
 
@@ -420,7 +494,7 @@ const ::HIR::Function& ::HIR::Crate::get_function_by_path(const Span& sp, const 
         return e;
     )
     else {
-        BUG(sp, "Function path " << path << " didn't point to an function");
+        BUG(sp, "Function path " << path << " didn't point to an function (" << ti.tag_str() << ")");
     }
 }
 
@@ -428,17 +502,23 @@ const ::HIR::Function& ::HIR::Crate::get_function_by_path(const Span& sp, const 
 const ::HIR::Static& ::HIR::Crate::get_static_by_path(const Span& sp, const ::HIR::SimplePath& path) const
 {
     const auto& m = this->get_mod_by_path(sp, path, /*ignore_last*/true);
-    auto it = m.m_value_items.find(path.m_components.back());
+    auto it = m.m_value_items.find(path.components().back());
     if(it != m.m_value_items.end())
     {
-        ASSERT_BUG(sp, it->second->ent.is_Static(), "`static` path " << path << " didn't point to a static");
+        ASSERT_BUG(sp, it->second->ent.is_Static(), "`static` path " << path << " didn't point to a static - " << it->second->ent.tag_str());
         return it->second->ent.as_Static();
     }
     for(const auto& e : m.m_inline_statics)
     {
-        if(e.first == path.m_components.back())
+        if(e.first == path.components().back())
         {
-            return e.second;
+            return *e.second;
+        }
+    }
+    if( path.crate_name() == this->m_crate_name && path.components().size() == 1 ) {
+        auto i = std::find_if(m_new_values.begin(), m_new_values.end(), [&](const auto& v){ return v.first == path.components().back(); });
+        if( i != m_new_values.end() ) {
+            return i->second->ent.as_Static();
         }
     }
     BUG(sp, "`static` path " << path << " can't be found");

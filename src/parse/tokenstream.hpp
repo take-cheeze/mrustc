@@ -24,16 +24,15 @@ namespace AST {
 /// State the parser needs to pass down via a second channel.
 struct ParseState
 {
-private:
-    AST::Edition edition;
 public:
-    ParseState(AST::Edition e):
-        edition(e)
+    ParseState()
     {
     }
 
     // Used for "for/if/while" to handle ambiguity
     bool disallow_struct_literal = false;
+    // Used for match arms to disallow `foo => if false {} (bar) => ...`
+    bool disallow_call_or_index = false;
     // A debugging hook that disables expansion of macros
     bool no_expand_macros = false;
 
@@ -45,10 +44,6 @@ public:
         assert(this->module);
         return *this->module;
     }
-
-    AST::Edition get_edition() const { return edition; }
-    bool edition_after(AST::Edition e) { return edition >= e; }
-    bool edition_before(AST::Edition e) { return edition < e; }
 
     friend ::std::ostream& operator<<(::std::ostream& os, const ParseState& ps) {
         os << "ParseState {";
@@ -66,20 +61,52 @@ class TokenStream
     bool    m_cache_valid;
     Token   m_cache;
     Ident::Hygiene  m_hygiene;
-    ::std::vector< ::std::pair<Token, Ident::Hygiene> > m_lookahead;
+    AST::Edition    m_edition;
+    struct LookaheadEnt {
+        Token   tok;
+        AST::Edition    edition;
+        Ident::Hygiene  hygiene;
+    };
+    ::std::vector< LookaheadEnt > m_lookahead;
     ParseState  m_parse_state;
 public:
     TokenStream(ParseState ps);
     virtual ~TokenStream();
     Token   getToken();
+    /// <summary>Consumes a token if it is of the specified type</summary>
+    bool   getTokenIf(eTokenType exp) { // I'd like std::optional, but not available
+        if(lookahead(0) == exp) {
+            getToken();
+            return true;
+        }
+        else {
+            return false;
+        }
+    }
+    /// <summary>Consumes a token if it is of the specified type</summary>
+    bool   getTokenIf(eTokenType exp, Token& dst) { // I'd like std::optional, but not available
+        if(lookahead(0) == exp) {
+            dst = getToken();
+            return true;
+        }
+        else {
+            return false;
+        }
+    }
+    /// <summary>Obtains a token, asserting that it's of the specified type</summary>
+    Token   getTokenCheck(eTokenType exp);
     void    putback(Token tok);
     eTokenType  lookahead(unsigned int count);
 
-    Ident::Hygiene getHygiene() const;
+    Ident::Hygiene get_hygiene() const;
     virtual void push_hygine() {}
     virtual void pop_hygine() {}
 
     ParseState& parse_state() { return m_parse_state; }
+
+    AST::Edition get_edition() const { return m_edition; }
+    bool edition_after(AST::Edition e) const { return m_edition >= e; }
+    bool edition_before(AST::Edition e) const { return m_edition < e; }
 
     ProtoSpan   start_span() const;
     Span    end_span(ProtoSpan ps) const;
@@ -89,12 +116,11 @@ public:
         return Span(outerSpan(), p);
     }
 
-    Ident get_ident(Token tok) const;
-
 protected:
     virtual Position getPosition() const = 0;
     virtual Span    outerSpan() const { return Span(); }
     virtual Token   realGetToken() = 0;
+    virtual AST::Edition realGetEdition() const = 0;
     virtual Ident::Hygiene realGetHygiene() const = 0;
 private:
     Token innerGetToken();
@@ -121,4 +147,5 @@ public:
 #define SET_ATTRS(lex, attrs)    SavedParseState _sps(lex, lex.parse_state()); lex.parse_state().parent_attrs = &(attrs)
 #define SET_PARSE_FLAG(lex, flag)    SavedParseState _sps(lex, lex.parse_state()); lex.parse_state().flag = true
 #define CLEAR_PARSE_FLAG(lex, flag)    SavedParseState _sps(lex, lex.parse_state()); lex.parse_state().flag = false
+#define CLEAR_PARSE_FLAGS_EXPR(lex)    SavedParseState _sps(lex, lex.parse_state()); lex.parse_state().disallow_struct_literal = false; lex.parse_state().disallow_call_or_index = false
 #define CHECK_PARSE_FLAG(lex, flag) (lex.parse_state().flag == true)

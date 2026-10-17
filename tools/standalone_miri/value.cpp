@@ -15,7 +15,7 @@
 
 namespace {
     static bool in_bounds(size_t ofs, size_t size, size_t max_size) {
-        if( !(ofs < max_size) )
+        if( !(ofs <= max_size) )
             return false;
         if( !(size <= max_size) )
             return false;
@@ -56,19 +56,13 @@ namespace {
 
 ::std::ostream& operator<<(::std::ostream& os, const Allocation* x)
 {
-    os << "A(#" << x->m_index << " " << x->tag() /*<< " +" << x->size()*/ << ")";
+    os << "A(#" << x->m_index << " " << x->tag() << " s=" << x->size() << ")";
     return os;
 }
 
-FfiLayout FfiLayout::new_const_bytes(size_t s)
+bool FfiPointerInner::is_valid_read(size_t o, size_t s) const
 {
-    return FfiLayout {
-        { Range {s, true, false} }
-        };
-}
-bool FfiLayout::is_valid_read(size_t o, size_t s) const
-{
-    for(const auto& r : ranges)
+    for(const auto& r : layout)
     {
         if( o < r.len ) {
             if( !r.is_valid )
@@ -128,6 +122,7 @@ AllocationHandle::~AllocationHandle()
         {
             delete m_ptr;
         }
+        m_ptr = nullptr;
     }
 }
 
@@ -235,6 +230,10 @@ size_t RelocationPtr::get_size() const
     }
     throw "Unreachable";
 }
+size_t RelocationPtr::get_base() const
+{
+    return 0x1000;
+}
 
 ::std::ostream& operator<<(::std::ostream& os, const RelocationPtr& x)
 {
@@ -249,10 +248,10 @@ size_t RelocationPtr::get_size() const
             os << x.fcn();
             break;
         case RelocationPtr::Ty::StdString:
-            os << "\"" << x.str() << "\"";
+            os << "\"" << FmtEscaped(x.str()) << "\"";
             break;
         case RelocationPtr::Ty::FfiPointer:
-            os << "FFI '" << x.ffi().tag_name << "' " << x.ffi().ptr_value;
+            os << "FFI '" << x.ffi().tag_name() << "' " << x.ffi().ptr_value();
             break;
         }
     }
@@ -273,15 +272,24 @@ void ValueCommonWrite::write_usize(size_t ofs, uint64_t v)
 {
     this->write_bytes(ofs, &v, POINTER_SIZE);
 }
+const ::HIR::Path& ValueCommonRead::read_pointer_fcn(size_t rd_ofs) const
+{
+    auto reloc = get_relocation(rd_ofs);
+    auto ofs = read_usize(rd_ofs);
+    LOG_ASSERT(ofs >= reloc.get_base(), "Invalid pointer read");
+    LOG_ASSERT(reloc.get_ty() == RelocationPtr::Ty::Function, "");
+    LOG_ASSERT(ofs == reloc.get_base(), "Function pointer offet not zero");
+    return reloc.fcn();
+}
 void* ValueCommonRead::read_pointer_tagged_null(size_t rd_ofs, const char* tag) const
 {
+    auto reloc = get_relocation(rd_ofs);
     auto ofs = read_usize(rd_ofs);
-    LOG_ASSERT(ofs >= Allocation::PTR_BASE, "Deref of invalid pointer");
-    ofs -= Allocation::PTR_BASE;
+    LOG_ASSERT(ofs >= reloc.get_base(), "Invalid pointer read");
+    ofs -= reloc.get_base();
     if( ofs != 0 ) {
         LOG_FATAL("Read a non-zero offset for tagged pointer");
     }
-    auto reloc = get_relocation(rd_ofs);
     //LOG_TODO("read_pointer_tagged_null(" << rd_ofs << ", '" << tag << "')");
     if( !reloc )
     {
@@ -293,11 +301,11 @@ void* ValueCommonRead::read_pointer_tagged_null(size_t rd_ofs, const char* tag) 
         {
         case RelocationPtr::Ty::FfiPointer: {
             const auto& f = reloc.ffi();
-            assert(f.tag_name);
             assert(tag);
-            if( ::std::strcmp(f.tag_name, tag) != 0 )
-                LOG_FATAL("Expected a '" << tag <<  "' pointer, got a '" << f.tag_name << "' pointer");
-            return f.ptr_value;
+            LOG_ASSERT(f.tag_name(), "Expected a '" << tag << "' pointer, but no tag present");
+            if( ::std::strcmp(f.tag_name(), tag) != 0 )
+                LOG_FATAL("Expected a '" << tag <<  "' pointer, got a '" << f.tag_name() << "' pointer");
+            return f.ptr_value();
             }
         default:
             LOG_FATAL("Reading a tagged pointer from non-FFI source");
@@ -306,10 +314,10 @@ void* ValueCommonRead::read_pointer_tagged_null(size_t rd_ofs, const char* tag) 
 }
 void* ValueCommonRead::read_pointer_unsafe(size_t rd_ofs, size_t req_valid, size_t& out_size, bool& out_is_mut) const
 {
-    auto ofs = read_usize(rd_ofs);
-    LOG_ASSERT(ofs >= Allocation::PTR_BASE, "Deref of invalid pointer");
-    ofs -= Allocation::PTR_BASE;
     auto reloc = get_relocation(rd_ofs);
+    auto ofs = read_usize(rd_ofs);
+    LOG_ASSERT(ofs >= reloc.get_base(), "Invalid pointer read - pointer value 0x" << std::hex << ofs << " isn't above relocation base (0x" << std::hex << reloc.get_base() << ")");
+    ofs -= reloc.get_base();
     if( !reloc )
     {
         if( ofs != 0 ) {
@@ -353,7 +361,7 @@ void* ValueCommonRead::read_pointer_unsafe(size_t rd_ofs, size_t req_valid, size
             // TODO: Have an idea of mutability and available size from FFI
             out_size = size - ofs;
             out_is_mut = false;
-            return reinterpret_cast<char*>(reloc.ffi().ptr_value) + ofs;
+            return reinterpret_cast<char*>(reloc.ffi().ptr_value()) + ofs;
             }
         }
         throw "";
@@ -361,14 +369,18 @@ void* ValueCommonRead::read_pointer_unsafe(size_t rd_ofs, size_t req_valid, size
 }
 ValueRef ValueCommonRead::read_pointer_valref_mut(size_t rd_ofs, size_t size)
 {
-    auto ofs = read_usize(rd_ofs);
-    LOG_ASSERT(ofs >= Allocation::PTR_BASE, "Invalid pointer read");
-    ofs -= Allocation::PTR_BASE;
     auto reloc = get_relocation(rd_ofs);
+    auto ofs = read_usize(rd_ofs);
+    LOG_ASSERT(ofs >= reloc.get_base(), "Invalid pointer read");
+    ofs -= reloc.get_base();
     LOG_DEBUG("ValueCommonRead::read_pointer_valref_mut(" << ofs << "+" << size << ", reloc=" << reloc << ")");
     if( !reloc )
     {
         LOG_ERROR("Getting ValRef to null pointer (no relocation)");
+    }
+    else if(ofs == 0 && size == 0)
+    {
+        return ValueRef(reloc, ofs, size);
     }
     else
     {
@@ -382,7 +394,7 @@ ValueRef ValueCommonRead::read_pointer_valref_mut(size_t rd_ofs, size_t size)
             LOG_ASSERT( in_bounds(ofs, size,  reloc.str().size()), "Deref with OOB size - " << ofs << "+" << size << " > " << reloc.str().size() );
             break;
         case RelocationPtr::Ty::Function:
-            LOG_FATAL("read_pointer_valref_mut w/ function");
+            LOG_FATAL("Called read_pointer_valref_mut with a Function");
         case RelocationPtr::Ty::FfiPointer:
             LOG_ASSERT( in_bounds(ofs, size,  reloc.ffi().get_size()), "Deref with OOB size - " << ofs << "+" << size << " > " << reloc.ffi().get_size() );
             break;
@@ -434,8 +446,7 @@ Value Allocation::read_value(size_t ofs, size_t size) const
 {
     Value rv;
     //TRACE_FUNCTION_R("Allocation::read_value " << this << " " << ofs << "+" << size, *this << " | " << size << "=" << rv);
-    if( this->is_freed )
-        LOG_ERROR("Use of freed memory " << this);
+    LOG_ASSERT(!this->is_freed, "Use of freed memory " << this);
     LOG_DEBUG(*this);
     LOG_ASSERT( in_bounds(ofs, size, this->size()), "Read out of bounds (" << ofs << "+" << size << " > " << this->size() << ")" );
 
@@ -486,7 +497,10 @@ void Allocation::read_bytes(size_t ofs, void* dst, size_t count) const
 }
 void Allocation::write_value(size_t ofs, Value v)
 {
-    TRACE_FUNCTION_R("Allocation::write_value " << this << " " << ofs << "+" << v.size() << " " << v, *this);
+    TRACE_FUNCTION_R(
+        "Allocation::write_value " << this << " " << ofs << "+" << v.size() << " " << v,
+        "" // << *this
+        );
     if( this->is_freed )
         LOG_ERROR("Use of freed memory " << this);
     //if( this->is_read_only )
@@ -534,8 +548,7 @@ void Allocation::write_value(size_t ofs, Value v)
 void Allocation::write_bytes(size_t ofs, const void* src, size_t count)
 {
     //LOG_DEBUG("Allocation::write_bytes " << this << " " << ofs << "+" << count);
-    if( this->is_freed )
-        LOG_ERROR("Use of freed memory " << this);
+    LOG_ASSERT(!this->is_freed, "Use of (write-to) freed memory " << this);
     //if( this->is_read_only )
     //    LOG_ERROR("Writing to read-only allocation " << this);
 
@@ -568,7 +581,7 @@ void Allocation::write_bytes(size_t ofs, const void* src, size_t count)
 }
 void Allocation::write_ptr(size_t ofs, size_t ptr_ofs, RelocationPtr reloc)
 {
-    LOG_ASSERT(ptr_ofs >= Allocation::PTR_BASE, "Invalid pointer being written");
+    LOG_ASSERT(ptr_ofs >= reloc.get_base(), "Invalid pointer being written");
     this->write_usize(ofs, ptr_ofs);
     this->set_reloc(ofs, POINTER_SIZE, ::std::move(reloc));
 }
@@ -610,20 +623,29 @@ void Allocation::set_reloc(size_t ofs, size_t len, RelocationPtr reloc)
             os << "--";
         }
     }
-    os.setf(flags);
+    os << ::std::dec;
 
     os << " {";
     for(const auto& r : x.relocations)
     {
-        if( 0 <= r.slot_ofs && r.slot_ofs < x.size() )
+        if( /*0 <= r.slot_ofs &&*/ r.slot_ofs < x.size() )
         {
             os << " @" << r.slot_ofs << "=" << r.backing_alloc;
         }
     }
+    os.flags(flags);
     os << " }";
     return os;
 }
 
+Value::~Value()
+{
+    if(m_inner.is_alloc && m_inner.alloc.alloc)
+    {
+        // Mark the allocation as free
+        m_inner.alloc.alloc->mark_as_freed();
+    }
+}
 Value::Value()
 {
 }
@@ -666,15 +688,19 @@ Value Value::with_size(size_t size, bool have_allocation)
 Value Value::new_fnptr(const ::HIR::Path& fn_path)
 {
     Value   rv( ::HIR::TypeRef(::HIR::CoreType { RawType::Function }) );
-    rv.write_ptr(0, Allocation::PTR_BASE, RelocationPtr::new_fcn(fn_path));
+    rv.write_ptr_ofs(0, 0, RelocationPtr::new_fcn(fn_path));
     return rv;
 }
 Value Value::new_ffiptr(FFIPointer ffi)
 {
     Value   rv( ::HIR::TypeRef(::HIR::CoreType { RawType::USize }) );
     assert( !rv.m_inner.is_alloc );
-    rv.write_ptr(0, Allocation::PTR_BASE, RelocationPtr::new_ffi(ffi));
+    rv.write_ptr_ofs(0, 0, RelocationPtr::new_ffi(ffi));
     return rv;
+}
+Value Value::new_pointer_ofs(::HIR::TypeRef ty, uint64_t ofs, RelocationPtr r) {
+    ofs += r.get_base();
+    return Value::new_pointer(ty, ofs, std::move(r));
 }
 Value Value::new_pointer(::HIR::TypeRef ty, uint64_t v, RelocationPtr r) {
     assert(ty.get_wrapper());
@@ -709,10 +735,11 @@ Value Value::new_i64(int64_t v) {
     return rv;
 }
 
-void Value::create_allocation()
+void Value::create_allocation(std::string loc)
 {
+    LOG_DEBUG(loc << " - Creating allocation for " << *this);
     assert(!m_inner.is_alloc);
-    auto new_alloc = Allocation::new_alloc(m_inner.direct.size, "create_allocation");   // TODO: Provide a better name?
+    auto new_alloc = Allocation::new_alloc(m_inner.direct.size, "create_allocation:"+loc);   // TODO: Provide a better name?
     auto& direct = m_inner.direct;
     if( direct.size > 0 )
         new_alloc->m_mask[0] = direct.mask[0];
@@ -771,7 +798,10 @@ Value Value::read_value(size_t ofs, size_t size) const
         // Inline always fits in inline.
         if( ofs == 0 && size == this->size() )
         {
-            rv = Value(*this);
+            rv.m_inner.direct.size = this->m_inner.direct.size;
+            memcpy(rv.m_inner.direct.data, this->m_inner.direct.data, sizeof(this->m_inner.direct.data));
+            memcpy(rv.m_inner.direct.mask, this->m_inner.direct.mask, sizeof(this->m_inner.direct.mask));
+            rv.m_inner.direct.reloc_0 = RelocationPtr(this->m_inner.direct.reloc_0);
         }
         else
         {
@@ -817,7 +847,7 @@ void Value::write_bytes(size_t ofs, const void* src, size_t count)
         }
         ::std::memcpy(direct.data + ofs, src, count);
         mark_bytes_valid(ofs, count);
-        if( 0 <= ofs && ofs < POINTER_SIZE ) {
+        if( /*0 <= ofs &&*/ ofs < POINTER_SIZE ) {
             direct.reloc_0 = RelocationPtr();
         }
     }
@@ -897,7 +927,7 @@ extern ::std::ostream& operator<<(::std::ostream& os, const ValueRef& v)
                     os << "--";
                 }
             }
-            os.setf(flags);
+            os.flags(flags);
 
             os << " {";
             for(const auto& r : alloc.relocations)
@@ -910,7 +940,7 @@ extern ::std::ostream& operator<<(::std::ostream& os, const ValueRef& v)
             os << " }";
             } break;
         case RelocationPtr::Ty::Function:
-            LOG_TODO("ValueRef to " << alloc_ptr);
+            LOG_TODO("print ValueRef to " << alloc_ptr);
             break;
         case RelocationPtr::Ty::StdString: {
             const auto& s = alloc_ptr.str();
@@ -921,10 +951,18 @@ extern ::std::ostream& operator<<(::std::ostream& os, const ValueRef& v)
             {
                 os << ::std::setw(2) << ::std::setfill('0') << (int)s.data()[i];
             }
-            os.setf(flags);
+            os.flags(flags);
             } break;
         case RelocationPtr::Ty::FfiPointer:
-            LOG_TODO("ValueRef to " << alloc_ptr);
+            const auto& p = alloc_ptr.ffi();
+            assert( in_bounds(v.m_offset, v.m_size, p.get_size()) );
+            auto flags = os.flags();
+            os << ::std::hex;
+            for(size_t i = v.m_offset; i < v.m_offset + v.m_size; i++)
+            {
+                os << ::std::setw(2) << ::std::setfill('0') << (int) ((char*)p.ptr_value())[i];
+            }
+            os.flags(flags);
             break;
         }
     }
@@ -950,7 +988,7 @@ extern ::std::ostream& operator<<(::std::ostream& os, const ValueRef& v)
                 os << "--";
             }
         }
-        os.setf(flags);
+        os.flags(flags);
 
         os << " {";
         for(const auto& r : alloc.relocations)
@@ -981,7 +1019,7 @@ extern ::std::ostream& operator<<(::std::ostream& os, const ValueRef& v)
                 os << "--";
             }
         }
-        os.setf(flags);
+        os.flags(flags);
         if(direct.reloc_0)
         {
             os << " { " << direct.reloc_0 << " }";
@@ -992,23 +1030,6 @@ extern ::std::ostream& operator<<(::std::ostream& os, const ValueRef& v)
         // TODO: no value?
     }
     return os;
-}
-
-void ValueRef::mark_bytes_valid(size_t ofs, size_t size)
-{
-    if( m_alloc ) {
-        switch(m_alloc.get_ty())
-        {
-        case RelocationPtr::Ty::Allocation:
-            m_alloc.alloc().mark_bytes_valid(m_offset + ofs, size);
-            break;
-        default:
-            LOG_TODO("mark_valid in " << m_alloc);
-        }
-    }
-    else {
-        m_value->mark_bytes_valid(m_offset + ofs, size);
-    }
 }
 
 Value ValueRef::read_value(size_t ofs, size_t size) const
@@ -1032,7 +1053,7 @@ Value ValueRef::read_value(size_t ofs, size_t size) const
         case RelocationPtr::Ty::FfiPointer: {
             LOG_ASSERT(in_bounds(m_offset + ofs, size, m_alloc.ffi().get_size()), "");
             auto rv = Value::with_size(size, false);
-            rv.write_bytes(0, reinterpret_cast<const char*>(m_alloc.ffi().ptr_value) + m_offset + ofs, size);
+            rv.write_bytes(0, reinterpret_cast<const char*>(m_alloc.ffi().ptr_value()) + m_offset + ofs, size);
             return rv;
             }
         default:
@@ -1047,4 +1068,50 @@ bool ValueRef::compare(size_t offset, const void* other, size_t other_len) const
 {
     check_bytes_valid(offset, other_len);
     return ::std::memcmp(data_ptr() + offset, other, other_len) == 0;
+}
+ValueRefW ValueRef::to_write()
+{
+    return ValueRefW(*this);
+}
+void ValueRefW::write_ptr(size_t ofs, size_t ptr_ofs, RelocationPtr reloc) {
+    LOG_ASSERT(ValueRef::in_bounds(ofs, POINTER_SIZE, m_inner.m_size), "write_ptr(" << ofs << "+" << POINTER_SIZE << " > " << m_inner.m_size <<")");
+    get_inner_w().write_ptr(m_inner.m_offset + ofs, ptr_ofs, reloc);
+}
+void ValueRefW::write_value(size_t ofs, Value v) {
+    if( m_inner.m_alloc ) {
+        switch(m_inner.m_alloc.get_ty())
+        {
+        case RelocationPtr::Ty::Allocation:
+            return m_inner.m_alloc.alloc().write_value(m_inner.m_offset + ofs, std::move(v));
+        case RelocationPtr::Ty::StdString: {
+            LOG_FATAL("Writing to a std::string backed value");
+            }
+        case RelocationPtr::Ty::FfiPointer: {
+            LOG_TODO("write_value to " << m_inner.m_alloc);
+            }
+        default:
+            LOG_TODO("write_value to " << m_inner.m_alloc);
+        }
+    }
+    else {
+        return m_inner.m_value->write_value(m_inner.m_offset + ofs, std::move(v));
+    }
+}
+
+void ValueRefW::mark_bytes_valid(size_t ofs, size_t size)
+{
+    LOG_ASSERT(ValueRef::in_bounds(ofs, size, m_inner.m_size), "mark_bytes_valid(" << ofs << "+" << size << " > " << m_inner.m_size <<")");
+    if( m_inner.m_alloc ) {
+        switch(m_inner.m_alloc.get_ty())
+        {
+        case RelocationPtr::Ty::Allocation:
+            m_inner.m_alloc.alloc().mark_bytes_valid(m_inner.m_offset + ofs, size);
+            break;
+        default:
+            LOG_TODO("mark_valid in " << m_inner.m_alloc);
+        }
+    }
+    else {
+        m_inner.m_value->mark_bytes_valid(m_inner.m_offset + ofs, size);
+    }
 }

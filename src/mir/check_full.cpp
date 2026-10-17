@@ -782,8 +782,8 @@ void MIR_Validate_FullValState(::MIR::TypeResolve& mir_res, const ::MIR::Functio
 
             DEBUG(mir_res << blk.statements[i] << " " << state);
 
-            TU_MATCHA( (blk.statements[i]), (se),
-            (Assign,
+            TU_MATCH_HDRA( (blk.statements[i]), {)
+            TU_ARMA(Assign, se) {
                 if( ENABLE_LEAK_DETECTOR )
                 {
                     // TODO: Check if the target isn't valid. Allow if either invaid, or too complex to know.
@@ -838,10 +838,15 @@ void MIR_Validate_FullValState(::MIR::TypeResolve& mir_res, const ::MIR::Functio
                         if(const auto* e = v.opt_LValue())
                             state.move_lvalue(mir_res, *e);
                     ),
-                // Create a new instance of a union (and eventually enum)
-                (Variant,
+                // Create a new instance of a union
+                (UnionVariant,
                     if(const auto* e = ve.val.opt_LValue())
                         state.move_lvalue(mir_res, *e);
+                    ),
+                (EnumVariant,
+                    for(const auto& v : ve.vals)
+                        if(const auto* e = v.opt_LValue())
+                            state.move_lvalue(mir_res, *e);
                     ),
                 // Create a new instance of a struct (or enum)
                 (Struct,
@@ -851,14 +856,29 @@ void MIR_Validate_FullValState(::MIR::TypeResolve& mir_res, const ::MIR::Functio
                     )
                 )
                 state.mark_lvalue_valid(mir_res, se.dst);
-                ),
-            (Asm,
+                }
+            TU_ARMA(Asm, se) {
                 for(const auto& v : se.inputs)
                     state.ensure_lvalue_valid(mir_res, v.second);
                 for(const auto& v : se.outputs)
                     state.mark_lvalue_valid(mir_res, v.second);
-                ),
-            (SetDropFlag,
+                }
+            TU_ARMA(Asm2, se) {
+                for(const auto& p : se.params)
+                {
+                    TU_MATCH_HDRA( (p), { )
+                    TU_ARMA(Const, v) {}
+                    TU_ARMA(Sym, v) {}
+                    TU_ARMA(Reg, v) {
+                        if(v.input)
+                            state.ensure_param_valid(mir_res, *v.input);
+                        if(v.output)
+                            state.mark_lvalue_valid(mir_res, *v.output);
+                        }
+                    }
+                }
+                }
+            TU_ARMA(SetDropFlag, se) {
                 if( se.other == ~0u )
                 {
                     state.drop_flags[se.idx] = se.new_val;
@@ -867,8 +887,14 @@ void MIR_Validate_FullValState(::MIR::TypeResolve& mir_res, const ::MIR::Functio
                 {
                     state.drop_flags[se.idx] = (se.new_val != state.drop_flags[se.other]);
                 }
-                ),
-            (Drop,
+                }
+            TU_ARMA(LoadDropFlag, se) {
+                MIR_TODO(mir_res, "");
+            }
+            TU_ARMA(SaveDropFlag, se) {
+                MIR_TODO(mir_res, "");
+            }
+            TU_ARMA(Drop, se) {
                 if( se.flag_idx == ~0u || state.drop_flags.at(se.flag_idx) )
                 {
                     if( se.kind == ::MIR::eDropKind::SHALLOW )
@@ -897,11 +923,11 @@ void MIR_Validate_FullValState(::MIR::TypeResolve& mir_res, const ::MIR::Functio
                         state.move_lvalue(mir_res, se.slot);
                     }
                 }
-                ),
-            (ScopeEnd,
+                }
+            TU_ARMA(ScopeEnd, se) {
                 // TODO: Mark all mentioned variables as invalid
-                )
-            )
+                }
+            }
         }
 
         state.garbage_collect();
@@ -946,8 +972,8 @@ void MIR_Validate_FullValState(::MIR::TypeResolve& mir_res, const ::MIR::Functio
             ),
         (If,
             state.ensure_lvalue_valid(mir_res, te.cond);
-            todo_queue.push_back( ::std::make_pair(te.bb0, state.clone()) );
-            todo_queue.push_back( ::std::make_pair(te.bb1, mv$(state)) );
+            todo_queue.push_back( ::std::make_pair(te.bb_true, state.clone()) );
+            todo_queue.push_back( ::std::make_pair(te.bb_false, mv$(state)) );
             ),
         (Switch,
             state.ensure_lvalue_valid(mir_res, te.val);

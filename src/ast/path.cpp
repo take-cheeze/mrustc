@@ -11,6 +11,7 @@
 #include <iostream>
 #include "../parse/parseerror.hpp"
 #include <algorithm>
+#include "expr.hpp"
 
 #define PRETTY_PATH_PRINT   1
 
@@ -21,14 +22,16 @@ namespace AST {
     TU_MATCHA( (x), (i),
     (Unbound, os << "_";   ),
     (Crate ,  os << "Crate";    ),
+    (Primitive, os << "Primitive"; ),
     (Module,  os << "Module";    ),
     (Trait,     os << "Trait";   ),
+    (TraitAlias, os << "TraitAlias"; ),
     (Struct,    os << "Struct";  ),
     (Enum,      os << "Enum";    ),
     (Union,     os << "Union";   ),
     (EnumVar,   os << "EnumVar(" << i.idx << ")"; ),
     (TypeAlias, os << "TypeAlias";),
-    (TypeParameter, os << "TyParam(" << i.level << " # " << i.idx << ")"; )
+    (TypeParameter, os << "TyParam(" << i.slot << ")"; )
     )
     return os;
 }
@@ -36,9 +39,11 @@ PathBinding_Type PathBinding_Type::clone() const
 {
     TU_MATCHA( (*this), (e),
     (Unbound  , return PathBinding_Type::make_Unbound({}); ),
+    (Primitive, return e; ),
     (Module   , return PathBinding_Type::make_Module(e);   ),
     (Crate    , return PathBinding_Type(e); ),
     (Trait    , return PathBinding_Type(e); ),
+    (TraitAlias, return PathBinding_Type(e); ),
     (Struct   , return PathBinding_Type(e); ),
     (Enum     , return PathBinding_Type(e); ),
     (Union    , return PathBinding_Type(e); ),
@@ -106,58 +111,117 @@ PathBinding_Macro PathBinding_Macro::clone() const
 
 ::std::ostream& operator<<(::std::ostream& os, const PathParams& x)
 {
+    if( x.m_is_paren ) {
+        auto& t = x.m_entries.at(0).as_Type();
+        os << t;    // Should be a tuple
+        auto& rv = x.m_entries.at(1).as_AssociatedTyEqual();
+        os << "->";
+        os << rv.second;
+        return os;
+    }
     bool needs_comma = false;
-    os << "<";
-    for(const auto& v : x.m_lifetimes) {
+    os << (x.m_is_paren ? "(" : "<");
+    for(const auto& e : x.m_entries)
+    {
+        if(e.is_Null())
+            continue;
         if(needs_comma) os << ", ";
         needs_comma = true;
-        os << v;
+
+        e.fmt(os);
     }
-    for(const auto& v : x.m_types) {
-        if(needs_comma) os << ", ";
-        needs_comma = true;
-        os << v;
-    }
-    for(const auto& v : x.m_assoc_equal) {
-        if(needs_comma) os << ", ";
-        needs_comma = true;
-        os << v.first << "=" << v.second;
-    }
-    for(const auto& v : x.m_assoc_bound) {
-        if(needs_comma) os << ", ";
-        needs_comma = true;
-        os << v.first << ": " << v.second;
-    }
-    os << ">";
+    os << (x.m_is_paren ? ")" : ">");
     return os;
 }
-PathParams::PathParams(const PathParams& x):
-    m_lifetimes( x.m_lifetimes )
+PathParams::PathParams(const PathParams& x)
+    : m_is_paren(x.m_is_paren)
 {
-    m_types.reserve( x.m_types.size() );
-    for(const auto& t : x.m_types)
-        m_types.push_back(t.clone());
-
-    m_assoc_equal.reserve( x.m_assoc_equal.size() );
-    for(const auto& t : x.m_assoc_equal)
-        m_assoc_equal.push_back( ::std::make_pair(t.first, t.second.clone()) );
-
-    m_assoc_bound.reserve( x.m_assoc_bound.size() );
-    for(const auto& t : x.m_assoc_bound)
-        m_assoc_bound.push_back( ::std::make_pair(t.first, AST::Path(t.second)) );
+    m_entries.reserve( x.m_entries.size() );
+    for(const auto& e : x.m_entries)
+        m_entries.push_back(e.clone());
 }
 Ordering PathParams::ord(const PathParams& x) const
 {
-    Ordering rv;
-    rv = ::ord(m_lifetimes, x.m_lifetimes);
-    if(rv != OrdEqual)  return rv;
-    rv = ::ord(m_types, x.m_types);
-    if(rv != OrdEqual)  return rv;
-    rv = ::ord(m_assoc_equal, x.m_assoc_equal);
-    if(rv != OrdEqual)  return rv;
-    rv = ::ord(m_assoc_bound, x.m_assoc_bound);
-    if(rv != OrdEqual)  return rv;
-    return rv;
+    return ::ord(m_entries, x.m_entries);
+}
+
+PathParamEnt PathParamEnt::clone() const
+{
+    TU_MATCH_HDRA( (*this), {)
+    TU_ARMA(Null, v) {
+        return v;
+        }
+    TU_ARMA(Lifetime, v) {
+        return v;
+        }
+    TU_ARMA(Type, v) {
+        return v.clone();
+        }
+    TU_ARMA(Value, v) {
+        return v->clone();
+        }
+    TU_ARMA(AssociatedTyEqual, v) {
+        return ::std::make_pair(v.first, v.second.clone());
+        }
+    TU_ARMA(AssociatedTyBound, v) {
+        return ::std::make_pair(v.first, v.second);
+        }
+    }
+    throw "";
+}
+Ordering PathParamEnt::ord(const PathParamEnt& x) const
+{
+    if(this->tag() != x.tag())
+        return ::ord( static_cast<int>(this->tag()), static_cast<int>(x.tag()) );
+    
+    TU_MATCH_HDRA( (*this, x), {)
+    TU_ARMA(Null, v1, v2) {
+        return ::OrdEqual;
+        }
+    TU_ARMA(Lifetime, v1, v2) {
+        return ::ord(v1, v2);
+        }
+    TU_ARMA(Type, v1, v2) {
+        return ::ord(v1, v2);
+        }
+    TU_ARMA(Value, v1, v2) {
+        return ::ord( (uintptr_t)v1.get(), (uintptr_t)v2.get() );
+        }
+    TU_ARMA(AssociatedTyEqual, v1, v2) {
+        return ::ord(v1, v2);
+        }
+    TU_ARMA(AssociatedTyBound, v1, v2) {
+        ORD(v1.first, v2.first);
+        ORD(v1.second.size(), v2.second.size());
+        for(size_t i = 0; i < v1.second.size(); i++)
+            ORD(v1.second[i], v2.second[i]);
+        return ::OrdEqual;
+        }
+    }
+    throw "";
+}
+void PathParamEnt::fmt(::std::ostream& os) const
+{
+    TU_MATCH_HDRA( (*this), {)
+    TU_ARMA(Null, _) {
+        os << "/*removed*/";
+        }
+    TU_ARMA(Lifetime, v) {
+        os << v;
+        }
+    TU_ARMA(Type, v) {
+        os << v;
+        }
+    TU_ARMA(Value, v) {
+        v->print(os);
+        }
+    TU_ARMA(AssociatedTyEqual, v) {
+        os << v.first << "=" << v.second;
+        }
+    TU_ARMA(AssociatedTyBound, v) {
+        os << v.first << ": " << v.second;
+        }
+    }
 }
 
 // --- AST::PathNode
@@ -203,22 +267,22 @@ typename ::std::vector<Named<T> >::const_iterator find_named(const ::std::vector
 AST::Path::~Path()
 {
 }
-AST::Path::Path(TagUfcs, TypeRef type, ::std::vector<AST::PathNode> nodes):
-    m_class( AST::Path::Class::make_UFCS({box$(type), nullptr, nodes}) )
+AST::Path AST::Path::new_ufcs_ty(TypeRef type, ::std::vector<AST::PathNode> nodes)
 {
+    return AST::Path( AST::Path::Class::make_UFCS({box$(type), nullptr, nodes}) );
 }
-AST::Path::Path(TagUfcs, TypeRef type, Path trait, ::std::vector<AST::PathNode> nodes):
-    m_class( AST::Path::Class::make_UFCS({box$(type), box$(trait), nodes}) )
+AST::Path AST::Path::new_ufcs_trait(TypeRef type, Path trait, ::std::vector<AST::PathNode> nodes)
 {
+    return AST::Path( AST::Path::Class::make_UFCS({box$(type), box$(trait), nodes}) );
 }
 AST::Path::Path(const Path& x):
     m_class()
-    //,m_bindings(x.m_bindings)
+    ,m_bindings(x.m_bindings.clone())
 {
-    memcpy(&m_bindings, &x.m_bindings, sizeof(Bindings));
-
     TU_MATCH(Class, (x.m_class), (ent),
-    (Invalid, m_class = Class::make_Invalid({});),
+    (Invalid,
+        m_class = Class::make_Invalid({});
+        ),
     (Local,
         m_class = Class::make_Local({ent.name});
         ),
@@ -267,20 +331,7 @@ bool Path::is_parent_of(const Path& x) const
 
 void Path::bind_variable(unsigned int slot)
 {
-    m_bindings.value = PathBinding_Value::make_Variable({slot});
-}
-void Path::bind_enum_var(const Enum& ent, const RcString& name)
-{
-    auto it = ::std::find_if(ent.variants().begin(), ent.variants().end(), [&](const auto& x) { return x.m_name == name; });
-    if( it == ent.variants().end() )
-    {
-        throw ParseError::Generic("Enum variant not found");
-    }
-    unsigned int idx = it - ent.variants().begin();
-
-    DEBUG("Bound to enum variant '" << name << "' (#" << idx << ")");
-    m_bindings.type = PathBinding_Type::make_EnumVar({ &ent, idx });
-    m_bindings.value = PathBinding_Value::make_EnumVar({ &ent, idx });
+    m_bindings.value.set(AST::AbsolutePath(), PathBinding_Value::make_Variable({slot}));
 }
 
 Path& Path::operator+=(const Path& other)
@@ -349,7 +400,10 @@ void Path::print_pretty(::std::ostream& os, bool is_type_context, bool is_debug)
         }
         else
         {
-            assert( m_bindings.value.is_Variable() || m_bindings.value.is_Generic() || m_bindings.type.is_TypeParameter() );
+            assert(
+                m_bindings.value.binding.is_Variable() || m_bindings.value.binding.is_Generic()
+                || m_bindings.type.binding.is_TypeParameter()
+                );
         }
         os << ent.name;
         }
@@ -381,8 +435,16 @@ void Path::print_pretty(::std::ostream& os, bool is_type_context, bool is_debug)
         }
         }
     TU_ARMA(Absolute, ent) {
-        if( ent.crate != "" )
-            os << "::\"" << ent.crate << "\"";
+        const char* cn = ent.crate.c_str();
+        if( !cn[0] ) {
+            os << "crate";
+        }
+        else if( cn[0] == '=' ) {
+            os << "::" << cn+1;
+        }
+        else {
+            os << "::\"" << cn << "\"";
+        }
         for(const auto& n : ent.nodes)
         {
             os << "::";

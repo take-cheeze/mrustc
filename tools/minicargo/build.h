@@ -20,7 +20,9 @@ struct BuildOptions
     ::helpers::path build_script_overrides;
     ::std::vector<::helpers::path>  lib_search_dirs;
     bool emit_mmir = false;
+    bool enable_debug = false;
     const char* target_name = nullptr;  // if null, host is used
+    const char* panic_strategy = nullptr;  // if non-null, passed to the compiler as -C panic=<strategy>
     enum class Mode {
         /// Build the binary/library
         Normal,
@@ -44,8 +46,5 @@ class BuildList
     ::std::vector<Entry>    m_list;
 public:
     BuildList(const PackageManifest& manifest, const BuildOptions& opts);
-    bool build(BuildOptions opts, unsigned num_jobs);  // 0 = 1 job
+    bool build(BuildOptions opts, unsigned num_jobs, bool dry_run);  // 0 = either 1 job, or as many as we can take from the jobserver
 };
-
-extern const helpers::path& get_mrustc_path();
-extern bool spawn_process(const char* exe_name, const StringList& args, const StringListKV& env, const ::helpers::path& logfile, const ::helpers::path& working_directory={});

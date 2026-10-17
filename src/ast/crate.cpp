@@ -21,6 +21,7 @@
 
 ::std::vector<::std::string>    AST::g_crate_load_dirs = { };
 ::std::map<::std::string, ::std::string>    AST::g_crate_overrides;
+::std::map<RcString, RcString>    AST::g_implicit_crates;
 
 namespace {
     bool check_item_cfg(const ::AST::AttributeList& attrs)
@@ -57,7 +58,7 @@ namespace {
 namespace AST {
 
 Crate::Crate():
-    m_root_module(::AST::Path("",{})),
+    m_root_module(AST::AbsolutePath()),
     m_load_std(LOAD_STD)
 {
 }
@@ -71,7 +72,12 @@ void Crate::load_externs()
             {
                 if( check_item_cfg(it->attrs) )
                 {
-                    c->name = load_extern_crate( it->span, c->name.c_str() );
+                    if( c->name == "" ) {
+                        // Leave for now
+                    }
+                    else {
+                        c->name = load_extern_crate( it->span, c->name );
+                    }
                 }
             }
         }
@@ -90,10 +96,9 @@ void Crate::load_externs()
             no_std = true;
         if( a.name() == "no_core" )
             no_core = true;
-        if( a.name() == "cfg_attr" && a.items().size() == 2 ) {
-            if( check_cfg(a.span(), a.items().at(0)) )
+        if( a.name() == "cfg_attr" ) {
+            for(const auto& a2 : check_cfg_attr(a))
             {
-                const auto& a2 = a.items().at(1);
                 if( a2.name() == "no_std" )
                     no_std = true;
                 if( a2.name() == "no_core" )
@@ -107,20 +112,32 @@ void Crate::load_externs()
     }
     else if( no_std ) {
         auto n = this->load_extern_crate(Span(), "core");
-        ASSERT_BUG(Span(), n == "core", "libcore wasn't loaded as `core`, instead `" << n << "`");
+        //if( n != "core" ) {
+        //    WARNING(Span(), W0000, "libcore wasn't loaded as `core`, instead `" << n << "`");
+        //}
     }
     else {
         auto n = this->load_extern_crate(Span(), "std");
-        ASSERT_BUG(Span(), n == "std", "libstd wasn't loaded as `std`, instead `" << n << "`");
+        //if( n != "std" ) {
+        //    WARNING(Span(), W0000, "libstd wasn't loaded as `std`, instead `" << n << "`");
+        //}
     }
 
     // Ensure that all crates passed on the command line are loaded
-    if( this->m_edition >= Edition::Rust2018 )
+    //if( this->m_edition >= Edition::Rust2018 )
+    if( TARGETVER_LEAST_1_29 )
     {
         DEBUG("Load from --crate");
         for(const auto& c : g_crate_overrides)
         {
-            this->load_extern_crate(Span(), c.first.c_str());
+            auto n = RcString::new_interned(c.first);
+            auto real_name = this->load_extern_crate(Span(), n);
+            g_implicit_crates.insert( std::make_pair(n, real_name) );
+        }
+        // 
+        if(this->m_ext_cratename_core != "")
+        {
+            g_implicit_crates.insert( std::make_pair( RcString::new_interned("core"), this->m_ext_cratename_core) );
         }
     }
 }
@@ -132,6 +149,7 @@ RcString Crate::load_extern_crate(Span sp, const RcString& name, const ::std::st
 
     ::std::string   path;
     auto it = g_crate_overrides.find(name.c_str());
+    // If there's no filename, and this crate name is in the override list - use an the explicit path
     if(basename == "" && it != g_crate_overrides.end())
     {
         path = it->second;
@@ -140,21 +158,23 @@ RcString Crate::load_extern_crate(Span sp, const RcString& name, const ::std::st
         }
         DEBUG("path = " << path << " (--extern)");
     }
+    // If the filename is known, then search for that in the search directories
+    // - Checks the crate name of each to ensure a match
     else if( basename != "" )
     {
-#if 1
-        path = basename;
-#else
         // Search a list of load paths for the crate
         for(const auto& p : g_crate_load_dirs)
         {
             path = p + "/" + basename;
 
             if( ::std::ifstream(path).good() ) {
-                break ;
+                // Ensure that if this is loaded, it yields the right name (otherwise skip)
+                auto n = HIR_Deserialise_JustName(path);
+                if( n == name ) {
+                    break ;
+                }
             }
         }
-#endif
         if( !::std::ifstream(path).good() ) {
             ERROR(sp, E0000, "Unable to locate crate '" << name << "' with filename " << basename << " in search directories");
         }
@@ -165,12 +185,19 @@ RcString Crate::load_extern_crate(Span sp, const RcString& name, const ::std::st
         ::std::vector<::std::string>    paths;
 #define RLIB_SUFFIX ".rlib"
 #define RDYLIB_SUFFIX ".so"
-        auto direct_filename = FMT("lib" << name.c_str() << RLIB_SUFFIX);
-        auto direct_filename_so = FMT("lib" << name.c_str() << RDYLIB_SUFFIX);
-        auto name_prefix = FMT("lib" << name.c_str() << "-");
+#ifdef WIN32
+# define EXESUF ".exe"
+#else
+# define EXESUF ""
+#endif
+#define PLUGIN_SUFFIX "-plugin" EXESUF
+        auto direct_filename = FMT("lib" << name << RLIB_SUFFIX);
+        auto direct_filename_so = FMT("lib" << name << RDYLIB_SUFFIX);
+        auto name_prefix = FMT("lib" << name << "-");
         // Search a list of load paths for the crate
         for(const auto& p : g_crate_load_dirs)
         {
+            DEBUG("Searching in " << p);
             path = p + "/" + direct_filename;
             if( ::std::ifstream(path).good() ) {
                 paths.push_back(path);
@@ -195,6 +222,7 @@ RcString Crate::load_extern_crate(Span sp, const RcString& name, const ::std::st
 #else
             auto dp = opendir(p.c_str());
             if( !dp ) {
+                DEBUG("Unable to opendir `" << p << "`");
                 continue ;
             }
             struct dirent *ent;
@@ -209,6 +237,9 @@ RcString Crate::load_extern_crate(Span sp, const RcString& name, const ::std::st
                 {
                 }
                 else if( len > (sizeof(RDYLIB_SUFFIX)-1) && strcmp(fname + len - (sizeof(RDYLIB_SUFFIX)-1), RDYLIB_SUFFIX) == 0 )
+                {
+                }
+                else if( len > (sizeof(PLUGIN_SUFFIX)-1) && strcmp(fname + len - (sizeof(PLUGIN_SUFFIX)-1), PLUGIN_SUFFIX) == 0 )
                 {
                 }
                 else
@@ -235,7 +266,7 @@ RcString Crate::load_extern_crate(Span sp, const RcString& name, const ::std::st
         if( paths.size() > 1 ) {
             ERROR(sp, E0000, "Multiple options for crate '" << name << "' in search directories - " << paths);
         }
-        if( paths.size() == 0 || !::std::ifstream(paths.front()).good() ) {
+        if( paths.size() == 0 ) {
             ERROR(sp, E0000, "Unable to locate crate '" << name << "' in search directories");
         }
         path = paths.front();
@@ -249,6 +280,10 @@ RcString Crate::load_extern_crate(Span sp, const RcString& name, const ::std::st
     auto res = m_extern_crates.insert(::std::make_pair( real_name, mv$(ec) ));
     if( !res.second ) {
         // Crate already loaded?
+        DEBUG("Duplicate load of '" << real_name);
+        return real_name;
+    }
+    else {
     }
     auto& ext_crate = res.first->second;
     // Move the external list out (doesn't need to be kept in the nested crate)
@@ -268,8 +303,31 @@ RcString Crate::load_extern_crate(Span sp, const RcString& name, const ::std::st
             }
         }
     }
+    // NOTE: Add the crate to the ordered list AFTER its dependencies
+    m_extern_crates_ord.push_back(real_name);
 
-    DEBUG("Loaded '" << name << "' from '" << basename << "' (actual name is '" << real_name << "')");
+    if( ext_crate.m_short_name == "core" ) {
+        if( this->m_ext_cratename_core == "" ) {
+            this->m_ext_cratename_core = ext_crate.m_name;
+        }
+    }
+    if( ext_crate.m_short_name == "std" ) {
+        if( this->m_ext_cratename_std == "" ) {
+            this->m_ext_cratename_std = ext_crate.m_name;
+        }
+    }
+    if( ext_crate.m_short_name == "proc_macro" ) {
+        if( this->m_ext_cratename_procmacro == "" ) {
+            this->m_ext_cratename_procmacro = ext_crate.m_name;
+        }
+    }
+    if( ext_crate.m_short_name == "test" ) {
+        if( this->m_ext_cratename_test == "" ) {
+            this->m_ext_cratename_test = ext_crate.m_name;
+        }
+    }
+
+    DEBUG("Loaded '" << name << "' from '" << basename << "' (actual name is '" << real_name << "' aka `" << ext_crate.m_short_name << "`)");
     return real_name;
 }
 
@@ -283,6 +341,13 @@ ExternCrate::ExternCrate(const RcString& name, const ::std::string& path):
 
     m_hir->post_load_update(name);
     m_name = m_hir->m_crate_name;
+    if(const auto* e = strchr(m_name.c_str(), '-'))
+    {
+        m_short_name = RcString::new_interned(m_name.c_str(), e - m_name.c_str());
+    }
+    else
+    {
+    }
 }
 
 }   // namespace AST

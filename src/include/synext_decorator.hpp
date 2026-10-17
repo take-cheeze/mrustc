@@ -34,6 +34,7 @@ namespace AST {
     struct ExprNode_Match_Arm;
 
     class ImplDef;
+    class Impl;
 }
 
 enum class AttrStage
@@ -48,11 +49,13 @@ class ExpandDecorator
 public:
     virtual ~ExpandDecorator() = default;
     virtual AttrStage   stage() const = 0;
+    virtual bool run_during_iter() const { return false; }
 
     virtual void    handle(const Span& sp, const AST::Attribute& mi, AST::Crate& crate) const { unexpected(sp, mi, "crate"); }
-    virtual void    handle(const Span& sp, const AST::Attribute& mi, AST::Crate& crate, const AST::Path& path, AST::Module& mod, slice<const AST::Attribute> attrs, AST::Item&i) const { unexpected(sp, mi, "item"); }
-    // NOTE: To delete, set the type to `_`
-    virtual void    handle(const Span& sp, const AST::Attribute& mi, AST::Crate& crate, const AST::Module& mod, AST::ImplDef& impl) const { unexpected(sp, mi, "impl"); }
+    virtual void    handle(const Span& sp, const AST::Attribute& mi, AST::Crate& crate, const AST::AbsolutePath& path, AST::Module& mod, size_t mod_idx, slice<const AST::Attribute> attrs, const AST::Visibility& vis, AST::Item&i) const { unexpected(sp, mi, "item"); }
+    virtual void    handle(const Span& sp, const AST::Attribute& mi, AST::Crate& crate, AST::Impl& impl, const RcString& name, slice<const AST::Attribute> attrs, const AST::Visibility& vis, AST::Item&i) const { unexpected(sp, mi, "associated item"); }
+    virtual void    handle(const Span& sp, const AST::Attribute& mi, AST::Crate& crate, const AST::AbsolutePath& path, AST::Trait& trait, slice<const AST::Attribute> attrs, AST::Item&i) const { unexpected(sp, mi, "trait item"); }
+
     // NOTE: To delete, clear the name
     virtual void    handle(const Span& sp, const AST::Attribute& mi, AST::Crate& crate, ::AST::StructItem& si) const { unexpected(sp, mi, "struct item"); }
     // NOTE: To delete, make the type invalid
@@ -60,7 +63,7 @@ public:
     // NOTE: To delete, clear the name
     virtual void    handle(const Span& sp, const AST::Attribute& mi, AST::Crate& crate, ::AST::EnumVariant& ev) const { unexpected(sp, mi, "enum variant"); }
 
-    virtual void    handle(const Span& sp, const AST::Attribute& mi, AST::Crate& crate, ::std::unique_ptr<AST::ExprNode>& expr) const { unexpected(sp, mi, "expression"); }
+    virtual void    handle(const Span& sp, const AST::Attribute& mi, AST::Crate& crate, ::AST::ExprNodeP& expr) const { unexpected(sp, mi, "expression"); }
     // NOTE: To delete, clear the patterns vector
     virtual void    handle(const Span& sp, const AST::Attribute& mi, AST::Crate& crate, ::AST::ExprNode_Match_Arm& expr) const { unexpected(sp, mi, "match arm"); }
     // NOTE: To delete, clear the value

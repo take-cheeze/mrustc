@@ -7,14 +7,25 @@
 
 /obj
 /bin
+/build
 /mrustc.depend
 /mrustc.layout
 /rustc-*-src.tar.gz
 /rustc-*-src
+/rustc_bootstrap
 /crates.io
 /test_deps_run-pass.mk
 
+/no_core*
+
+# proc_macro debugging output
+/procmacro_dump*.bin
+# Memory dumps
+/mrustc-*.dmp
+/1.txt
+
 /tools/bin
+/tools/mir_opt_test/tests.log
 
 /output
 /output-*
@@ -43,11 +54,14 @@
 
 
 /run_rustc/output
+/run_rustc/output-*
 
 /gitstats
 
 /lib/libproc_macro/Cargo.lock
 /lib/libproc_macro/target
+/lib/libproc_macro/tools/dump.exe
+/lib/libproc_macro/tools/dump.pdb
 
 /bnf/*.o
 /bnf/*.dep
@@ -59,3 +73,4 @@
 /bnf/rust.tab.h
 /bnf/rust.output
 /bnf/test.bin
+/scripts/__pycache__

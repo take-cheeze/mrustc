@@ -32,7 +32,12 @@ namespace {
     ::std::string get_path_relative_to(const ::std::string& base_path, ::std::string path)
     {
         DEBUG(base_path << ", " << path);
+        // Absolute
         if( path[0] == '/' || path[0] == '\\' ) {
+            return path;
+        }
+        // Windows absolute
+        else if( isalnum(path[0]) && path[1] == ':' && (path[2] == '/' || path[2] == '\\') ) {
             return path;
         }
         else if( base_path.size() == 0 ) {
@@ -43,13 +48,20 @@ namespace {
         }
         else {
 
-            auto slash = ::std::min( base_path.find_last_of('/'), base_path.find_last_of('\\') );
+            auto slash_fwd = base_path.find_last_of('/');
+            auto slash_back = base_path.find_last_of('\\');
+            auto slash =
+                slash_fwd == std::string::npos ? slash_back
+                : slash_back == std::string::npos ? slash_fwd
+                : std::max(slash_fwd, slash_back)
+                ;
             if( slash == ::std::string::npos )
             {
                 return path;
             }
             else
             {
+                DEBUG("> slash = " << slash);
                 slash += 1;
                 ::std::string   rv;
                 rv.reserve( slash + path.size() );
@@ -67,18 +79,20 @@ class CIncludeExpander:
     ::std::unique_ptr<TokenStream> expand(const Span& sp, const AST::Crate& crate, const TokenTree& tt, AST::Module& mod) override
     {
         Token   tok;
-        auto lex = TTStream(sp, ParseState(crate.m_edition), tt);
+        auto lex = TTStream(sp, ParseState(), tt);
 
         auto path = get_string(sp, lex, crate, mod);
         GET_CHECK_TOK(tok, lex, TOK_EOF);
 
-        ::std::string file_path = get_path_relative_to(mod.m_file_info.path, mv$(path));
+        //::std::string file_path = get_path_relative_to(mod.m_file_info.path, mv$(path));
+        ::std::string file_path = get_path_relative_to(sp.get_top_file_span().filename.c_str(), mv$(path));
         crate.m_extra_files.push_back(file_path);
 
         try {
-            ParseState  ps(crate.m_edition);
+            ParseState  ps;
             ps.module = &mod;
-            return box$( Lexer(file_path, ps) );
+            DEBUG("Edition = " << crate.m_edition);
+            return box$( Lexer(file_path, crate.m_edition, ps) );
         }
         catch(::std::runtime_error& e)
         {
@@ -93,7 +107,7 @@ class CIncludeBytesExpander:
     ::std::unique_ptr<TokenStream> expand(const Span& sp, const AST::Crate& crate, const TokenTree& tt, AST::Module& mod) override
     {
         Token   tok;
-        auto lex = TTStream(sp, ParseState(crate.m_edition), tt);
+        auto lex = TTStream(sp, ParseState(), tt);
 
         auto path = get_string(sp, lex, crate, mod);
         GET_CHECK_TOK(tok, lex, TOK_EOF);
@@ -109,8 +123,8 @@ class CIncludeBytesExpander:
         ss << is.rdbuf();
 
         ::std::vector<TokenTree>    toks;
-        toks.push_back(Token(TOK_BYTESTRING, mv$(ss.str())));
-        return box$( TTStreamO(sp, ParseState(crate.m_edition), TokenTree(Ident::Hygiene::new_scope(), mv$(toks))) );
+        toks.push_back(Token(TOK_BYTESTRING, mv$(ss.str()), {}));
+        return box$( TTStreamO(sp, ParseState(), TokenTree(AST::Edition::Rust2015, Ident::Hygiene::new_scope(), mv$(toks))) );
     }
 };
 
@@ -120,7 +134,7 @@ class CIncludeStrExpander:
     ::std::unique_ptr<TokenStream> expand(const Span& sp, const AST::Crate& crate, const TokenTree& tt, AST::Module& mod) override
     {
         Token   tok;
-        auto lex = TTStream(sp, ParseState(crate.m_edition), tt);
+        auto lex = TTStream(sp, ParseState(), tt);
 
         auto path = get_string(sp, lex, crate, mod);
         GET_CHECK_TOK(tok, lex, TOK_EOF);
@@ -136,8 +150,8 @@ class CIncludeStrExpander:
         ss << is.rdbuf();
 
         ::std::vector<TokenTree>    toks;
-        toks.push_back(Token(TOK_STRING, mv$(ss.str())));
-        return box$( TTStreamO(sp, ParseState(crate.m_edition), TokenTree(Ident::Hygiene::new_scope(), mv$(toks))) );
+        toks.push_back(Token(TOK_STRING, mv$(ss.str()), {}));
+        return box$( TTStreamO(sp, ParseState(), TokenTree(AST::Edition::Rust2015, Ident::Hygiene::new_scope(), mv$(toks))) );
     }
 };
 

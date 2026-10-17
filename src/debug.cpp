@@ -5,6 +5,7 @@
  * debug.cpp
  * - Debug printing (with indenting)
  */
+#include <cstdint>
 #include <debug_inner.hpp>
 #include <debug.hpp>
 #include <set>
@@ -13,6 +14,9 @@
 #include <common.hpp>   // FmtEscaped
 #include <cstring>	// strchr
 
+// TODO: Inline debug filter/caching
+// - Cache messages for the current phase, clearing the cache (dropping) when various signatures match
+//  > Similar to the `log_get_last_function.py` script
 
 int g_debug_indent_level = 0;
 bool g_debug_enabled = true;
@@ -115,6 +119,12 @@ extern void debug_init_phases(const char* env_var_name, std::initializer_list<co
     {
         while( debug_string[0] )
         {
+            if ( strcmp(debug_string, "*") == 0 )
+            {
+                g_debug_disable_map.clear();
+                return;
+            }
+
             const char* end = strchr(debug_string, ':');
 
             ::std::string   s;
@@ -142,7 +152,7 @@ extern void debug_init_phases(const char* env_var_name, std::initializer_list<co
 ::std::ostream& operator<<(::std::ostream& os, const FmtEscaped& x)
 {
     os << ::std::hex;
-    for(auto s = x.s; *s != '\0'; s ++)
+    for(auto s = x.s; s != x.e; s ++)
     {
         switch(*s)
         {

@@ -28,7 +28,7 @@ extern ::std::string& operator+=(::std::string& s, const Codepoint& cp);
 extern ::std::ostream& operator<<(::std::ostream& s, const Codepoint& cp);
 
 extern Token Lex_FindOperator(const ::std::string& s);
-extern Token Lex_FindReservedWord(const ::std::string& s);
+extern Token Lex_FindReservedWord(const ::std::string& s, AST::Edition edition);
 
 typedef Codepoint   uchar;
 
@@ -39,17 +39,21 @@ class Lexer:
     unsigned int m_line;
     unsigned int m_line_ofs;
 
-    ::std::ifstream m_istream;
+    ::std::unique_ptr<::std::ifstream>  m_istream_fp;
+    ::std::istream& m_istream;
     bool    m_last_char_valid;
     Codepoint   m_last_char;
     ::std::vector<Token>    m_next_tokens;
 
+    AST::Edition    m_edition;
     Ident::Hygiene m_hygiene;
 public:
-    Lexer(const ::std::string& filename, ParseState ps);
+    Lexer(::std::istringstream& ss, AST::Edition edition, ParseState ps);
+    Lexer(const ::std::string& filename, AST::Edition edition, ParseState ps);
 
     Position getPosition() const override;
     Ident::Hygiene realGetHygiene() const override;
+    AST::Edition realGetEdition() const override { return m_edition; }
     Token realGetToken() override;
 
 private:
@@ -57,14 +61,23 @@ private:
 
     signed int getSymbol();
     Token getTokenInt_RawString(bool is_byte);
-    Token getTokenInt_Identifier(Codepoint ch, Codepoint ch2='\0');
-    double parseFloat(uint64_t whole);
+    Token getTokenInt_Identifier(Codepoint ch, Codepoint ch2='\0', bool parse_reserved_word=true);
+    enum class NumMode {
+        BIN,
+        OCT,
+        DEC,
+        HEX,
+    };
+    U128 parseInt(NumMode* num_mode);
+    double parseFloat(U128 whole);
     uint32_t parseEscape(char enclosing);
 
     void push_hygine() override {
         m_hygiene = Ident::Hygiene::new_scope_chained(m_hygiene);
+        DEBUG(">> " << m_hygiene);
     }
     void pop_hygine() override {
+        DEBUG("<< " << m_hygiene << " -> " << m_hygiene.get_parent());
         m_hygiene = m_hygiene.get_parent();
     }
 

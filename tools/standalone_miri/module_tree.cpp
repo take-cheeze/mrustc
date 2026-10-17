@@ -12,6 +12,7 @@
 #include <iostream>
 #include <algorithm>    // std::find
 #include "debug.hpp"
+#include <path.h>
 
 ModuleTree::ModuleTree()
 {
@@ -29,7 +30,7 @@ struct Parser
 
     bool parse_one();
 
-    ::MIR::Function parse_body();
+    ::MIR::Function parse_body(const ::std::vector<std::string>& arg_names);
     ::HIR::PathParams parse_pathparams();
     RawType parse_core_type();
     ::HIR::TypeRef parse_type();
@@ -56,10 +57,12 @@ void ModuleTree::load_file(const ::std::string& path)
 void ModuleTree::validate()
 {
     TRACE_FUNCTION_R("", "");
+#if 0
     for(const auto& dt : this->data_types)
     {
-        //LOG_ASSERT(dt.second->populated, "Type " << dt.first << " never defined");
+        LOG_ASSERT(dt.second->populated, "Type " << dt.first << " never defined");
     }
+#endif
 
     for(const auto& fcn : this->functions)
     {
@@ -83,14 +86,26 @@ bool Parser::parse_one()
     if( lex.consume_if("crate") )
     {
         // Import an external crate
-        lex.check(TokenClass::String);
-        auto path = ::std::move(lex.next().strval);
-        lex.consume();
+        auto path = ::std::move(lex.check_consume(TokenClass::String).strval);
         //LOG_TRACE(lex << "crate '" << path << "'");
 
         lex.check_consume(';');
 
-
+        // TODO: If the file cannot be found, then search for it using some relative rules
+        if( !::std::ifstream(path).good() ) {
+            // parent 1 is the dir containing the current file, parent 2 is its parent
+            // - This is a massive hack for build scripts, that are compiled/invoked using an absolute path
+            auto d = ::helpers::path(lex.filename()).parent().parent();
+            if( ::std::ifstream((d / path).str()).good() ) {
+                path = (d / path).str();
+            }
+            else {
+                d = d.parent();
+                if( ::std::ifstream((d / path).str()).good() ) {
+                    path = (d / path).str();
+                }
+            }
+        }
         this->tree.load_file(path);
     }
     else if( lex.consume_if("fn") )
@@ -99,17 +114,37 @@ bool Parser::parse_one()
         //LOG_TRACE(lex << "fn " << p);
 
         lex.check_consume('(');
-        ::std::vector<::HIR::TypeRef>  arg_tys;
+        ::std::vector<::std::string>    arg_names;
+        ::std::vector<::HIR::TypeRef>   arg_tys;
+        bool is_variadic = false;
         while(lex.next() != ')')
         {
+            if( lex.next() == '.' ) {
+                lex.check_consume('.');
+                lex.check_consume('.');
+                lex.check_consume('.');
+                is_variadic = true;
+                break;
+            }
+            if( lex.next() == TokenClass::Ident && lex.lookahead() == ':' ) {
+                arg_names.push_back( lex.consume().strval );
+                lex.check_consume(':');
+            }
             arg_tys.push_back( parse_type() );
             if( !lex.consume_if(',') )
                 break;
         }
+        if( arg_names.size() == 0 ) {
+            for(size_t i = 0; i < arg_tys.size(); i ++) {
+                arg_names.push_back(FMT_STRING("arg" << i));
+            }
+        }
+        LOG_ASSERT(arg_names.size() == arg_tys.size(), "Mismatch in argument type/name counts");
         lex.check_consume(')');
         ::HIR::TypeRef  rv_ty;
-        if( lex.consume_if(':') )
+        if( lex.consume_if(':') || lex.consume_if('-') )
         {
+            lex.consume_if('>');
             rv_ty = parse_type();
         }
 
@@ -127,74 +162,131 @@ bool Parser::parse_one()
         }
         else
         {
-            body = parse_body();
+            body = parse_body(arg_names);
 
             LOG_DEBUG(lex << "fn " << p);
         }
         auto p2 = p;
-        tree.functions.insert( ::std::make_pair(::std::move(p), Function { ::std::move(p2), ::std::move(arg_tys), rv_ty, ::std::move(ext), ::std::move(body) }) );
+        if( tree.functions.count(p) == 0 ) {
+            tree.functions.insert( ::std::make_pair(::std::move(p), Function {
+                ::std::move(p2),
+                ::std::move(arg_tys), ::std::move(rv_ty), is_variadic,
+                ::std::move(ext), ::std::move(body)
+                }) );
+        }
+        else {
+            auto& exist = tree.functions[p];
+
+            // Signature check
+            if( exist.args != arg_tys || exist.ret_ty != rv_ty || exist.is_variadic != is_variadic ) {
+                LOG_NOTICE(lex << "Non-matching redefinition of " << p << "\n"
+                    << exist.args << " " << exist.ret_ty << "\n"
+                    << arg_tys << " " << rv_ty
+                    );
+            }
+
+            if( !body.blocks.empty() ) {
+                if( !exist.m_mir.blocks.empty() ) {
+                    // Check if they're identical, and warn/error if not
+                    bool is_mismatch = exist.m_mir.blocks.size() != body.blocks.size();
+                    is_mismatch |= exist.m_mir.locals != body.locals;
+                    is_mismatch |= exist.m_mir.drop_flags != body.drop_flags;
+                    auto n_blocks = ::std::min(exist.m_mir.blocks.size(), body.blocks.size());
+                    for(size_t i = 0; i < n_blocks; i ++) {
+                        is_mismatch |= exist.m_mir.blocks[i].statements != body.blocks[i].statements;
+                        is_mismatch |= exist.m_mir.blocks[i].terminator != body.blocks[i].terminator;
+                    }
+                    if( is_mismatch ) {
+                        LOG_ERROR(lex << "Re-definition of " << p << " with differing bodies");
+                    }
+                }
+                else {
+                    exist.m_mir = ::std::move(body);
+                }
+            }
+        }
     }
     else if( lex.consume_if("static") )
     {
+        Static s;
         auto p = RcString::new_interned(lex.check_consume(TokenClass::Ident).strval.c_str());
         //LOG_TRACE(lex << "static " << p);
         lex.check_consume(':');
-        auto ty = parse_type();
-        // TODO: externs?
+        s.ty = parse_type();
         lex.check_consume('=');
-        lex.check(TokenClass::String);
-        auto data = ::std::move(lex.consume().strval);
+        if( lex.consume_if('@') ) {
+            lex.check(TokenClass::String);
+            auto extern_name = ::std::move(lex.consume().strval);
+        }
+        else {
+            // TODO: externs?
+            lex.check(TokenClass::String);
+            auto data = ::std::move(lex.consume().strval);
 
-        Static s;
-        s.val = Value(ty);
-        // - Statics need to always have an allocation (for references)
-        s.val.ensure_allocation();
-        s.val.write_bytes(0, data.data(), data.size());
-        s.ty = ty;
+            s.init.bytes.insert(s.init.bytes.begin(), data.begin(), data.end());
 
-        if( lex.consume_if('{') )
-        {
-            while( !lex.consume_if('}') )
+            if( lex.consume_if('{') )
             {
-                lex.check_consume('@');
-                lex.check(TokenClass::Integer);
-                auto ofs = lex.consume().integer();
-                lex.check_consume('+');
-                lex.check(TokenClass::Integer);
-                auto size = lex.consume().integer();
-                lex.check_consume('=');
-                if( lex.next() == TokenClass::String )
+                while( !lex.consume_if('}') )
                 {
-                    auto reloc_str = ::std::move(lex.consume().strval);
-
-                    auto a = Allocation::new_alloc( reloc_str.size(), FMT_STRING("static " << p) );
-                    a->write_bytes(0, reloc_str.data(), reloc_str.size());
-                    s.val.set_reloc( ofs, size, RelocationPtr::new_alloc(::std::move(a)) );
-                }
-                else if( lex.next() == TokenClass::Ident )
-                {
-                    auto reloc_path = HIR::Path { RcString(lex.check_consume(TokenClass::Ident).strval.c_str()) };
-                    s.val.set_reloc( ofs, size, RelocationPtr::new_fcn(reloc_path) );
-                }
-                else
-                {
-                    LOG_FATAL(lex << "Unexepcted token " << lex.next() << " in relocation value");
-                    throw "ERROR";
-                }
-                if( ! lex.consume_if(',') ) {
-                    lex.check_consume('}');
-                    break ;
+                    lex.check_consume('@');
+                    lex.check(TokenClass::Integer);
+                    auto ofs = lex.consume().integer_64(lex);
+                    lex.check_consume('+');
+                    lex.check(TokenClass::Integer);
+                    auto size = lex.consume().integer_64(lex);
+                    lex.check_consume('=');
+                    if( lex.next() == TokenClass::String )
+                    {
+                        auto reloc_str = ::std::move(lex.consume().strval);
+                        s.init.relocs.push_back( Static::InitValue::Relocation::new_string(ofs, size, std::move(reloc_str)) );
+                    }
+                    else if( lex.next() == TokenClass::Ident )
+                    {
+                        auto reloc_path = HIR::Path { RcString(lex.check_consume(TokenClass::Ident).strval.c_str()) };
+                        s.init.relocs.push_back( Static::InitValue::Relocation::new_item(ofs, size, std::move(reloc_path)) );
+                    }
+                    else
+                    {
+                        LOG_FATAL(lex << "Unexepcted token " << lex.next() << " in relocation value");
+                        throw "ERROR";
+                    }
+                    if( ! lex.consume_if(',') ) {
+                        lex.check_consume('}');
+                        break ;
+                    }
                 }
             }
         }
         lex.check_consume(';');
 
         LOG_DEBUG(lex << "static " << p);
-        tree.statics.insert(::std::make_pair( ::std::move(p), ::std::move(s) ));
+        if( tree.statics.count(p) != 0 ) {
+            auto& e = tree.statics.at(p);
+            if( e.ty != s.ty ) {
+                LOG_ERROR("Redefinition of " << p << " with different types");
+            }
+            if( e.init.bytes.empty() ) {
+                e.init = std::move(s.init);
+            }
+            else if( s.init.bytes.empty() ) {
+            }
+            else {
+                // TODO: Compare
+            }
+        }
+        else {
+            tree.statics.insert(::std::make_pair( ::std::move(p), ::std::move(s) ));
+        }
     }
     else if( lex.consume_if("type") )
     {
         RcString p = lex.check_consume(TokenClass::Ident).strval.c_str();
+
+        if( lex.consume_if(';') ) {
+            // TOOD: Define extern type
+            return true;
+        }
         //LOG_TRACE("type " << p);
 
         auto rv = DataType {};
@@ -203,10 +295,10 @@ bool Parser::parse_one()
 
         lex.check_consume('{');
         lex.check_consume("SIZE");
-        rv.size = lex.consume().integer();
+        rv.size = lex.consume().integer_64(lex);
         lex.check_consume(',');
         lex.check_consume("ALIGN");
-        rv.alignment = lex.consume().integer();
+        rv.alignment = lex.consume().integer_64(lex);
         lex.check_consume(';');
 
         // Drop glue (if present)
@@ -237,7 +329,7 @@ bool Parser::parse_one()
             // Data
             if(lex.next() == TokenClass::Integer)
             {
-                size_t ofs = lex.consume().integer();
+                size_t ofs = lex.consume().integer_64(lex);
                 lex.check_consume('=');
                 auto ty = parse_type();
                 lex.check_consume(';');
@@ -246,61 +338,50 @@ bool Parser::parse_one()
                 rv.fields.push_back(::std::make_pair(ofs, ::std::move(ty)));
             }
             // Variants
-            else if(lex.next() == TokenClass::Ident && lex.next().strval[0] == '#' )
+            else if( lex.next() == '@' )
             {
-                size_t var_idx = ::std::stoi(lex.consume().strval.substr(1));
-
-                size_t data_fld = SIZE_MAX;
-                if( lex.consume_if('=') )
+                lex.check_consume('@');
+                lex.check_consume('[');
+                rv.tag_path.base_field = lex.consume().integer_64(lex);
+                if( lex.consume_if(',') )
                 {
-                    data_fld = lex.consume().integer();
-                }
-
-                size_t tag_ofs = SIZE_MAX;
-
-                size_t base_idx = SIZE_MAX;
-                ::std::vector<size_t>   other_idx;
-                ::std::string tag_value;
-                if( lex.consume_if('@') )
-                {
-                    lex.check_consume('[');
-                    base_idx = lex.consume().integer();
-                    if( lex.consume_if(',') )
+                    while(lex.next() != ']')
                     {
-                        while(lex.next() != ']')
-                        {
-                            lex.check(TokenClass::Integer);
-                            other_idx.push_back( lex.consume().integer() );
-                            if( !lex.consume_if(',') )
-                                break;
-                        }
+                        lex.check(TokenClass::Integer);
+                        rv.tag_path.other_indexes.push_back( lex.consume().integer_64(lex) );
+                        if( !lex.consume_if(',') )
+                            break;
                     }
-                    lex.check_consume(']');
-
-                    lex.check_consume('=');
-                    lex.check(TokenClass::String);
-                    tag_value = ::std::move(lex.consume().strval);
-
-                    //tag_ofs = rv.fields.at(base_idx).first;
-                    //const auto* tag_ty = &rv.fields.at(base_idx).second;
-                    //for(auto idx : other_idx)
-                    //{
-                    //    assert(tag_ty->get_wrapper() == nullptr);
-                    //    assert(tag_ty->inner_type == RawType::Composite);
-                    //    LOG_TODO(lex << "Calculate tag offset with nested tag - " << idx << " ty=" << *tag_ty);
-                    //}
                 }
-                lex.check_consume(';');
+                lex.check_consume(']');
+                lex.check_consume('=');
+                lex.check_consume('{');
 
-                if( rv.variants.size() <= var_idx )
+                while( lex.next() != '}' )
                 {
-                    rv.variants.resize(var_idx+1);
+                    DataType::VariantValue  var;
+                    if( lex.consume_if('*') ) {
+                    }
+                    else {
+                        lex.check(TokenClass::String);
+                        var.tag_data = ::std::move(lex.consume().strval);
+                    }
+                    if(lex.consume_if('=')) {
+                        var.data_field = lex.check_consume(TokenClass::Integer).integer_64(lex);
+                    }
+                    else {
+                        var.data_field = SIZE_MAX;
+                    }
+                    rv.variants.push_back(std::move(var));
+
+                    if( !lex.consume_if(',') )
+                        break;
                 }
-                rv.variants[var_idx] = { data_fld, base_idx, other_idx, tag_value };
+                lex.check_consume('}');
             }
             else
             {
-                LOG_BUG("Unexpected token in `type` - " << lex.next());
+                LOG_ERROR(lex << "Unexpected token in `type` - " << lex.next());
             }
         }
         lex.check_consume('}');
@@ -338,18 +419,28 @@ bool Parser::parse_one()
 
     return true;
 }
-::MIR::Function Parser::parse_body()
+::MIR::Function Parser::parse_body(const ::std::vector<std::string>& arg_names)
 {
     ::MIR::Function rv;
-    ::std::vector<::std::string>    drop_flag_names;
-    ::std::vector<::std::string>    var_names;
 
-    struct H
+    struct State
     {
+        ::std::vector<::std::string>    drop_flag_names;
+        /// Map of variable name to `(is_arg,index)`
+        ::std::map<::std::string, std::pair<bool,unsigned> >   variables;
+
+        unsigned get_drop_flag(const Parser& p, const std::string& name) const {
+            auto df_it = ::std::find(drop_flag_names.begin(), drop_flag_names.end(), name);
+            if( df_it == drop_flag_names.end() ) {
+                LOG_ERROR(p.lex << "Unable to find drop flag '" << name << "'");
+            }
+            return static_cast<unsigned>( df_it - drop_flag_names.begin() );
+        }
+
         //
         // Parse a LValue
         //
-        static ::MIR::LValue parse_lvalue(Parser& p, ::std::vector<::std::string>& var_names)
+        ::MIR::LValue parse_lvalue(Parser& p) const
         {
             auto& lex = p.lex;
             int deref = 0;
@@ -359,30 +450,25 @@ bool Parser::parse_one()
             }
             ::MIR::LValue   lv;
             if( lex.consume_if('(') ) {
-                lv = parse_lvalue(p, var_names);
+                lv = parse_lvalue(p);
                 lex.check_consume(')');
             }
             else if( lex.next() == TokenClass::Ident ) {
                 auto name = ::std::move(lex.consume().strval);
-                // TODO: Make arguments have custom names too
-                if( name.substr(0,3) == "arg" ) {
-                    try {
-                        auto idx = static_cast<unsigned>( ::std::stol(name.substr(3)) );
-                        lv = ::MIR::LValue::new_Argument( idx );
-                    }
-                    catch(const ::std::exception& e) {
-                        LOG_ERROR(lex << "Invalid argument name - " << name << " - " << e.what());
-                    }
-                }
                 // Hard-coded "RETURN" lvalue
-                else if( name == "RETURN" ) {
+                if( name == "RETURN" ) {
                     lv = ::MIR::LValue::new_Return();
                 }
                 // Otherwise, look up variable names
                 else {
-                    auto it = ::std::find(var_names.begin(), var_names.end(), name);
-                    if( it != var_names.end() ) {
-                        lv = ::MIR::LValue::new_Local(static_cast<unsigned>(it - var_names.begin()));
+                    auto it = this->variables.find(name);
+                    if( it != this->variables.end() ) {
+                        if( it->second.first ) {
+                            lv = ::MIR::LValue::new_Argument(it->second.second);
+                        }
+                        else {
+                            lv = ::MIR::LValue::new_Local(it->second.second);
+                        }
                     }
                     else {
                         lv = ::MIR::LValue::new_Static( HIR::Path { RcString(name.c_str()) } );
@@ -397,19 +483,19 @@ bool Parser::parse_one()
                 if( lex.consume_if('@') )
                 {
                     lex.check(TokenClass::Integer);
-                    auto idx = static_cast<unsigned>( lex.consume().integer() );
+                    auto idx = static_cast<unsigned>( lex.consume().integer_64(lex) );
                     lv = ::MIR::LValue::new_Downcast(::std::move(lv), idx);
                 }
                 else if( lex.consume_if('.') )
                 {
                     lex.check(TokenClass::Integer);
-                    auto idx = static_cast<unsigned>( lex.consume().integer() );
+                    auto idx = static_cast<unsigned>( lex.consume().integer_64(lex) );
                     lv = ::MIR::LValue::new_Field( ::std::move(lv), idx );
                 }
                 else if( lex.next() == '[' )
                 {
                     lex.consume();
-                    auto idx_lv = parse_lvalue(p, var_names);
+                    auto idx_lv = parse_lvalue(p);
                     lv = ::MIR::LValue::new_Index(::std::move(lv), idx_lv.as_Local());
                     lex.check_consume(']');
                 }
@@ -425,12 +511,12 @@ bool Parser::parse_one()
             return lv;
         }
 
-        static ::MIR::Constant parse_const(Parser& p)
+        ::MIR::Constant parse_const(Parser& p) const
         {
             if( p.lex.next() == TokenClass::Integer ) {
-                auto v = p.lex.consume().integer();
+                auto v = p.lex.consume().integer_128(p.lex);
                 auto cty = p.parse_core_type();
-                return ::MIR::Constant::make_Uint({ static_cast<uint64_t>(v), cty });
+                return ::MIR::Constant::make_Uint({ v, cty });
             }
             else if( p.lex.next() == TokenClass::String ) {
                 auto v = ::std::move( p.lex.consume().strval );
@@ -448,13 +534,13 @@ bool Parser::parse_one()
                 bool is_neg = (p.lex.consume() == '-');
                 if( p.lex.next() == TokenClass::Integer )
                 {
-                    auto v = static_cast<int64_t>(p.lex.consume().integer());
+                    auto v = S128(p.lex.consume().integer_128(p.lex));
                     auto cty = p.parse_core_type();
                     return ::MIR::Constant::make_Int({ is_neg ? -v : v, cty });
                 }
                 else if( p.lex.next() == TokenClass::Real )
                 {
-                    auto v = p.lex.consume().real();
+                    auto v = p.lex.consume().real(p.lex);
                     auto cty = p.parse_core_type();
                     return ::MIR::Constant::make_Float({ is_neg ? -v : v, cty });
                 }
@@ -480,7 +566,7 @@ bool Parser::parse_one()
         }
 
         // Parse a "Param" (constant or lvalue)
-        static ::MIR::Param parse_param(Parser& p, ::std::vector<::std::string>& var_names)
+        ::MIR::Param parse_param(Parser& p) const
         {
             if( p.lex.next() == TokenClass::Integer || p.lex.next() == TokenClass::String || p.lex.next() == TokenClass::ByteString
                 || p.lex.next() == '+' || p.lex.next() == '-' || p.lex.next() == '&'
@@ -492,12 +578,15 @@ bool Parser::parse_one()
             }
             else
             {
-                return parse_lvalue(p, var_names);
+                return parse_lvalue(p);
             }
         }
-    };
+    } state;
 
     lex.check_consume('{');
+    for(size_t i = 0; i < arg_names.size(); i ++ ) {
+        state.variables.insert(std::make_pair(arg_names[i], ::std::make_pair(true, static_cast<unsigned>(i))));
+    }
 
     // 1. Locals + Drop flags
     while(lex.next() == "let")
@@ -506,12 +595,12 @@ bool Parser::parse_one()
         auto name = ::std::move(lex.consume().strval);
         if(lex.consume_if('='))
         {
-            rv.drop_flags.push_back(lex.consume().integer() != 0);
-            drop_flag_names.push_back(::std::move(name));
+            rv.drop_flags.push_back(lex.consume().integer_64(lex) != 0);
+            state.drop_flag_names.push_back(::std::move(name));
         }
         else if(lex.consume_if(':'))
         {
-            var_names.push_back(::std::move(name));
+            state.variables.insert(std::make_pair(::std::move(name), ::std::make_pair(false, static_cast<unsigned>(rv.locals.size()))));
             rv.locals.push_back( parse_type() );
         }
         else
@@ -527,7 +616,7 @@ bool Parser::parse_one()
         ::std::vector<::MIR::Statement> stmts;
         ::MIR::Terminator   term;
 
-        if( lex.next().integer() != rv.blocks.size() )
+        if( lex.next().integer_64(lex) != rv.blocks.size() )
         {
             // TODO: Error.
         }
@@ -540,7 +629,7 @@ bool Parser::parse_one()
             lex.check(TokenClass::Ident);
             if( lex.consume_if("ASSIGN") )
             {
-                auto dst_val = H::parse_lvalue(*this, var_names);
+                auto dst_val = state.parse_lvalue(*this);
                 lex.check_consume('=');
                 ::MIR::RValue   src_rval;
                 // Literals
@@ -550,11 +639,11 @@ bool Parser::parse_one()
                     || lex.next() == "ADDROF"
                     )
                 {
-                    src_rval = H::parse_const(*this);
+                    src_rval = state.parse_const(*this);
                 }
                 // LValue (prefixed by =)
                 else if( lex.consume_if('=') ) {
-                    src_rval = H::parse_lvalue(*this, var_names);
+                    src_rval = state.parse_lvalue(*this);
                 }
                 else if( lex.consume_if('&') ) {
                     auto bt = ::HIR::BorrowType::Shared;
@@ -562,17 +651,17 @@ bool Parser::parse_one()
                         bt = ::HIR::BorrowType::Move;
                     else if( lex.consume_if("mut") )
                         bt = ::HIR::BorrowType::Unique;
-                    else
-                        ;
-                    auto val = H::parse_lvalue(*this, var_names);
-                    src_rval = ::MIR::RValue::make_Borrow({ bt, ::std::move(val) });
+                    else {
+                    }
+                    auto val = state.parse_lvalue(*this);
+                    src_rval = ::MIR::RValue::make_Borrow({ bt, false, ::std::move(val) });
                 }
                 // Composites
                 else if( lex.consume_if('(') ) {
                     ::std::vector<::MIR::Param> vals;
                     while( lex.next() != ')' )
                     {
-                        vals.push_back( H::parse_param(*this, var_names) );
+                        vals.push_back( state.parse_param(*this) );
                         if( !lex.consume_if(',') )
                             break ;
                     }
@@ -588,12 +677,12 @@ bool Parser::parse_one()
                     }
                     else
                     {
-                        vals.push_back( H::parse_param(*this, var_names) );
+                        vals.push_back( state.parse_param(*this) );
                         if( lex.consume_if(';') )
                         {
                             // Sized array
                             lex.check(TokenClass::Integer);
-                            auto size_val = static_cast<unsigned>(lex.consume().integer());
+                            auto size_val = static_cast<unsigned>(lex.consume().integer_64(lex));
                             lex.check_consume(']');
 
                             src_rval = ::MIR::RValue::make_SizedArray({ ::std::move(vals[0]), size_val });
@@ -605,7 +694,7 @@ bool Parser::parse_one()
                             {
                                 while( lex.next() != ']' )
                                 {
-                                    vals.push_back( H::parse_param(*this, var_names) );
+                                    vals.push_back( state.parse_param(*this) );
                                     if( !lex.consume_if(',') )
                                         break ;
                                 }
@@ -619,7 +708,7 @@ bool Parser::parse_one()
                     ::std::vector<::MIR::Param> vals;
                     while( lex.next() != '}' )
                     {
-                        vals.push_back( H::parse_param(*this, var_names) );
+                        vals.push_back( state.parse_param(*this) );
                         if( !lex.consume_if(',') )
                             break ;
                     }
@@ -629,18 +718,36 @@ bool Parser::parse_one()
 
                     src_rval = ::MIR::RValue::make_Struct({ ::std::move(p), ::std::move(vals) });
                 }
-                else if( lex.consume_if("VARIANT") ) {
+                else if( lex.consume_if("UNION") ) {
                     auto path = HIR::GenericPath { RcString( lex.check_consume(TokenClass::Ident).strval.c_str() ) };
                     //auto idx = static_cast<unsigned>(lex.consume_integer());
                     lex.check(TokenClass::Integer);
-                    auto idx = static_cast<unsigned>(lex.consume().integer());
-                    auto val = H::parse_param(*this, var_names);
+                    auto idx = static_cast<unsigned>(lex.consume().integer_64(lex));
+                    auto val = state.parse_param(*this);
 
-                    src_rval = ::MIR::RValue::make_Variant({ ::std::move(path), idx, ::std::move(val) });
+                    src_rval = ::MIR::RValue::make_UnionVariant({ ::std::move(path), idx, ::std::move(val) });
+                }
+                else if( lex.consume_if("ENUM") ) {
+                    auto path = HIR::GenericPath { RcString( lex.check_consume(TokenClass::Ident).strval.c_str() ) };
+                    //auto idx = static_cast<unsigned>(lex.consume_integer());
+                    lex.check(TokenClass::Integer);
+                    auto idx = static_cast<unsigned>(lex.consume().integer_64(lex));
+
+                    lex.check_consume('{');
+                    ::std::vector<::MIR::Param> vals;
+                    while( lex.next() != '}' )
+                    {
+                        vals.push_back( state.parse_param(*this) );
+                        if( !lex.consume_if(',') )
+                            break ;
+                    }
+                    lex.check_consume('}');
+
+                    src_rval = ::MIR::RValue::make_EnumVariant({ ::std::move(path), idx, ::std::move(vals) });
                 }
                 // Operations
                 else if( lex.consume_if("CAST") ) {
-                    auto lv = H::parse_lvalue(*this, var_names);
+                    auto lv = state.parse_lvalue(*this);
                     lex.check_consume("as");
                     auto ty = parse_type();
                     src_rval = ::MIR::RValue::make_Cast({ ::std::move(lv), ::std::move(ty) });
@@ -659,12 +766,12 @@ bool Parser::parse_one()
                         LOG_ERROR(lex << "Unexpected token in uniop - " << lex.next());
                     }
 
-                    auto lv = H::parse_lvalue(*this, var_names);
+                    auto lv = state.parse_lvalue(*this);
 
                     src_rval = ::MIR::RValue::make_UniOp({ ::std::move(lv), op });
                 }
                 else if( lex.consume_if("BINOP") ) {
-                    auto lv1 = H::parse_param(*this, var_names);
+                    auto lv1 = state.parse_param(*this);
                     lex.check(TokenClass::Symbol);
                     auto t = lex.consume();
                     ::MIR::eBinOp   op;
@@ -705,22 +812,22 @@ bool Parser::parse_one()
                     default:
                         LOG_ERROR(lex << "Unexpected token " << t << " in BINOP");
                     }
-                    auto lv2 = H::parse_param(*this, var_names);
+                    auto lv2 = state.parse_param(*this);
 
                     src_rval = ::MIR::RValue::make_BinOp({ ::std::move(lv1), op, ::std::move(lv2) });
                 }
                 else if( lex.consume_if("MAKEDST") ) {
-                    auto lv_ptr = H::parse_param(*this, var_names);
+                    auto lv_ptr = state.parse_param(*this);
                     lex.check_consume(',');
-                    auto lv_meta = H::parse_param(*this, var_names);
+                    auto lv_meta = state.parse_param(*this);
                     src_rval = ::MIR::RValue::make_MakeDst({ ::std::move(lv_ptr), ::std::move(lv_meta) });
                 }
                 else if( lex.consume_if("DSTPTR") ) {
-                    auto lv = H::parse_lvalue(*this, var_names);
+                    auto lv = state.parse_lvalue(*this);
                     src_rval = ::MIR::RValue::make_DstPtr({ ::std::move(lv) });
                 }
                 else if( lex.consume_if("DSTMETA") ) {
-                    auto lv = H::parse_lvalue(*this, var_names);
+                    auto lv = state.parse_lvalue(*this);
                     src_rval = ::MIR::RValue::make_DstMeta({ ::std::move(lv) });
                 }
                 else {
@@ -733,14 +840,10 @@ bool Parser::parse_one()
             {
                 lex.check(TokenClass::Ident);
                 auto name = ::std::move(lex.consume().strval);
-                auto df_it = ::std::find(drop_flag_names.begin(), drop_flag_names.end(), name);
-                if( df_it == drop_flag_names.end() ) {
-                    LOG_ERROR(lex << "Unable to find drop flag '" << name << "'");
-                }
-                auto df_idx = static_cast<unsigned>( df_it - drop_flag_names.begin() );
+                unsigned df_idx = state.get_drop_flag(*this, name);
                 lex.check_consume('=');
                 if( lex.next() == TokenClass::Integer ) {
-                    bool val = lex.consume().integer() != 0;
+                    bool val = lex.consume().integer_64(lex) != 0;
                     stmts.push_back(::MIR::Statement::make_SetDropFlag({ df_idx, val, ~0u }));
                 }
                 else {
@@ -751,18 +854,14 @@ bool Parser::parse_one()
                     }
                     lex.check(TokenClass::Ident);
                     auto name = ::std::move(lex.consume().strval);
-                    df_it = ::std::find(drop_flag_names.begin(), drop_flag_names.end(), name);
-                    if( df_it == drop_flag_names.end() ) {
-                        LOG_ERROR(lex << "Unable to find drop flag '" << name << "'");
-                    }
-                    auto other_idx = static_cast<unsigned>( df_it - drop_flag_names.begin() );
+                    unsigned other_idx = state.get_drop_flag(*this, name);
 
                     stmts.push_back(::MIR::Statement::make_SetDropFlag({ df_idx, inv, other_idx }));
                 }
             }
             else if(lex.consume_if("DROP") )
             {
-                auto slot = H::parse_lvalue(*this, var_names);
+                auto slot = state.parse_lvalue(*this);
                 auto kind = ::MIR::eDropKind::DEEP;
                 if( lex.consume_if("SHALLOW") )
                 {
@@ -773,11 +872,7 @@ bool Parser::parse_one()
                 {
                     lex.check(TokenClass::Ident);
                     auto name = ::std::move(lex.consume().strval);
-                    auto df_it = ::std::find(drop_flag_names.begin(), drop_flag_names.end(), name);
-                    if( df_it == drop_flag_names.end() ) {
-                        LOG_ERROR(lex << "Unable to find drop flag '" << name << "'");
-                    }
-                    flag_idx = static_cast<unsigned>( df_it - drop_flag_names.begin() );
+                    flag_idx = state.get_drop_flag(*this, name);
                 }
 
                 stmts.push_back(::MIR::Statement::make_Drop({  kind, ::std::move(slot), flag_idx }));
@@ -790,7 +885,7 @@ bool Parser::parse_one()
                 {
                     auto cons = ::std::move(lex.check_consume(TokenClass::String).strval);
                     lex.check_consume(':');
-                    auto lv = H::parse_lvalue(*this, var_names);
+                    auto lv = state.parse_lvalue(*this);
                     if(!lex.consume_if(','))
                         break;
                     out_vals.push_back(::std::make_pair(::std::move(cons), ::std::move(lv)));
@@ -805,7 +900,7 @@ bool Parser::parse_one()
                 {
                     auto cons = ::std::move(lex.check_consume(TokenClass::String).strval);
                     lex.check_consume(':');
-                    auto lv = H::parse_lvalue(*this, var_names);
+                    auto lv = state.parse_lvalue(*this);
                     if(!lex.consume_if(','))
                         break;
                     in_vals.push_back(::std::make_pair(::std::move(cons), ::std::move(lv)));
@@ -834,6 +929,152 @@ bool Parser::parse_one()
                     ::std::move(tpl), ::std::move(out_vals), ::std::move(in_vals), ::std::move(clobbers), ::std::move(flags)
                     }));
             }
+            else if( lex.consume_if("ASM2") )
+            {
+                ::MIR::Statement::Data_Asm2 stmt_asm2;
+                lex.check_consume('(');
+                do {
+                    auto text = std::move(lex.check_consume(TokenClass::String).strval);
+                    AsmCommon::Line line;
+
+                    // Stripped-down version of the parsing code from the main compiler
+                    const char* c = text.c_str();
+                    std::string cur_string;
+                    while(*c)
+                    {
+                        if(*c == '{')
+                        {
+                            AsmCommon::LineFragment frag;
+
+                            c ++;
+                            unsigned idx = 0;
+                            while(*c && *c != ':' && *c != '}')
+                            {
+                                LOG_ASSERT('0' <= *c && *c <= '9', lex << "Non-integer argument in asm! format string");
+                                idx *= 10;
+                                idx += *c - '0';
+                                c ++;
+                            }
+                            LOG_ASSERT(*c, lex << "Unexpected EOF in asm! format string");
+                            frag.index = idx;
+                            assert(*c == ':' || *c == '}');
+                            if(*c == ':')
+                            {
+                                c ++;
+                                LOG_ASSERT(*c, lex << "Unexpected EOF in asm! format string");
+                                if(*c != '}') {
+                                    frag.modifier = *c;
+                                    c ++;
+                                }
+                            }
+                            LOG_ASSERT(*c, lex << "Unexpected EOF in asm! format string");
+                            LOG_ASSERT(*c == '}', lex << "Expected '}' in asm! format string");
+
+                            frag.before = std::move(cur_string);
+                            cur_string.clear();
+                            line.frags.push_back(std::move(frag));
+                        }
+                        else {
+                            cur_string += *c;
+                        }
+                        c ++;
+                    }
+                    line.trailing = std::move(cur_string);
+                    stmt_asm2.lines.push_back(std::move(line));
+
+                    if( lex.next() == ')' )
+                        break;
+                } while( !lex.consume_if(',') );
+
+                // Arguments
+                while( !lex.consume_if(')') )
+                {
+                    if( lex.consume_if("const") )
+                    {
+                        stmt_asm2.params.push_back( state.parse_const(*this) );
+                    }
+                    else if( lex.consume_if("sym") )
+                    {
+                        stmt_asm2.params.push_back( HIR::Path { RcString(lex.check_consume(TokenClass::Ident).strval.c_str()) } );
+                    }
+                    else if( lex.consume_if("reg") )
+                    {
+                        MIR::AsmParam::Data_Reg param;
+                        lex.check_consume('(');
+                        // Direction
+                        lex.check(TokenClass::Ident);
+                        /**/ if( lex.consume_if("in" ) ) { param.dir = AsmCommon::Direction::In;  }
+                        else if( lex.consume_if("out") ) { param.dir = AsmCommon::Direction::Out; }
+                        else if( lex.consume_if("lateout") ) { param.dir = AsmCommon::Direction::LateOut; }
+                        else if( lex.consume_if("inlateout") ) { param.dir = AsmCommon::Direction::InLateOut; }
+                        else {
+                            LOG_ERROR(lex << "Unexpected token in ASM2 direction - " << lex.next());
+                        }
+                        // Spec
+                        if( lex.next() == TokenClass::String ) {
+                            param.spec = lex.consume().strval;
+                        }
+                        else if( lex.next() == TokenClass::Ident ) {
+#define GET(_suf, _name)  if( lex.consume_if(#_name) ) { param.spec = AsmCommon::RegisterClass::_suf ## _ ## _name; }
+                            /**/ GET(x86, reg)
+                            else GET(x86, reg_byte)
+                            else {
+                                LOG_ERROR(lex << "Unexpected token in ASM2 register class - " << lex.next());
+                            }
+#undef GET
+                        }
+                        else {
+                            LOG_ERROR(lex << "Unexpected token in ASM2 reg spec - " << lex.next());
+                        }
+                        lex.check_consume(')');
+                        if( !lex.consume_if('_') ) {
+                            param.input = std::make_unique<MIR::Param>(state.parse_param(*this));
+                        }
+                        lex.check_consume('=');
+                        lex.check_consume('>');
+                        if( !lex.consume_if('_') ) {
+                            param.output = std::make_unique<MIR::LValue>(state.parse_lvalue(*this));
+                        }
+
+                        stmt_asm2.params.push_back(std::move(param));
+                    }
+                    else if( lex.consume_if("options") )
+                    {
+                        lex.check_consume('(');
+
+                        do {
+                            if( lex.next() == ')' )
+                                break;
+
+                            lex.check(TokenClass::Ident);
+#define FLAG(_name)  if( lex.consume_if(#_name) ) { stmt_asm2.options._name = true; }
+                            /**/ FLAG(pure)
+                            else FLAG(nomem)
+                            else FLAG(readonly)
+                            else FLAG(preserves_flags)
+                            else FLAG(noreturn)
+                            else FLAG(nostack)
+                            else FLAG(att_syntax)
+                            else {
+                                LOG_ERROR(lex << "Unexpected token in ASM2 options - " << lex.next());
+                            }
+#undef FLAG
+
+                        } while( lex.consume_if(',') );
+                        lex.check_consume(')');
+                    }
+                    else
+                    {
+                        LOG_ERROR(lex << "Unexpected token in ASM2 argument - " << lex.next());
+                    }
+                    if( !lex.consume_if(',') ) {
+                        lex.consume_if(')');
+                        break;
+                    }
+                }
+
+                stmts.push_back(std::move(stmt_asm2));
+            }
             else
             {
                 break;
@@ -845,11 +1086,11 @@ bool Parser::parse_one()
         lex.check(TokenClass::Ident);
         if( lex.consume_if("GOTO") )
         {
-            term = ::MIR::Terminator::make_Goto(static_cast<unsigned>(lex.consume().integer()));
+            term = ::MIR::Terminator::make_Goto(static_cast<unsigned>(lex.consume().integer_64(lex)));
         }
         else if( lex.consume_if("PANIC") )
         {
-            term = ::MIR::Terminator::make_Panic({ static_cast<unsigned>(lex.consume().integer()) });
+            term = ::MIR::Terminator::make_Panic({ static_cast<unsigned>(lex.consume().integer_64(lex)) });
         }
         else if( lex.consume_if("RETURN") )
         {
@@ -865,21 +1106,21 @@ bool Parser::parse_one()
         }
         else if( lex.consume_if("IF") )
         {
-            auto val = H::parse_lvalue(*this, var_names);
+            auto val = state.parse_lvalue(*this);
             lex.check_consume("goto");
-            auto tgt_true = static_cast<unsigned>(lex.consume().integer());
+            auto tgt_true = static_cast<unsigned>(lex.consume().integer_64(lex));
             lex.check_consume("else");
-            auto tgt_false = static_cast<unsigned>(lex.consume().integer());
+            auto tgt_false = static_cast<unsigned>(lex.consume().integer_64(lex));
             term = ::MIR::Terminator::make_If({ ::std::move(val), tgt_true, tgt_false });
         }
         else if( lex.consume_if("SWITCH") )
         {
-            auto val = H::parse_lvalue(*this, var_names);
+            auto val = state.parse_lvalue(*this);
             lex.check_consume('{');
             ::std::vector<unsigned> targets;
             while(lex.next() != '{')
             {
-                targets.push_back( static_cast<unsigned>(lex.check_consume(TokenClass::Integer).integer()) );
+                targets.push_back( static_cast<unsigned>(lex.check_consume(TokenClass::Integer).integer_64(lex)) );
                 if( !lex.consume_if(',') )
                     break;
             }
@@ -889,7 +1130,7 @@ bool Parser::parse_one()
         }
         else if( lex.consume_if("SWITCHVALUE") )
         {
-            auto val = H::parse_lvalue(*this, var_names);
+            auto val = state.parse_lvalue(*this);
             ::std::vector<::MIR::BasicBlockId>  targets;
             lex.check_consume('{');
             ::MIR::SwitchValues vals;
@@ -897,9 +1138,9 @@ bool Parser::parse_one()
                 ::std::vector<uint64_t> values;
                 while(lex.next() != '_')
                 {
-                    values.push_back( lex.check_consume(TokenClass::Integer).integer() );
+                    values.push_back( lex.check_consume(TokenClass::Integer).integer_64(lex) );
                     lex.check_consume('=');
-                    targets.push_back( static_cast<unsigned>( lex.check_consume(TokenClass::Integer).integer() ) );
+                    targets.push_back( static_cast<unsigned>( lex.check_consume(TokenClass::Integer).integer_64(lex) ) );
                     lex.check_consume(',');
                 }
                 vals = ::MIR::SwitchValues::make_Unsigned(::std::move(values));
@@ -909,10 +1150,10 @@ bool Parser::parse_one()
                 while(lex.next() != '_')
                 {
                     auto neg = lex.consume() == '-';
-                    int64_t val = static_cast<int64_t>( lex.check_consume(TokenClass::Integer).integer() );
+                    int64_t val = static_cast<int64_t>( lex.check_consume(TokenClass::Integer).integer_64(lex) );
                     values.push_back( neg ? -val : val );
                     lex.check_consume('=');
-                    targets.push_back( static_cast<unsigned>( lex.check_consume(TokenClass::Integer).integer() ) );
+                    targets.push_back( static_cast<unsigned>( lex.check_consume(TokenClass::Integer).integer_64(lex) ) );
                     lex.check_consume(',');
                 }
                 vals = ::MIR::SwitchValues::make_Signed(::std::move(values));
@@ -923,7 +1164,7 @@ bool Parser::parse_one()
                 {
                     values.push_back( ::std::move(lex.check_consume(TokenClass::String).strval) );
                     lex.check_consume('=');
-                    targets.push_back( static_cast<unsigned>( lex.check_consume(TokenClass::Integer).integer() ) );
+                    targets.push_back( static_cast<unsigned>( lex.check_consume(TokenClass::Integer).integer_64(lex) ) );
                     lex.check_consume(',');
                 }
                 vals = ::MIR::SwitchValues::make_String(::std::move(values));
@@ -933,18 +1174,18 @@ bool Parser::parse_one()
             }
             lex.check_consume('_');
             lex.check_consume('=');
-            auto def_tgt = static_cast<unsigned>( lex.check_consume(TokenClass::Integer).integer() );
+            auto def_tgt = static_cast<unsigned>( lex.check_consume(TokenClass::Integer).integer_64(lex) );
             lex.check_consume('}');
 
             term = ::MIR::Terminator::make_SwitchValue({ ::std::move(val), def_tgt, ::std::move(targets), ::std::move(vals) });
         }
         else if( lex.consume_if("CALL") )
         {
-            auto dst = H::parse_lvalue(*this, var_names);
+            auto dst = state.parse_lvalue(*this);
             lex.check_consume('=');
             ::MIR::CallTarget   ct;
             if(lex.consume_if('(')) {
-                ct = H::parse_lvalue(*this, var_names);
+                ct = state.parse_lvalue(*this);
                 lex.check_consume(')');
             }
             else if( lex.next() == TokenClass::String ) {
@@ -959,7 +1200,7 @@ bool Parser::parse_one()
             ::std::vector<::MIR::Param> args;
             while(lex.next() != ')')
             {
-                args.push_back(H::parse_param(*this, var_names));
+                args.push_back(state.parse_param(*this));
                 if( !lex.consume_if(',') )
                     break;
             }
@@ -967,10 +1208,10 @@ bool Parser::parse_one()
             lex.check_consume("goto");
             //auto tgt_idx = lex.consume_integer();
             lex.check(TokenClass::Integer);
-            auto tgt_block = static_cast<unsigned>(lex.consume().integer());
+            auto tgt_block = static_cast<unsigned>(lex.consume().integer_64(lex));
             lex.check_consume("else");
             lex.check(TokenClass::Integer);
-            auto panic_block = static_cast<unsigned>(lex.consume().integer());
+            auto panic_block = static_cast<unsigned>(lex.consume().integer_64(lex));
 
             term = ::MIR::Terminator::make_Call({ tgt_block, panic_block, ::std::move(dst), ::std::move(ct), ::std::move(args) });
         }
@@ -1052,8 +1293,7 @@ RawType Parser::parse_core_type()
         auto rv = parse_type();
         if( lex.consume_if(';') )
         {
-            size_t size = lex.next().integer();
-            lex.consume();
+            size_t size = lex.check_consume(TokenClass::Integer).integer_64(lex);
             lex.check_consume(']');
             return ::std::move(rv).wrap( TypeWrapper::Ty::Array, size );
         }
@@ -1079,8 +1319,9 @@ RawType Parser::parse_core_type()
             bt = ::HIR::BorrowType::Move;
         else if( lex.consume_if("mut") )
             bt = ::HIR::BorrowType::Unique;
-        else
-            ; // keep as shared
+        else {
+            // keep as shared
+        }
         return parse_type().wrap( TypeWrapper::Ty::Borrow, static_cast<size_t>(bt) );
     }
     else if( lex.consume_if('*') )
@@ -1111,8 +1352,16 @@ RawType Parser::parse_core_type()
         lex.check_consume("fn");
         lex.check_consume('(');
         ::std::vector<::HIR::TypeRef>   args;
+        bool is_variadic = false;
         while( lex.next() != ')' )
         {
+            if( lex.next() == '.' ) {
+                lex.check_consume('.');
+                lex.check_consume('.');
+                lex.check_consume('.');
+                is_variadic = true;
+                break;
+            }
             args.push_back(parse_type());
             if( !lex.consume_if(',') )
                 break;
@@ -1130,13 +1379,13 @@ RawType Parser::parse_core_type()
         }
         auto ft = FunctionType {
             is_unsafe,
+            is_variadic,
             ::std::move(abi),
             ::std::move(args),
             ::std::move(ret_ty)
             };
         const auto* ft_p = &*tree.function_types.insert(::std::move(ft)).first;
         return ::HIR::TypeRef(ft_p);
-        // TODO: Use abi/ret_ty/args as part of that
     }
     else if( lex.consume_if("dyn") )
     {
@@ -1214,7 +1463,7 @@ const Function* ModuleTree::get_ext_function(const char* name) const
     }
     return it->second;
 }
-Static& ModuleTree::get_static(const HIR::Path& p)
+const Static& ModuleTree::get_static(const HIR::Path& p) const
 {
     auto it = statics.find(p.n);
     if(it == statics.end())
@@ -1223,7 +1472,7 @@ Static& ModuleTree::get_static(const HIR::Path& p)
     }
     return it->second;
 }
-Static* ModuleTree::get_static_opt(const HIR::Path& p)
+const Static* ModuleTree::get_static_opt(const HIR::Path& p) const
 {
     auto it = statics.find(p.n);
     if(it == statics.end())

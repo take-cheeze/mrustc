@@ -8,19 +8,31 @@
 #ifndef TYPES_HPP_INCLUDED
 #define TYPES_HPP_INCLUDED
 
+#include <cstdint>
 #include <memory>
 
 #include "../common.hpp"
 #include "coretypes.hpp"
-#include "ast/path.hpp"
-#include "ast/macro.hpp"
+#include <span.hpp>
+//#include "ast/macro.hpp"
+#include "ast/lifetime_ref.hpp"
+//#include "ast/path.hpp"
 #include <tagged_union.hpp>
+
+#ifdef AST_PATH_HPP_COMPLETE
+# error ""
+#endif
 
 namespace AST {
 class ExprNode;
 class Expr;
 class LifetimeParam;
+
+class Path;
+struct PathParams;
+class MacroInvocation;
 }
+class TypeRef;
 
 namespace AST {
 
@@ -39,48 +51,6 @@ namespace AST {
         friend ::std::ostream& operator<<(::std::ostream& os, const HigherRankedBounds& x);
     };
 
-    class LifetimeRef
-    {
-    public:
-        static const uint16_t BINDING_STATIC = 0xFFFF;
-        static const uint16_t BINDING_UNBOUND = 0xFFFE;
-        static const uint16_t BINDING_INFER = 0xFFFD;
-
-    private:
-        Ident   m_name;
-        uint16_t  m_binding;
-
-        LifetimeRef(Ident name, uint32_t binding):
-            m_name( ::std::move(name) ),
-            m_binding( binding )
-        {
-        }
-    public:
-        LifetimeRef():
-            LifetimeRef("", BINDING_INFER)
-        {
-        }
-        LifetimeRef(Ident name):
-            LifetimeRef(::std::move(name), BINDING_UNBOUND)
-        {
-        }
-        static LifetimeRef new_static() {
-            return LifetimeRef("static", BINDING_STATIC);
-        }
-
-        void set_binding(uint16_t b) { assert(m_binding == BINDING_UNBOUND); m_binding = b; }
-        bool is_unbound() const { return m_binding == BINDING_UNBOUND; }
-        bool is_infer() const { return m_binding == BINDING_INFER; }
-
-        const Ident& name() const { return m_name; }
-        uint16_t binding() const { return m_binding; }
-        Ordering ord(const LifetimeRef& x) const { return ::ord(m_name.name, x.m_name.name); }
-        bool operator==(const LifetimeRef& x) const { return ord(x) == OrdEqual; }
-        bool operator!=(const LifetimeRef& x) const { return ord(x) != OrdEqual; }
-        bool operator<(const LifetimeRef& x) const { return ord(x) == OrdLess; };
-
-        friend ::std::ostream& operator<<(::std::ostream& os, const LifetimeRef& x);
-    };
 }
 
 class PrettyPrintType
@@ -94,13 +64,6 @@ public:
     void print(::std::ostream& os) const;
 
     friend ::std::ostream& operator<<(::std::ostream& os, const PrettyPrintType& v);
-};
-
-struct TypeArgRef
-{
-    RcString   name;
-    unsigned int    level;
-    const AST::GenericParams*  params;
 };
 
 struct Type_Function
@@ -130,9 +93,23 @@ struct Type_Function
 struct Type_TraitPath
 {
     AST::HigherRankedBounds hrbs;
-    AST::Path   path;
+    ::std::unique_ptr<AST::Path>    path;
+
+    Type_TraitPath() {}
+    Type_TraitPath(AST::HigherRankedBounds hrbs, AST::Path path);
+    Type_TraitPath(const Type_TraitPath&);
 
     Ordering ord(const Type_TraitPath& x) const;
+};
+struct Type_ErasedType
+{
+    
+    ::std::vector<Type_TraitPath>   traits;
+    ::std::vector<Type_TraitPath>   maybe_traits;
+    ::std::vector<AST::LifetimeRef> lifetimes;
+    ::std::unique_ptr<AST::PathParams> use;
+    /// Was this `impl` from 2024 or later edition? This changes the behaviour if `use` is not present
+    bool is_edition_2024_or_later;
 };
 
 TAGGED_UNION(TypeData, None,
@@ -141,7 +118,7 @@ TAGGED_UNION(TypeData, None,
     (Bang, struct { }),
     (Unit, struct { }),
     (Macro, struct {
-        ::AST::MacroInvocation inv;
+        ::std::unique_ptr<::AST::MacroInvocation> inv;
         }),
     (Primitive, struct {
         enum eCoreType core_type;
@@ -163,23 +140,22 @@ TAGGED_UNION(TypeData, None,
         }),
     (Array, struct {
         ::std::unique_ptr<TypeRef> inner;
+        // If `nullptr` - this is an inferred size
         ::std::shared_ptr<AST::ExprNode> size;
+        }),
+    (Slice, struct {
+        ::std::unique_ptr<TypeRef> inner;
         }),
     (Generic, struct {
         RcString name;
         unsigned int index;
         }),
-    (Path, struct {
-        AST::Path path;
-        }),
+    (Path, ::std::unique_ptr<AST::Path>),
     (TraitObject, struct {
         ::std::vector<Type_TraitPath>   traits;
         ::std::vector<AST::LifetimeRef> lifetimes;
         }),
-    (ErasedType, struct {
-        ::std::vector<Type_TraitPath>   traits;
-        ::std::vector<AST::LifetimeRef> lifetimes;
-        })
+    (ErasedType, std::unique_ptr<Type_ErasedType>)
     );
 
 /// A type
@@ -223,10 +199,7 @@ public:
     {}
 
     struct TagMacro {};
-    TypeRef(TagMacro, ::AST::MacroInvocation inv):
-        m_span(inv.span()),
-        m_data(TypeData::make_Macro({mv$(inv)}))
-    {}
+    TypeRef(TagMacro, ::AST::MacroInvocation inv);
 
     struct TagUnit {};  // unit maps to a zero-length tuple, just easier to type
     TypeRef(TagUnit, Span sp):
@@ -273,7 +246,7 @@ public:
     struct TagUnsizedArray {};
     TypeRef(TagUnsizedArray , Span sp, TypeRef inner_type):
         m_span(mv$(sp)),
-        m_data(TypeData::make_Array({ ::make_unique_ptr(mv$(inner_type)), ::std::shared_ptr<AST::ExprNode>() }))
+        m_data(TypeData::make_Slice({ ::make_unique_ptr(mv$(inner_type)) }))
     {}
 
     struct TagArg {};
@@ -286,13 +259,8 @@ public:
     {}
 
     struct TagPath {};
-    TypeRef(TagPath, Span sp, AST::Path path):
-        m_span(mv$(sp)),
-        m_data(TypeData::make_Path({ ::std::move(path) }))
-    {}
-    TypeRef(Span sp, AST::Path path):
-        TypeRef(TagPath(), mv$(sp), mv$(path))
-    {}
+    TypeRef(TagPath, Span sp, AST::Path path);
+    TypeRef(Span sp, AST::Path path);
 
     TypeRef( Span sp, ::std::vector<Type_TraitPath> traits, ::std::vector<AST::LifetimeRef> lifetimes ):
         m_span(mv$(sp)),
@@ -311,8 +279,8 @@ public:
     bool is_primitive() const { return m_data.is_Primitive(); }
 
     bool is_path() const { return m_data.is_Path(); }
-    const AST::Path& path() const { return m_data.as_Path().path; }
-    AST::Path& path() { return m_data.as_Path().path; }
+    const AST::Path& path() const { return *m_data.as_Path(); }
+          AST::Path& path()       { return *m_data.as_Path(); }
 
     bool is_type_param() const { return m_data.is_Generic(); }
     const RcString& type_param() const { return m_data.as_Generic().name; }
@@ -353,5 +321,7 @@ public:
 
     friend ::std::ostream& operator<<(::std::ostream& os, const TypeRef& tr);
 };
+
+#define TYPES_HPP_COMPLETE
 
 #endif // TYPES_HPP_INCLUDED

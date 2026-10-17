@@ -11,12 +11,16 @@ V ?= @
 OBJDIR := .obj/
 
 BIN := ../../bin/standalone_miri$(EXESUF)
-OBJS := main.o debug.o mir.o lex.o value.o module_tree.o hir_sim.o miri.o rc_string.o
+OBJS := main.o debug.o mir.o lex.o value.o module_tree.o hir_sim.o rc_string.o
+OBJS += miri.o miri_extern.o miri_intrinsic.o
 
 LINKFLAGS := -g -lpthread
 CXXFLAGS := -Wall -std=c++14 -g -O2
 CXXFLAGS += -I ../common -I ../../src/include -I .
 CXXFLAGS += -Wno-misleading-indentation	# Gets REALLY confused by the TU_ARM macro
+
+CXXFLAGS += $(CXXFLAGS_EXTRA)
+LINKFLAGS += $(LINKFLAGS_EXTRA)
 
 OBJS := $(OBJS:%=$(OBJDIR)%)
 
@@ -30,22 +34,22 @@ clean:
 	rm $(BIN) $(OBJS)
 
 $(BIN): $(OBJS) $(COMMON_LIB)
-	@mkdir -p $(dir $@)
+	@+mkdir -p $(dir $@)
 	@echo [CXX] -o $@
 	$V$(CXX) -o $@ $(OBJS) $(COMMON_LIB) $(LINKFLAGS)
 
 $(OBJDIR)%.o: %.cpp
-	@mkdir -p $(dir $@)
+	@+mkdir -p $(dir $@)
 	@echo [CXX] $<
 	$V$(CXX) -o $@ -c $< $(CXXFLAGS) -MMD -MP -MF $@.dep
 
 $(OBJDIR)%.o: ../../src/%.cpp
-	@mkdir -p $(dir $@)
+	@+mkdir -p $(dir $@)
 	@echo [CXX] $<
 	$V$(CXX) -o $@ -c $< $(CXXFLAGS) -MMD -MP -MF $@.dep
 
 $(COMMON_LIB):
-	make -C ../common
+	$(MAKE) -C ../common
 
 -include $(OBJS:%.o=%.o.dep)
 

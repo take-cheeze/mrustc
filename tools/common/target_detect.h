@@ -16,18 +16,69 @@
 # endif
 // - Linux
 #elif defined(__linux__)
+# ifndef _GNU_SOURCE
+#  define _GNU_SOURCE
+# endif
+# include <features.h>
 # if defined(__amd64__)
-#  define DEFAULT_TARGET_NAME "x86_64-linux-gnu"
+#  if defined(_ILP32)
+#   define DEFAULT_TARGET_NAME "x86_64-unknown-linux-gnux32"
+#  elif defined(__USE_GNU)
+#   define DEFAULT_TARGET_NAME "x86_64-unknown-linux-gnu"
+#  else
+#   define DEFAULT_TARGET_NAME "x86_64-unknown-linux-musl"
+#  endif
 # elif defined(__aarch64__)
-#  define DEFAULT_TARGET_NAME "aarch64-linux-gnu"
+#  if defined(__USE_GNU)
+#   define DEFAULT_TARGET_NAME "aarch64-unknown-linux-gnu"
+#  else
+#   define DEFAULT_TARGET_NAME "aarch64-unknown-linux-musl"
+#  endif
 # elif defined(__arm__)
-#  define DEFAULT_TARGET_NAME "arm-linux-gnu"
+#  if defined(__USE_GNU)
+#   define DEFAULT_TARGET_NAME "arm-unknown-linux-gnu"
+#  else
+#   define DEFAULT_TARGET_NAME "arm-unknown-linux-musl"
+#  endif
 # elif defined(__i386__)
-#  define DEFAULT_TARGET_NAME "i586-linux-gnu"
+#  if defined(__USE_GNU)
+#   define DEFAULT_TARGET_NAME "i586-unknown-linux-gnu"
+#  else
+#   define DEFAULT_TARGET_NAME "i586-unknown-linux-musl"
+#  endif
 # elif defined(__m68k__)
-#  define DEFAULT_TARGET_NAME "m68k-linux-gnu"
+#  if defined(__USE_GNU)
+#   define DEFAULT_TARGET_NAME "m68k-unknown-linux-gnu"
+#  else
+#   define DEFAULT_TARGET_NAME "m68k-unknown-linux-musl"
+#  endif
+# elif defined(__powerpc64__) && defined(__BIG_ENDIAN__)
+#  if defined(__USE_GNU)
+#   define DEFAULT_TARGET_NAME "powerpc64-unknown-linux-gnu"
+#  else
+#   define DEFAULT_TARGET_NAME "powerpc64-unknown-linux-musl"
+#  endif
+# elif defined(__powerpc64__) && defined(__LITTLE_ENDIAN__)
+#  if defined(__USE_GNU)
+#   define DEFAULT_TARGET_NAME "powerpc64le-unknown-linux-gnu"
+#  else
+#   define DEFAULT_TARGET_NAME "powerpc64le-unknown-linux-musl"
+#  endif
+# elif defined(__riscv) && __riscv_xlen == 64
+#  if defined(__USE_GNU)
+#   define DEFAULT_TARGET_NAME "riscv64-unknown-linux-gnu"
+#  else
+#   define DEFAULT_TARGET_NAME "riscv64-unknown-linux-musl"
+#  endif
 # else
 #  warning "Unable to detect a suitable default target (linux-gnu)"
+# endif
+// - msys/cygwin
+#elif defined(__CYGWIN__)
+# if defined(__x86_64__)
+#  define DEFAULT_TARGET_NAME "x86_64-pc-windows-gnu"
+# else
+#  define DEFAULT_TARGET_NAME "i586-pc-windows-gnu"
 # endif
 // - MinGW
 #elif defined(__MINGW32__)
@@ -74,7 +125,15 @@
 # define DEFAULT_TARGET_NAME "x86_64-unknown-dragonfly"
 // - Apple devices
 #elif defined(__APPLE__)
-# define DEFAULT_TARGET_NAME "x86_64-apple-macosx"
+# if defined(__aarch64__)
+#  define DEFAULT_TARGET_NAME "aarch64-apple-darwin"
+# elif defined(__ppc64__)
+#  define DEFAULT_TARGET_NAME "powerpc64-apple-darwin"
+# elif defined(__ppc__)
+#  define DEFAULT_TARGET_NAME "powerpc-apple-darwin"
+# else
+#  define DEFAULT_TARGET_NAME "x86_64-apple-darwin"
+#endif
 // - Haiku
 #elif defined(__HAIKU__)
 # if defined(__x86_64__)

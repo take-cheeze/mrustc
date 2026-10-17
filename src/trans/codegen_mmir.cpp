@@ -18,15 +18,6 @@
 
 namespace
 {
-    size_t PTR_BASE = 0x1000;   // See matching value in standalone_miri value.hpp
-
-    size_t Target_GetSizeOf_Required(const Span& sp, const StaticTraitResolve& resolve, const ::HIR::TypeRef& ty)
-    {
-        size_t size;
-        bool type_has_size = Target_GetSizeOf(sp, resolve, ty, size);
-        ASSERT_BUG(sp, type_has_size, "Attempting to get the size of a unsized type");
-        return size;
-    }
 
     template<typename T>
     struct Fmt
@@ -104,6 +95,9 @@ namespace
             }
             os << fmt(te.inner);
             }
+        TU_ARMA(NamedFunction, te) {
+            os << "fn " << Trans_Mangle(te.path);
+            }
         TU_ARMA(Function, e) {
             if( e.is_unsafe ) {
                 os << "unsafe ";
@@ -115,10 +109,10 @@ namespace
             for(const auto& t : e.m_arg_types)
                 os << fmt(t) << ", ";
             os << ") -> " << fmt(e.m_rettype);
-            }
-        TU_ARMA(Closure, te) {
-            BUG(Span(), "" << x.e);
-            }
+            } break;
+        case ::HIR::TypeData::TAG_NodeType:
+            BUG(Span(), "Unexpected type in trans: " << x.e);
+            break;
         }
         return os;
     }
@@ -264,9 +258,9 @@ namespace
             m_outfile_path(outfile),
             m_of(m_outfile_path + ".mir")
         {
-            for( const auto& crate : m_crate.m_ext_crates )
+            for( const auto& crate_name : m_crate.m_ext_crates_ordered )
             {
-                m_of << "crate \"" << FmtEscaped(crate.second.m_path) << ".mir\";\n";
+                m_of << "crate \"" << FmtEscaped(m_crate.m_ext_crates.at(crate_name).m_path) << ".mir\";\n";
             }
         }
 
@@ -294,6 +288,7 @@ namespace
                 m_of << "\t}\n";
                 m_of << "}\n";
 
+                if(TARGETVER_LEAST_1_29)
                 {
                     // Bind `panic_impl` lang item to the item tagged with `panic_implementation`
                     const auto& panic_impl_path = m_crate.get_lang_item_path(Span(), "mrustc-panic_implementation");
@@ -337,8 +332,8 @@ namespace
                     const auto* repr = Target_GetTypeRepr(sp, m_resolve, ty);
                     MIR_ASSERT(*m_mir_res, repr, "No repr for tuple " << ty);
 
-                    bool has_drop_glue =  m_resolve.type_needs_drop_glue(sp, ty);
-                    auto drop_glue_path = ::HIR::Path(ty.clone(), "drop_glue#");
+                    bool has_drop_glue = m_resolve.type_needs_drop_glue(sp, ty);
+                    auto drop_glue_path = ::HIR::Path(ty.clone(), "#drop_glue");
 
                     m_of << "type " << fmt(ty) << " {\n";
                     m_of << "\tSIZE " << repr->size << ", ALIGN " << repr->align << ";\n";
@@ -351,27 +346,6 @@ namespace
                         m_of << "\t" << e.offset << " = " << fmt(e.ty) << ";\n";
                     }
                     m_of << "}\n";
-
-                    if( has_drop_glue )
-                    {
-                        m_of << "fn " << fmt(drop_glue_path) << "(&move " << fmt(ty) << ") {\n";
-                        m_of << "\tlet unit: ();\n";
-
-                        m_of << "\t0: {\n";
-
-                        auto self = ::MIR::LValue::new_Deref( ::MIR::LValue::new_Argument(0) );
-                        auto fld_lv = ::MIR::LValue::new_Field(mv$(self), 0);
-                        for(const auto& e : repr->fields)
-                        {
-                            if( m_resolve.type_needs_drop_glue(sp, e.ty) ) {
-                                m_of << "\t\t""DROP " << fmt(fld_lv) << ";\n";
-                            }
-                            fld_lv.inc_Field();
-                        }
-                        m_of << "\t\t""RETURN\n";
-                        m_of << "\t}\n";
-                        m_of << "}\n";
-                    }
                 }
             }
             else {
@@ -409,7 +383,7 @@ namespace
                         TU_MATCHA( (str.m_data), (se),
                         (Unit,  MIR_BUG(*m_mir_res, "Unit-like struct with DstType::Possible"); ),
                         (Tuple, return metadata_type( monomorph(se.back().ent) ); ),
-                        (Named, return metadata_type( monomorph(se.back().second.ent) ); )
+                        (Named, return metadata_type( monomorph(se.back().ty ) ); )
                         )
                         //MIR_TODO(*m_mir_res, "Determine DST type when ::Possible - " << ty);
                         return MetadataType::None;
@@ -441,7 +415,7 @@ namespace
             ::MIR::TypeResolve  top_mir_res { sp, m_resolve, FMT_CB(ss, ss << "struct " << p;), ::HIR::TypeRef(), {}, empty_fcn };
             m_mir_res = &top_mir_res;
 
-            auto drop_glue_path = ::HIR::Path(::HIR::TypeRef::new_path(p.clone(), &item), "drop_glue#");
+            auto drop_glue_path = ::HIR::Path(::HIR::TypeRef::new_path(p.clone(), &item), "#drop_glue");
 
             TRACE_FUNCTION_F(p);
             ::HIR::TypeRef  ty = ::HIR::TypeRef::new_path(p.clone(), &item);
@@ -462,20 +436,11 @@ namespace
                         //auto vtp = t.m_data.as_TraitObject().m_trait.m_path;
 
                         const auto& trait = resolve.m_crate.get_trait_by_path(sp, te.m_trait.m_path.m_path);
-                        auto vtable_gp = ::HIR::GenericPath(trait.m_vtable_path);
-                        vtable_gp.m_params = te.m_trait.m_path.m_params.clone();
-                        vtable_gp.m_params.m_types.resize( vtable_gp.m_params.m_types.size() + trait.m_type_indexes.size() );
-                        for(const auto& ty : trait.m_type_indexes) {
-                            auto aty = te.m_trait.m_type_bounds.at(ty.first).clone();
-                            vtable_gp.m_params.m_types.at(ty.second) = ::std::move(aty);
-                        }
-                        for(auto& e : vtable_gp.m_params.m_types)
-                        {
-                            ASSERT_BUG(sp, e != ::HIR::TypeRef(), "");
-                        }
-
-                        const auto& vtable_ref = resolve.m_crate.get_struct_by_path(sp, vtable_gp.m_path);
-                        return ::HIR::TypeRef::new_pointer(::HIR::BorrowType::Shared, ::HIR::TypeRef::new_path( ::std::move(vtable_gp), &vtable_ref ));
+                        auto vtable_ty = trait.get_vtable_type(sp, resolve.m_crate, te);
+                        return ::HIR::TypeRef::new_pointer(::HIR::BorrowType::Shared, std::move(vtable_ty));
+                    }
+                    else if( t.data().is_Path() && t.data().as_Path().binding.is_ExternType() ) {
+                        return HIR::TypeRef::new_unit();
                     }
                     else if( t.data().is_Path() ) {
                         auto* repr = Target_GetTypeRepr(sp, resolve, t);
@@ -510,67 +475,6 @@ namespace
             }
             m_of << "}\n";
 
-            if( has_drop_glue )
-            {
-                m_of << "fn " << fmt(drop_glue_path) << "(&move " << fmt(ty) << ") {\n";
-                m_of << "\tlet unit: ();\n";
-
-                if( const auto* ity = m_resolve.is_type_owned_box(ty) )
-                {
-                    m_of << "\t0: {\n";
-                    //ASSERT_BUG(sp, !item.m_markings.has_drop_impl, "Box shouldn't have a Drop impl");
-
-                    // TODO: This is very specific to the structure of the official liballoc's Box.
-                    auto self = ::MIR::LValue::new_Deref( ::MIR::LValue::new_Argument(0) );
-                    auto fld_p_lv = ::MIR::LValue::new_Field( mv$(self), 0 );
-                    fld_p_lv = ::MIR::LValue::new_Field( mv$(fld_p_lv), 0 );
-                    fld_p_lv = ::MIR::LValue::new_Field( mv$(fld_p_lv), 0 );
-
-                    if( m_resolve.type_needs_drop_glue(sp, *ity) ) {
-                        auto fld_lv = ::MIR::LValue::new_Deref( fld_p_lv.clone() );
-                        m_of << "\t\t""DROP " << fmt(fld_lv) << ";\n";
-                    }
-
-                    auto box_free = ::HIR::GenericPath { m_crate.get_lang_item_path(sp, "box_free"), { ity->clone() } };
-                    m_of << "\t\t""CALL unit = " << fmt(box_free) << "(" << fmt(fld_p_lv) << ") goto 2 else 1\n";
-                    m_of << "\t}\n";
-                    m_of << "\t1: {\n";
-                    m_of << "\t\tDIVERGE\n";
-                    m_of << "\t}\n";
-                    m_of << "\t2: {\n";
-                }
-                else
-                {
-                    if( item.m_markings.has_drop_impl ) {
-                        m_of << "\tlet nms: &mut " << fmt(ty) << ";\n";
-                    }
-                    m_of << "\t0: {\n";
-
-                    if( item.m_markings.has_drop_impl )
-                    {
-                        m_of << "\t\t""ASSIGN nms = &mut *arg0;\n";
-                        m_of << "\t\t""CALL unit = " << fmt(::HIR::Path(ty.clone(), m_resolve.m_lang_Drop, "drop")) << "(nms) goto 2 else 1\n";
-                        m_of << "\t}\n";
-                        m_of << "\t1: {\n";
-                        m_of << "\t\tDIVERGE\n";
-                        m_of << "\t}\n";
-                        m_of << "\t2: {\n";
-                    }
-
-                    auto self = ::MIR::LValue::new_Deref( ::MIR::LValue::new_Argument(0) );
-                    auto fld_lv = ::MIR::LValue::new_Field( mv$(self), 0 );
-                    for(const auto& e : repr->fields)
-                    {
-                        if( m_resolve.type_needs_drop_glue(sp, e.ty) ) {
-                            m_of << "\t\t""DROP " << fmt(fld_lv) << ";\n";
-                        }
-                        fld_lv.inc_Field();
-                    }
-                }
-                m_of << "\t\t""RETURN\n";
-                m_of << "\t}\n";
-                m_of << "}\n";
-            }
             m_mir_res = nullptr;
         }
         void emit_constructor_enum(const Span& sp, const ::HIR::GenericPath& var_path, const ::HIR::Enum& item, size_t var_idx) override
@@ -582,11 +486,12 @@ namespace
             auto monomorph = [&](const auto& x)->const auto& { return m_resolve.monomorph_expand_opt(sp, tmp, x, ms); };
 
             auto enum_path = var_path.clone();
-            enum_path.m_path.m_components.pop_back();
+            enum_path.m_path.pop_component();
 
             // Create constructor function
             const auto& var_ty = item.m_data.as_Data().at(var_idx).type;
             const auto& e = var_ty.data().as_Path().binding.as_Struct()->m_data.as_Tuple();
+            m_of << "/* " << var_path << " */\n";
             m_of << "fn " << fmt(var_path) << "(";
             for(unsigned int i = 0; i < e.size(); i ++)
             {
@@ -595,17 +500,15 @@ namespace
                 m_of << fmt(monomorph(e[i].ent));
             }
             m_of << "): " << fmt(enum_path) << " {\n";
-            m_of << "\tlet var0: " << fmt(monomorph(var_ty)) << ";\n";
             m_of << "\t0: {\n";
-            m_of << "\t\tASSIGN var0 = { ";
+            m_of << "\t\tASSIGN RETURN = ENUM " << fmt(enum_path) << " " << var_idx << " { ";
             for(unsigned int i = 0; i < e.size(); i ++)
             {
                 if(i != 0)
                     m_of << ", ";
                 m_of << "arg" << i;
             }
-            m_of << " }: " << fmt(monomorph(var_ty)) << ";\n";
-            m_of << "\t\tASSIGN RETURN = VARIANT " << fmt(enum_path) << " " << var_idx << " var0;\n";
+            m_of << " };\n";
             m_of << "\t\tRETURN\n";
             m_of << "\t}\n";
             m_of << "}";
@@ -618,6 +521,7 @@ namespace
             auto monomorph = [&](const auto& x)->const auto& { return m_resolve.monomorph_expand_opt(sp, tmp, x, ms); };
             // Create constructor function
             const auto& e = item.m_data.as_Tuple();
+            m_of << "/* " << p << " */\n";
             m_of << "fn " << fmt(p) << "(";
             for(unsigned int i = 0; i < e.size(); i ++)
             {
@@ -649,7 +553,7 @@ namespace
             ::HIR::TypeRef  ty = ::HIR::TypeRef::new_path(p.clone(), &item);
 
             bool has_drop_glue = m_resolve.type_needs_drop_glue(sp, ty);
-            auto drop_glue_path = ::HIR::Path(ty.clone(), "drop_glue#");
+            auto drop_glue_path = ::HIR::Path(ty.clone(), "#drop_glue");
 
             const auto* repr = Target_GetTypeRepr(sp, m_resolve, ty);
             MIR_ASSERT(*m_mir_res, repr, "No repr for union " << ty);
@@ -663,34 +567,7 @@ namespace
             {
                 m_of << "\t" << e.offset << " = " << fmt(e.ty) << ";\n";
             }
-            for(const auto& e : repr->fields)
-            {
-                m_of << "\t" << "#" << (&e - repr->fields.data()) << " =" << (&e - repr->fields.data()) << ";\n";
-            }
             m_of << "}\n";
-
-            if( has_drop_glue )
-            {
-                m_of << "fn " << fmt(drop_glue_path) << "(&move " << ty << ") {\n";
-                if( item.m_markings.has_drop_impl ) {
-                    m_of << "\tlet nms: &mut " << fmt(ty) << ";\n";
-                }
-                m_of << "\t0: {\n";
-                if( item.m_markings.has_drop_impl )
-                {
-                    m_of << "\t\t""ASSIGN nms = &mut *arg0;\n";
-                    m_of << "\t\t""CALL unit = " << fmt(::HIR::Path(ty.clone(), m_resolve.m_lang_Drop, "drop")) << "(nms) goto 2 else 1\n";
-                    m_of << "\t}\n";
-                    m_of << "\t1: {\n";
-                    m_of << "\t\tDIVERGE\n";
-                    m_of << "\t}\n";
-                    m_of << "\t2: {\n";
-                }
-                // NOTE: Unions don't drop inner values, but do call the destructor
-                m_of << "\t\tRETURN\n";
-                m_of << "\t}\n";
-                m_of << "}\n";
-            }
         }
 
         void emit_enum(const Span& sp, const ::HIR::GenericPath& p, const ::HIR::Enum& item) override
@@ -705,7 +582,7 @@ namespace
 
             // Generate the drop glue (and determine if there is any)
             bool has_drop_glue = m_resolve.type_needs_drop_glue(sp, ty);
-            auto drop_glue_path = ::HIR::Path(ty.clone(), "drop_glue#");
+            auto drop_glue_path = ::HIR::Path(ty.clone(), "#drop_glue");
 
             const auto* repr = Target_GetTypeRepr(sp, m_resolve, ty);
             MIR_ASSERT(*m_mir_res, repr, "No repr for enum " << ty);
@@ -719,116 +596,90 @@ namespace
             {
                 m_of << "\t" << e.offset << " = " << fmt(e.ty) << ";\n";
             }
+
+            auto emit_value = [&](const TypeRepr::FieldPath& path, uint64_t v) {
+                m_of << "\"";
+                for(size_t i = 0; i < path.size; i ++)
+                {
+                    int val = (v >> (i*8)) & 0xFF;
+                    if(val < 16)
+                        m_of << ::std::hex << "\\x0" << val << ::std::dec;
+                    else
+                        m_of << ::std::hex << "\\x" << val << ::std::dec;
+                }
+                m_of << "\"";
+                };
+
             switch(repr->variants.tag())
             {
             case TypeRepr::VariantMode::TAGDEAD:    throw "";
-            TU_ARM(repr->variants, None, _e) (void)_e;
-                break;
-            TU_ARM(repr->variants, Values, e)
-                for(const auto& v : e.values)
+            TU_ARM(repr->variants, None, _e) {
+                }
+            TU_ARM(repr->variants, Linear, e) {
+                m_of << "\t@[" << e.field.index << ", " << e.field.sub_fields << "] = {\n";
+                for(size_t i = 0; i < e.num_variants; i ++ )
                 {
-                    // Variants require:
-                    m_of << "\t#" << (&v - e.values.data());
+                    m_of << "\t\t";
+
+                    if( e.is_niche(i) ) {
+                        m_of << "*";
+                    }
+                    else {
+                        emit_value(e.field, e.offset + i);
+                    }
                     // - Data field number (optional)
                     if( !item.is_value() )
                     {
-                        m_of << " =" << (&v - e.values.data());
+                        m_of << " =" << i;
                     }
-                    // - Tag offsetr
-                    m_of << " @[" << e.field.index << ", " << e.field.sub_fields << "] = \"";
-                    for(size_t i = 0; i < e.field.size; i ++)
-                    {
-                        int val = (v >> (i*8)) & 0xFF;
-                        if(val < 16)
-                            m_of << ::std::hex << "\\x0" << val << ::std::dec;
-                        else
-                            m_of << ::std::hex << "\\x" << val << ::std::dec;
-                    }
-                    m_of << "\";\n";
+                    m_of << ",\n";
                 }
-                break;
-            TU_ARM(repr->variants, NonZero, e) {
-                m_of << "\t#" << int(e.zero_variant) << " @[" << e.field.index << ", " << e.field.sub_fields << "] = \"";
-                for(size_t i = 0; i < e.field.size; i ++)
+                m_of << "\t\t}\n";
+                }
+            TU_ARM(repr->variants, Values, e) {
+                m_of << "\t@[" << e.field.index << ", " << e.field.sub_fields << "] = {\n";
+                for(size_t idx = 0; idx < e.values.size(); idx ++)
                 {
-                    m_of << "\\0";
+                    m_of << "\t\t";
+                    // - Tag value
+                    emit_value(e.field, e.values[idx]);
+                    // - Data field number (optional)
+                    if( !item.is_value() )
+                    {
+                        m_of << " =" << idx;
+                    }
+                    m_of << ",\n";
                 }
-                m_of << "\";\n";
-                m_of << "\t#" << int(1 - e.zero_variant) << " =" << int(1 - e.zero_variant) << ";\n";
-                } break;
+                m_of << "\t}\n";
+                }
+            TU_ARM(repr->variants, NonZero, e) {
+                m_of << "\t@[" << e.field.index << ", " << e.field.sub_fields << "] = { ";
+                for(size_t i = 0; i < 2; i ++)
+                {
+                    if( i == 1 ) {
+                        m_of << ", ";
+                    }
+
+                    if( e.zero_variant == i ) {
+                        m_of << "\"";
+                        for(size_t i = 0; i < e.field.size; i ++)
+                        {
+                            m_of << "\\0";
+                        }
+                        m_of << "\"";
+                    }
+                    else {
+                        m_of << "* =" << i;
+                    }
+                }
+                m_of << " }\n";
+                }
             }
             m_of << "}\n";
 
-            // ---
-            // - Drop Glue
-            // ---
-            if( has_drop_glue )
-            {
-                m_of << "fn " << fmt(drop_glue_path) << "(&move " << fmt(ty) << ") {\n";
-                if( item.m_markings.has_drop_impl ) {
-                    m_of << "\tlet nms: &mut " << fmt(ty) << ";\n";
-                }
-                m_of << "\t0: {\n";
-
-                size_t first_drop_bb;
-                if( item.m_markings.has_drop_impl )
-                {
-                    m_of << "\t\t""ASSIGN nms = &mut *arg0;\n";
-                    m_of << "\t\t""CALL unit = " << fmt(::HIR::Path(ty.clone(), m_resolve.m_lang_Drop, "drop")) << "(nms) goto 2 else 1\n";
-                    m_of << "\t}\n";
-                    m_of << "\t1: {\n";
-                    m_of << "\t\tDIVERGE\n";
-                    m_of << "\t}\n";
-                    m_of << "\t2: {\n";
-                    first_drop_bb = 3;
-                }
-                else
-                {
-                    first_drop_bb = 1;
-                }
-                if( const auto* e = item.m_data.opt_Data() )
-                {
-                    m_of << "\t\tSWITCH *arg0 { ";
-                    for(unsigned int var_idx = 0; var_idx < e->size(); var_idx ++)
-                    {
-                        if( var_idx != 0 )
-                        {
-                            m_of << ", ";
-                        }
-                        m_of << (first_drop_bb + var_idx);
-                    }
-                    m_of << " }\n";
-                    m_of << "\t}\n";
-                    for(unsigned int var_idx = 0; var_idx < e->size(); var_idx ++)
-                    {
-                        m_of << "\t" << (first_drop_bb+var_idx) << ": {\n";
-                        m_of << "\t\tDROP (*arg0)@" << var_idx << ";\n";
-                        m_of << "\t\tRETURN\n";
-                        m_of << "\t}\n";
-                    }
-                }
-                else
-                {
-                    m_of << "\t}\n";
-                }
-                m_of << "}\n";
-            }
-
             m_mir_res = nullptr;
         }
-        struct Reloc {
-            size_t  ofs;
-            size_t  len;
-            const ::HIR::Path* p;
-            ::std::string   bytes;
 
-            static Reloc new_named(size_t ofs, size_t len, const ::HIR::Path* p) {
-                return Reloc { ofs, len, p, "" };
-            }
-            static Reloc new_bytes(size_t ofs, size_t len, ::std::string bytes) {
-                return Reloc { ofs, len, nullptr, ::std::move(bytes) };
-            }
-        };
         void emit_str_byte(uint8_t b) {
             if( b == 0 ) {
                 m_of << "\\0";
@@ -849,235 +700,7 @@ namespace
                 m_of << "\\x" << ::std::hex << int(b) << ::std::dec;
             }
         }
-        void emit_str_u32(uint32_t v) {
-            emit_str_byte(v & 0xFF);
-            emit_str_byte(v >> 8);
-            emit_str_byte(v >> 16);
-            emit_str_byte(v >> 24);
-        }
-        void emit_str_usize(uint64_t v) {
-            if( Target_GetCurSpec().m_arch.m_pointer_bits == 64 ) {
-                emit_str_u32(v      );
-                emit_str_u32(v >> 32);
-            }
-            else if( Target_GetCurSpec().m_arch.m_pointer_bits == 64 ) {
-                emit_str_u32(v   );
-            }
-            else {
-                emit_str_u32(v   );
-            }
-        }
-        void emit_literal_as_bytes(const ::HIR::Literal& lit, const ::HIR::TypeRef& ty, ::std::vector<Reloc>& out_relocations, size_t base_ofs)
-        {
-            TRACE_FUNCTION_F(lit << ", " << ty);
-            auto putb = [&](uint8_t b) { emit_str_byte(b); };
-            auto putu32 = [&](uint32_t v) { emit_str_u32(v); };
-            auto putsize = [&](uint64_t v) { emit_str_usize(v); };
-            switch(ty.data().tag())
-            {
-            case ::HIR::TypeData::TAGDEAD: throw "";
-            case ::HIR::TypeData::TAG_Generic:
-            case ::HIR::TypeData::TAG_ErasedType:
-            case ::HIR::TypeData::TAG_Diverge:
-            case ::HIR::TypeData::TAG_Infer:
-            case ::HIR::TypeData::TAG_TraitObject:
-            case ::HIR::TypeData::TAG_Slice:
-            case ::HIR::TypeData::TAG_Closure:
-                BUG(sp, "Unexpected " << ty << " in decoding literal");
-            TU_ARM(ty.data(), Primitive, te) {
-                switch(te)
-                {
-                case ::HIR::CoreType::U8:
-                case ::HIR::CoreType::I8:
-                case ::HIR::CoreType::Bool:
-                    ASSERT_BUG(sp, lit.is_Integer(), ty << " not Literal::Integer - " << lit);
-                    putb(lit.as_Integer());
-                    break;
-                case ::HIR::CoreType::U16:
-                case ::HIR::CoreType::I16:
-                    ASSERT_BUG(sp, lit.is_Integer(), ty << " not Literal::Integer - " << lit);
-                    putb(lit.as_Integer() & 0xFF);
-                    putb(lit.as_Integer() >> 8);
-                    break;
-                case ::HIR::CoreType::U32:
-                case ::HIR::CoreType::I32:
-                case ::HIR::CoreType::Char:
-                    ASSERT_BUG(sp, lit.is_Integer(), ty << " not Literal::Integer - " << lit);
-                    putu32(lit.as_Integer()   );
-                    break;
-                case ::HIR::CoreType::U64:
-                case ::HIR::CoreType::I64:
-                    ASSERT_BUG(sp, lit.is_Integer(), ty << " not Literal::Integer - " << lit);
-                    putu32(lit.as_Integer()      );
-                    putu32(lit.as_Integer() >> 32);
-                    break;
-                case ::HIR::CoreType::U128:
-                case ::HIR::CoreType::I128:
-                    ASSERT_BUG(sp, lit.is_Integer(), ty << " not Literal::Integer - " << lit);
-                    putu32(lit.as_Integer()      );
-                    putu32(lit.as_Integer() >> 32);
-                    putu32(0);
-                    putu32(0);
-                    break;
-                case ::HIR::CoreType::Usize:
-                case ::HIR::CoreType::Isize:
-                    ASSERT_BUG(sp, lit.is_Integer(), ty << " not Literal::Integer - " << lit);
-                    putsize(lit.as_Integer());
-                    break;
-                case ::HIR::CoreType::F32: {
-                    ASSERT_BUG(sp, lit.is_Float(), "not Literal::Float - " << lit);
-                    uint32_t v;
-                    float v2 = lit.as_Float();
-                    memcpy(&v, &v2, 4);
-                    putu32(v);
-                    } break;
-                case ::HIR::CoreType::F64: {
-                    ASSERT_BUG(sp, lit.is_Float(), "not Literal::Float - " << lit);
-                    uint64_t v;
-                    memcpy(&v, &lit.as_Float(), 8);
-                    putu32(v);
-                    } break;
-                case ::HIR::CoreType::Str:
-                    BUG(sp, "Unexpected " << ty << " in decoding literal");
-                }
-                } break;
-            case ::HIR::TypeData::TAG_Path:
-            case ::HIR::TypeData::TAG_Tuple: {
-                const auto* repr = Target_GetTypeRepr(sp, m_resolve, ty);
-                assert(repr);
-                size_t cur_ofs = 0;
-                if( lit.is_List() )
-                {
-                    const auto& le = lit.as_List();
-                    assert(le.size() == repr->fields.size());
-                    for(size_t i = 0; i < repr->fields.size(); i ++)
-                    {
-                        assert(cur_ofs <= repr->fields[i].offset);
-                        while(cur_ofs < repr->fields[i].offset)
-                        {
-                            putb(0);
-                            cur_ofs ++;
-                        }
-                        emit_literal_as_bytes(le[i], repr->fields[i].ty, out_relocations, base_ofs + cur_ofs);
-                        size_t size = Target_GetSizeOf_Required(sp, m_resolve, repr->fields[i].ty);
-                        cur_ofs += size;
-                    }
-                    while(cur_ofs < repr->size)
-                    {
-                        putb(0);
-                        cur_ofs ++;
-                    }
-                }
-                else if( lit.is_Variant() )
-                {
-                    const auto& le = lit.as_Variant();
-                    if( *le.val != ::HIR::Literal::make_List({}) )
-                    {
-                        assert(le.idx < repr->fields.size());
-                        while(cur_ofs < repr->fields[le.idx].offset)
-                        {
-                            putb(0);
-                            cur_ofs ++;
-                        }
-
-                        emit_literal_as_bytes(*le.val, repr->fields[le.idx].ty, out_relocations, base_ofs + cur_ofs);
-
-                        size_t size = Target_GetSizeOf_Required(sp, m_resolve, repr->fields[le.idx].ty);
-                        cur_ofs += size;
-                    }
-
-                    if(const auto* ve = repr->variants.opt_Values())
-                    {
-                        ASSERT_BUG(sp, cur_ofs <= repr->fields[ve->field.index].offset, "Bad offset before enum tag");
-                        while(cur_ofs < repr->fields[ve->field.index].offset)
-                        {
-                            putb(0);
-                            cur_ofs ++;
-                        }
-                        auto v = ::HIR::Literal::make_Integer(le.idx);
-                        emit_literal_as_bytes(v, repr->fields[ve->field.index].ty, out_relocations, base_ofs + cur_ofs);
-
-                        size_t size = Target_GetSizeOf_Required(sp, m_resolve, repr->fields[ve->field.index].ty);
-                        cur_ofs += size;
-                    }
-                    // TODO: Nonzero?
-                    while(cur_ofs < repr->size)
-                    {
-                        putb(0);
-                        cur_ofs ++;
-                    }
-                }
-                else
-                {
-                    TODO(sp, "Composites - " << ty << " w/ " << lit);
-                }
-                } break;
-            case ::HIR::TypeData::TAG_Borrow:
-                if( ty.data().as_Borrow().inner == ::HIR::CoreType::Str )
-                {
-                    ASSERT_BUG(sp, lit.is_String(), ty << " not Literal::String - " << lit);
-                    const auto& s = lit.as_String();
-                    putsize(PTR_BASE + 0);
-                    putsize(s.size());
-                    out_relocations.push_back(Reloc::new_bytes(base_ofs, 8,  s));
-                    break;
-                }
-                // fall
-            case ::HIR::TypeData::TAG_Pointer: {
-                const auto& ity = (ty.data().is_Borrow() ? ty.data().as_Borrow().inner : ty.data().as_Pointer().inner);
-                size_t ity_size, ity_align;
-                Target_GetSizeAndAlignOf(sp, m_resolve, ity, ity_size, ity_align);
-                bool is_unsized = (ity_size == SIZE_MAX);
-
-                TU_MATCH_HDRA( (lit), { )
-                TU_ARMA(BorrowPath, le) {
-                    putsize(PTR_BASE);
-                    out_relocations.push_back(Reloc::new_named(base_ofs, 8,  &le));
-                    if( is_unsized )
-                    {
-                        // TODO: Get the size of the pointed-to array
-                        // OR: Find out the source item type and the target trait.
-                        putsize(0);
-                    }
-                    }
-                TU_ARMA(Integer, le) {
-                    ASSERT_BUG(sp, le == 0, "Pointer from integer not 0");
-                    ASSERT_BUG(sp, ty.data().is_Pointer(), "Borrow from integer");
-                    putsize(le);
-                    if( is_unsized )
-                    {
-                        putsize(0);
-                    }
-                    }
-                TU_ARMA(String, le) {
-                    const auto& s = lit.as_String();
-                    putsize(PTR_BASE);
-                    putsize(s.size());
-                    out_relocations.push_back(Reloc::new_bytes(base_ofs, 8,  s));
-                    }
-                break; default:
-                    TODO(sp, "Emit a pointer - " << ty << " from literal " << lit);
-                }
-                } break;
-            case ::HIR::TypeData::TAG_Function:
-                ASSERT_BUG(sp, lit.is_BorrowPath(), ty << " not Literal::BorrowPath - " << lit);
-                putsize(PTR_BASE);
-                out_relocations.push_back(Reloc::new_named(base_ofs, 8,  &lit.as_BorrowPath()));
-                break;
-            TU_ARM(ty.data(), Array, te) {
-                // What about byte strings?
-                // TODO: Assert size
-                ASSERT_BUG(sp, lit.is_List(), "not Literal::List - " << lit);
-                for(const auto& v : lit.as_List())
-                {
-                    emit_literal_as_bytes(v, te.inner, out_relocations, base_ofs);
-                    size_t size = Target_GetSizeOf_Required(sp, m_resolve, te.inner);
-                    base_ofs += size;
-                }
-                } break;
-            }
-        }
-        void emit_static_local(const ::HIR::Path& p, const ::HIR::Static& item, const Trans_Params& params) override
+        void emit_static_local(const ::HIR::Path& p, const ::HIR::Static& item, const Trans_Params& params, const EncodedLiteral& encoded) override
         {
             ::MIR::Function empty_fcn;
             ::MIR::TypeResolve  top_mir_res { sp, m_resolve, FMT_CB(ss, ss << "static " << p;), ::HIR::TypeRef(), {}, empty_fcn };
@@ -1085,14 +708,14 @@ namespace
 
             TRACE_FUNCTION_F(p);
 
-            ::std::vector<Reloc>    relocations;
-
             auto type = params.monomorph(m_resolve, item.m_type);
+
             m_of << "static " << fmt(p) << ": " << fmt(type) << " = \"";
-            emit_literal_as_bytes(item.m_value_res, type, relocations, 0);
+            for(auto b : encoded.bytes)
+                emit_str_byte(b);
             m_of << "\"";
             m_of << "{";
-            for(const auto& r : relocations)
+            for(const auto& r : encoded.relocations)
             {
                 m_of << "@" << r.ofs << "+" << r.len << " = ";
                 if( r.p )
@@ -1106,72 +729,7 @@ namespace
 
             m_mir_res = nullptr;
         }
-        void emit_vtable(const ::HIR::Path& p, const ::HIR::Trait& trait) override
-        {
-            ::MIR::Function empty_fcn;
-            ::MIR::TypeResolve  top_mir_res { sp, m_resolve, FMT_CB(ss, ss << "vtable " << p;), ::HIR::TypeRef(), {}, empty_fcn };
 
-            const size_t ptr_size = Target_GetCurSpec().m_arch.m_pointer_bits / 8;
-            const auto& trait_path = p.m_data.as_UfcsKnown().trait;
-            const auto& type = p.m_data.as_UfcsKnown().type;
-            bool has_drop_glue =  m_resolve.type_needs_drop_glue(sp, type);
-
-            ::HIR::TypeRef  vtable_ty;
-            {
-                const auto& vtable_sp = trait.m_vtable_path;
-                auto vtable_params = trait_path.m_params.clone();
-                for(const auto& ty : trait.m_type_indexes) {
-                    auto aty = ::HIR::TypeRef::new_path( ::HIR::Path( type.clone(), trait_path.clone(), ty.first ), {} );
-                    m_resolve.expand_associated_types(sp, aty);
-                    vtable_params.m_types.push_back( mv$(aty) );
-                    //vtable_params.m_types.at(ty.second) = ::std::move(aty);
-                }
-                const auto& vtable_ref = m_crate.get_struct_by_path(sp, vtable_sp);
-                vtable_ty = ::HIR::TypeRef::new_path( ::HIR::GenericPath(mv$(vtable_sp), mv$(vtable_params)), &vtable_ref );
-            }
-
-            size_t  size, align;
-            MIR_ASSERT(*m_mir_res, Target_GetSizeAndAlignOf(sp, m_resolve, type, size, align), "Unexpected generic? " << type);
-            m_of << "static " << fmt(p) << ": " << fmt(vtable_ty) << " = \"";
-            // - Data
-            // Drop
-            emit_str_usize(has_drop_glue ? PTR_BASE : 0);
-            // Align
-            emit_str_usize(align);
-            // Size
-            emit_str_usize(size);
-            // Methods
-            for(unsigned int i = 0; i < trait.m_value_indexes.size(); i ++ )
-            {
-                emit_str_usize(PTR_BASE);
-            }
-            m_of << "\" {";
-
-            // - Relocations
-            auto monomorph_cb_trait = MonomorphStatePtr(&type, &trait_path.m_params, nullptr);
-            // Drop
-            if( has_drop_glue )
-            {
-                m_of << "@0+" << ptr_size << " = " << fmt(::HIR::Path(type.clone(), "drop_glue#")) << ", ";
-            }
-            // Methods
-            for(unsigned int i = 0; i < trait.m_value_indexes.size(); i ++ )
-            {
-                // Find the corresponding vtable entry
-                for(const auto& m : trait.m_value_indexes)
-                {
-                    if( m.second.first != 3+i )
-                        continue ;
-
-                    //MIR_ASSERT(*m_mir_res, tr.m_values.at(m.first).is_Function(), "TODO: Handle generating vtables with non-function items");
-                    DEBUG("- " << m.second.first << " = " << m.second.second << " :: " << m.first);
-
-                    auto gpath = monomorph_cb_trait.monomorph_genericpath(sp, m.second.second, false);
-                    m_of << "@" << (3 + i) * ptr_size << "+" << ptr_size << " = " << fmt(::HIR::Path(type.clone(), mv$(gpath), m.first)) << ", ";
-                }
-            }
-            m_of << "};\n";
-        }
         void emit_function_ext(const ::HIR::Path& p, const ::HIR::Function& item, const Trans_Params& params) override
         {
             ::MIR::Function empty_fcn;
@@ -1185,6 +743,7 @@ namespace
                 ::HIR::TypeRef  ret_type_tmp;
                 const auto& ret_type = monomorphise_fcn_return(ret_type_tmp, item, params);
 
+                m_of << "/* " << p << " */\n";
                 m_of << "fn " << fmt(p) << "(";
                 for(unsigned int i = 0; i < item.m_args.size(); i ++)
                 {
@@ -1211,6 +770,7 @@ namespace
             m_mir_res = &mir_res;
 
             // - Signature
+            m_of << "/* " << p << " */\n";
             m_of << "fn " << fmt(p) << "(";
             for(unsigned int i = 0; i < item.m_args.size(); i ++)
             {
@@ -1319,9 +879,17 @@ namespace
                         TU_ARM(se.src, MakeDst, e)
                             m_of << "MAKEDST " << fmt(e.ptr_val) << ", " << fmt(e.meta_val);
                             break;
-                        TU_ARM(se.src, Variant, e)
-                            m_of << "VARIANT " << fmt(e.path) << " " << e.index << " " << fmt(e.val);
+                        TU_ARM(se.src, UnionVariant, e)
+                            m_of << "UNION " << fmt(e.path) << " " << e.index << " " << fmt(e.val);
                             break;
+                        TU_ARM(se.src, EnumVariant, e) {
+                            m_of << "ENUM " << fmt(e.path) << " " << e.index << " { ";
+                            for(const auto& v : e.vals)
+                            {
+                                m_of << fmt(v) << ", ";
+                            }
+                            m_of << "}";
+                            } break;
                         TU_ARM(se.src, Array, e) {
                             m_of << "[ ";
                             for(const auto& v : e.vals)
@@ -1359,6 +927,12 @@ namespace
                             m_of << (se.new_val ? "" : "!") << "df" << se.other;
                         }
                         } break;
+                    TU_ARM(stmt, LoadDropFlag, se) {
+                        m_of << "LOADFLAG df" << se.idx << " = " << fmt(se.slot) << " BIT " << se.bit_index;
+                        } break;
+                    TU_ARM(stmt, SaveDropFlag, se) {
+                        m_of << "SAVEFLAG " << fmt(se.slot) << " BIT " << se.bit_index << " = df" << se.idx;
+                        } break;
                     TU_ARM(stmt, Asm, se) {
                         m_of << "ASM (";
                         for(const auto& v : se.outputs)
@@ -1377,6 +951,30 @@ namespace
                             m_of << "\"" << v << "\", ";
                         }
                         m_of << ":" << se.flags << "]";
+                        } break;
+                    TU_ARM(stmt, Asm2, se) {
+                        m_of << "ASM2 (";
+                        for(const auto& l : se.lines)
+                            m_of << l;
+                        for(const auto& p : se.params)
+                        {
+                            m_of << ", ";
+                            TU_MATCH_HDRA((p), {)
+                            TU_ARMA(Const, v)
+                                m_of << "const " << fmt(v);
+                            TU_ARMA(Sym, v)
+                                m_of << "sym " << fmt(v);
+                            TU_ARMA(Reg, v) {
+                                m_of << "reg(" << v.dir << " " << v.spec << ") ";
+                                if(v.input ) m_of << fmt(*v.input ); else m_of << "_";
+                                m_of << " => ";
+                                if(v.output) m_of << fmt(*v.output); else m_of << "_";
+                                }
+                            }
+                        }
+                        m_of << ", ";
+                        se.options.fmt(m_of);
+                        m_of << ")";
                         } break;
                     TU_ARM(stmt, ScopeEnd, se) { (void)se;
                         continue ;
@@ -1423,7 +1021,7 @@ namespace
                     m_of << "PANIC " << e.dst << "\n";
                     break;
                 TU_ARM(term, If, e)
-                    m_of << "IF " << fmt(e.cond) << " goto " << e.bb0 << " else " << e.bb1 << "\n";
+                    m_of << "IF " << fmt(e.cond) << " goto " << e.bb_true << " else " << e.bb_false << "\n";
                     break;
                 TU_ARM(term, Switch, e) {
                     m_of << "SWITCH " << fmt(e.val) << " { ";
@@ -1441,6 +1039,31 @@ namespace
                             m_of << "\"" << FmtEscaped(ve[i]) << "\" = " << e.targets[i] << ",";
                         }
                         break;
+                    TU_ARM(e.values, ByteString, ve) {
+                        for(size_t j = 0; j < ve.size(); j ++)
+                        {
+                            m_of << "b\"";
+                            for(size_t i = 0; i < ve[j].size(); i ++) {
+                                auto b = ve[j][i];
+                                switch(b)
+                                {
+                                case '\\': m_of << "\\\\"; break;
+                                case '\"': m_of << "\\\""; break;
+                                default:
+                                    if( ' ' <= b && b < 0x7f ) {
+                                        m_of << char(ve[j][i]);
+                                    }
+                                    else {
+                                        m_of << "\\x";
+                                        m_of << "0123456789ABCDEF"[b >> 4];
+                                        m_of << "0123456789ABCDEF"[b & 15];
+                                    }
+                                    break;
+                                }
+                            }
+                            m_of << "\" = " << e.targets[i] << ",";
+                        }
+                        } break;
                     TU_ARM(e.values, Unsigned, ve)
                         for(size_t i = 0; i < ve.size(); i++)
                         {
@@ -1463,6 +1086,14 @@ namespace
                     m_of << " }\n";
                     } break;
                 TU_ARM(term, Call, e) {
+                    if( const auto* f_p = e.fcn.opt_Intrinsic() ) {
+                        if( f_p->name == "offset_of" ) {
+                            size_t val = mir_res.intrinsic_offset_of(f_p->params.m_types.at(0), e.args);
+                            m_of << fmt(e.ret_val) << " = " << val << " usize;\n";
+                            m_of << "\t\tGOTO " << e.ret_block;
+                            break;
+                        }
+                    }
                     m_of << "CALL " << fmt(e.ret_val) << " = ";
                     switch(e.fcn.tag())
                     {
@@ -1495,28 +1126,39 @@ namespace
 
             m_mir_res = nullptr;
         }
+        
+        void emit_global_asm(const ::HIR::GlobalAssembly& ) override
+        {
+            TODO(Span(), "global_asm! codegen");
+        }
 
 
     private:
         const ::HIR::TypeRef& monomorphise_fcn_return(::HIR::TypeRef& tmp, const ::HIR::Function& item, const Trans_Params& params)
         {
-            if( visit_ty_with(item.m_return, [&](const auto& x){ return x.data().is_ErasedType() || x.data().is_Generic(); }) )
+            bool has_erased = visit_ty_with(item.m_return, [&](const auto& x) { return x.data().is_ErasedType(); });
+            
+            if( has_erased || monomorphise_type_needed(item.m_return) )
             {
-                tmp = clone_ty_with(Span(), item.m_return, [&](const auto& tpl, auto& out) {
-                    if( const auto* e = tpl.data().opt_ErasedType() )
-                    {
-                        out = params.monomorph(m_resolve, item.m_code.m_erased_types.at(e->m_index));
-                        return true;
-                    }
-                    else if( tpl.data().is_Generic() ) {
-                        out = params.monomorph_type(sp, tpl).clone();
-                        return true;
-                    }
-                    else {
+                // If there's an erased type, make a copy with the erased type expanded
+                if( has_erased )
+                {
+                    tmp = clone_ty_with(sp, item.m_return, [&](const auto& x, auto& out) {
+                        if( const auto* te = x.data().opt_ErasedType() ) {
+                            if( const auto* e = te->m_inner.opt_Fcn() ) {
+                                out = item.m_code.m_erased_types.at(e->m_index).clone();
+                                return true;
+                            }
+                        }
                         return false;
-                    }
-                });
-                m_resolve.expand_associated_types(sp, tmp);
+                        });
+                    tmp = params.monomorph_type(Span(), tmp).clone();
+                }
+                else
+                {
+                    tmp = params.monomorph_type(Span(), item.m_return).clone();
+                }
+                m_resolve.expand_associated_types(Span(), tmp);
                 return tmp;
             }
             else

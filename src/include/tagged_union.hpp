@@ -18,6 +18,7 @@
 //#include "cpp_unpack.h"
 #include <cassert>
 #include <string>
+#include <stdexcept>
 
 #define TU_FIRST(a, ...)    a
 #define TU_EXP1(x)  x
@@ -46,6 +47,8 @@
 #define TU_DISP14(n, a1,a2,a3,a4,a5, b1,b2,b3,b4,b5, c1,c2,c3,c4       )   TU_DISP5(n, a1,a2,a3,a4,a5) TU_DISP5(n, b1,b2,b3,b4,b5) TU_DISP4(n, c1,c2,c3,c4)
 #define TU_DISP15(n, a1,a2,a3,a4,a5, b1,b2,b3,b4,b5, c1,c2,c3,c4,c5    )   TU_DISP5(n, a1,a2,a3,a4,a5) TU_DISP5(n, b1,b2,b3,b4,b5) TU_DISP5(n, c1,c2,c3,c4,c5)
 #define TU_DISP16(n, a1,a2,a3,a4,a5, b1,b2,b3,b4,b5, c1,c2,c3,c4,c5, d1)   TU_DISP5(n, a1,a2,a3,a4,a5) TU_DISP5(n, b1,b2,b3,b4,b5) TU_DISP5(n, c1,c2,c3,c4,c5) TU_DISP1(n, d1)
+#define TU_DISP17(n, a1,a2,a3,a4,a5, b1,b2,b3,b4,b5, c1,c2,c3,c4,c5, d1,d2) TU_DISP5(n, a1,a2,a3,a4,a5) TU_DISP5(n, b1,b2,b3,b4,b5) TU_DISP5(n, c1,c2,c3,c4,c5) TU_DISP2(n, d1,d2)
+#define TU_DISP18(n, a1,a2,a3,a4,a5, b1,b2,b3,b4,b5, c1,c2,c3,c4,c5, d1,d2,d3) TU_DISP5(n, a1,a2,a3,a4,a5) TU_DISP5(n, b1,b2,b3,b4,b5) TU_DISP5(n, c1,c2,c3,c4,c5) TU_DISP3(n, d1,d2,d3)
 
 #define TU_DISPO0(n)
 #define TU_DISPO1(n, _1)   n(_1)
@@ -64,6 +67,8 @@
 #define TU_DISPO14(n, a1,a2,a3,a4,a5, b1,b2,b3,b4,b5, c1,c2,c3,c4)   TU_DISPO5(n, a1,a2,a3,a4,a5) TU_DISPO5(n, b1,b2,b3,b4,b5) TU_DISPO4(n, c1,c2,c3,c4)
 #define TU_DISPO15(n, a1,a2,a3,a4,a5, b1,b2,b3,b4,b5, c1,c2,c3,c4,c5)   TU_DISPO5(n, a1,a2,a3,a4,a5) TU_DISPO5(n, b1,b2,b3,b4,b5) TU_DISPO5(n, c1,c2,c3,c4,c5)
 #define TU_DISPO16(n, a1,a2,a3,a4,a5, b1,b2,b3,b4,b5, c1,c2,c3,c4,c5, d1)   TU_DISPO5(n, a1,a2,a3,a4,a5) TU_DISPO5(n, b1,b2,b3,b4,b5) TU_DISPO5(n, c1,c2,c3,c4,c5) TU_DISPO1(n, d1)
+#define TU_DISPO17(n, a1,a2,a3,a4,a5, b1,b2,b3,b4,b5, c1,c2,c3,c4,c5, d1,d2) TU_DISPO5(n, a1,a2,a3,a4,a5) TU_DISPO5(n, b1,b2,b3,b4,b5) TU_DISPO5(n, c1,c2,c3,c4,c5) TU_DISPO2(n, d1,d2)
+#define TU_DISPO18(n, a1,a2,a3,a4,a5, b1,b2,b3,b4,b5, c1,c2,c3,c4,c5, d1,d2,d3) TU_DISPO5(n, a1,a2,a3,a4,a5) TU_DISPO5(n, b1,b2,b3,b4,b5) TU_DISPO5(n, c1,c2,c3,c4,c5) TU_DISPO4(n, d1,d2,d3)
 
 #define TU_DISPA(n, a)   n a
 #define TU_DISPA1(n, a, _1)   TU_DISPA(n, (TU_EXP a, TU_EXP _1))
@@ -82,11 +87,13 @@
 #define TU_DISPA14(n, a, a1,a2,a3,a4, b1,b2,b3,b4, c1,c2,c3, d1,d2,d3) TU_DISPA4(n,a, a1,a2,a3,a4) TU_DISPA4(n,a, b1,b2,b3,b4) TU_DISPA3(n,a, c1,c2,c3) TU_DISPA3(n,a, d1,d2,d3)
 #define TU_DISPA15(n, a, a1,a2,a3,a4, b1,b2,b3,b4, c1,c2,c3,c4, d1,d2,d3) TU_DISPA4(n,a, a1,a2,a3,a4) TU_DISPA4(n,a, b1,b2,b3,b4) TU_DISPA4(n,a, c1,c2,c3,c4) TU_DISPA3(n,a, d1,d2,d3)
 #define TU_DISPA16(n, a, a1,a2,a3,a4, b1,b2,b3,b4, c1,c2,c3,c4, d1,d2,d3,d4) TU_DISPA4(n,a, a1,a2,a3,a4) TU_DISPA4(n,a, b1,b2,b3,b4) TU_DISPA4(n,a, c1,c2,c3,c4) TU_DISPA4(n,a, d1,d2,d3,d4)
+#define TU_DISPA17(n, a, a1,a2,a3,a4, b1,b2,b3,b4, c1,c2,c3,c4, d1,d2,d3,d4, e1) TU_DISPA4(n,a, a1,a2,a3,a4) TU_DISPA4(n,a, b1,b2,b3,b4) TU_DISPA4(n,a, c1,c2,c3,c4) TU_DISPA4(n,a, d1,d2,d3,d4) TU_DISPA1(n,a, e1)
+#define TU_DISPA18(n, a, a1,a2,a3,a4, b1,b2,b3,b4, c1,c2,c3,c4, d1,d2,d3,d4, e1,e2) TU_DISPA4(n,a, a1,a2,a3,a4) TU_DISPA4(n,a, b1,b2,b3,b4) TU_DISPA4(n,a, c1,c2,c3,c4) TU_DISPA4(n,a, d1,d2,d3,d4) TU_DISPA2(n,a, e1, e2)
 
 // Macro to obtain a numbered macro for argument counts
 // - Raw variant
-#define TU_GM_I(SUF,_1,_2,_3,_4,_5,_6,_7,_8,_9,_10,_11,_12,_13,_14,_15,_16,COUNT,...) SUF##COUNT
-#define TU_GM(SUF,...) TU_EXP1( TU_GM_I(SUF, __VA_ARGS__,16,15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0) )
+#define TU_GM_I(SUF,_1,_2,_3,_4,_5,_6,_7,_8,_9,_10,_11,_12,_13,_14,_15,_16,_17,_18,_19,_20,COUNT,...) SUF##COUNT
+#define TU_GM(SUF,...) TU_EXP1( TU_GM_I(SUF, __VA_ARGS__,20,19,18,17,16,15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0) )
 // - _DISP based variant (for iteration)
 #define TU_GMX(...) TU_EXP1( TU_GM(TU_DISP, __VA_ARGS__) )
 #define TU_GMO(...) TU_EXP1( TU_GM(TU_DISPO, __VA_ARGS__) )
@@ -114,7 +121,7 @@
 */} break;
 #define TU_MATCH_ARMS(CLASS, VAR, NAME, ...)    TU_EXP1( TU_GMA(__VA_ARGS__)(TU_MATCH_ARM, (CLASS, VAR, NAME), __VA_ARGS__) )
 
-#define TU_IFLET(CLASS, VAR, TAG, NAME, ...) if(VAR.tag() == CLASS::TAG_##TAG) { auto& NAME = VAR.as_##TAG(); (void)&NAME; __VA_ARGS__ }
+#define TU_IFLET(CLASS, VAR, TAG, NAME, ...) if((VAR).tag() == CLASS::TAG_##TAG) { auto& NAME = (VAR).as_##TAG(); (void)&NAME; __VA_ARGS__ }
 
 #define TU_MATCH_HDR(VARS, brace)  TU_MATCH_HDR_(::std::remove_reference<decltype(TU_FIRST VARS)>::type, VARS, brace)
 #define TU_MATCH_HDR_(CLASS, VARS, brace)  switch( (TU_FIRST VARS).tag() ) brace case CLASS::TAGDEAD: assert(!"ERROR: destructed tagged union used");
@@ -140,9 +147,9 @@
     */for(bool tu_lc = true; tu_lc; tu_lc=false) for(TU_ARMA_Decl(TAG, __VA_ARGS__); TU_EXP1( TU_GMO(__VA_ARGS__)(TU_ARMA_IgnVal, __VA_ARGS__) ) tu_lc; tu_lc=false)
 
 //#define TU_TEST(VAL, ...)    (VAL.is_##TAG() && VAL.as_##TAG() TEST)
-#define TU_TEST1(VAL, TAG1, TEST)    ((VAL).is_##TAG1() && (VAL).as_##TAG1() TEST)
+#define TU_TEST1(VAL, TAG1, TEST)    ((VAL).is_##TAG1() && ((VAL).as_##TAG1() TEST))
 #define TU_TEST2(VAL, TAG1, FLD1,TAG2, TEST)    ((VAL).is_##TAG1() && (VAL).as_##TAG1() FLD1.is_##TAG2() && (VAL).as_##TAG1() FLD1.as_##TAG2() TEST)
-
+#define TU_OPT1(VAL, TAG1, GET) ((VAL).is_##TAG1() ? ((VAL).as_##TAG1() GET) : nullptr)
 
 #define TU_DATANAME(name)   Data_##name
 // Internals of TU_CONS
@@ -165,7 +172,7 @@
 #define TU_TAG(name, ...)  TAG_##name,
 
 // Destructor internals
-#define TU_DEST_CASE(tag, ...)  case TAG_##tag: m_data.tag.~TU_DATANAME(tag)(); break;/*
+#define TU_DEST_CASE(tag, ...)  case TAG_##tag: TU_destruct_inplace(m_data.tag); break;/*
 */
 
 // move constructor internals
@@ -205,7 +212,18 @@
  * ```
  */
 #define TAGGED_UNION(_name, _def, ...)  TU_EXP1( TAGGED_UNION_EX(_name, (), _def, (TU_EXP(__VA_ARGS__)), (), (), ()) )
+#if defined(__clang__)
 #define TAGGED_UNION_EX(_name, _inherit, _def, _variants, _extra_move, _extra_assign, _extra) \
+_Pragma("clang diagnostic push"); \
+_Pragma("clang diagnostic ignored \"-Wnon-c-typedef-for-linkage\""); \
+    _TAGGED_UNION_EX(_name, _inherit, _def, _variants, _extra_move, _extra_assign, _extra) \
+_Pragma("clang diagnostic pop");
+#else
+#define TAGGED_UNION_EX(_name, _inherit, _def, _variants, _extra_move, _extra_assign, _extra) \
+    _TAGGED_UNION_EX(_name, _inherit, _def, _variants, _extra_move, _extra_assign, _extra)
+#endif
+
+#define _TAGGED_UNION_EX(_name, _inherit, _def, _variants, _extra_move, _extra_assign, _extra) \
 class _name TU_EXP _inherit { \
     typedef _name self_t;/*
 */public:\
@@ -244,6 +262,11 @@ class _name TU_EXP _inherit { \
 
 /*
 */
+
+namespace {
+    template<typename T> static void TU_destruct_inplace(T& v) { v.~T(); }
+}
+
 
 #endif
 

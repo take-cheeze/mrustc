@@ -4,88 +4,145 @@
  *
  * trans/mangling_v2.cpp
  * - Name mangling (encoding of rust paths into symbols)
+ * 
+ * Ensures that symbols contain only alpha-numerics and `_`
+ * NOTE: `$` is used ONLY for shortening excessively long symbols
  */
 #include <debug.hpp>
 #include <string_view.hpp>
 #include <hir/hir.hpp>  // ABI_RUST
 #include <hir/type.hpp>
+#include <cctype>
+#include <algorithm>	// std::find
+#include <cmath>	// ceil/log10
 
 class Mangler
 {
     ::std::ostream& m_os;
+    std::vector<RcString>    m_name_cache;
 public:
     Mangler(::std::ostream& os):
         m_os(os)
     {
     }
 
-    // Item names:
-    // - These can have a single '#' in them (either leading or in the middle)
-    // TODO: Some other invalid characters can appear:
-    // - '-' (crate names)
+    /// Formats an integer in a decodable format (lower case until the final digit)
+    // Used to encode values that might be have trailing digits
+    void fmt_base26_int(unsigned val)
+    {
+        // Lower-case: 
+        while(val >= 26) {
+            m_os << char('a' + (val%26));
+            val /= 26;
+        }
+        assert(val < 26);
+        m_os << char('A' + val);
+    }
+
+    // Reference-counted item names
+    // - These can be repeated quite often, so support back-references
+    //   > Back-references are emitted as "`_` <base26>"
+    // - Otherwise, emitted as a raw string (see below)
     void fmt_name(const RcString& s)
     {
+        // Support back-references to names (if shorter than the literal name)
+        auto it = std::find(m_name_cache.begin(), m_name_cache.end(), s);
+        if(it != m_name_cache.end())
+        {
+            auto idx = it - m_name_cache.begin();
+            // Only emit this way if shorter than the formatted name would be.
+            auto len = 1 + static_cast<unsigned>(std::ceil(std::log10(idx+1) / std::log10(26)));
+            if(len < s.size())
+            {
+                m_os << "_"; fmt_base26_int(idx);
+                return ;
+            }
+        }
+        else
+        {
+            m_name_cache.push_back(s);
+        }
+
         this->fmt_name(s.c_str());
     }
+    // Item names:
+    // - These can have a single '#' in them (either leading or in the middle)
+    // - '-' (crate names)
+    // Encoding is either:
+    // - "<len:int> <raw_data>" (fully valid identifier)
+    // - "<ofs:base26> <len:int> <raw_data1> <raw_data2>" (`#` or `-` present)
+    // - "<len:base26> `_` <raw_data2>" (`#` or `-` at the start)
     void fmt_name(const char* const s)
     {
         size_t size = strlen(s);
         const char* hash_pos = nullptr;
-        // - Search the string for the '#' character
+        // Search the string for a '#' or '-' character (only one allowed)
         for(const auto* p = s; *p; p++)
         {
-            if( p == s ) {
-                ASSERT_BUG(Span(), !isdigit(*p), "Leading digit not valid in '" << s << "'");
-            }
-
             if( isalnum(*p) ) {
             }
             else if( *p == '_' ) {
             }
             else if( *p == '#' || *p == '-' ) { // HACK: Treat '-' and '#' as the same in encoding
                 // Multiple hash characters? abort/error
-                ASSERT_BUG(Span(), hash_pos == nullptr, "Multiple '#' characters in '" << s << "'");
+                // HACK: Only treat the last one as special, previous ones are replaced by underscores
                 hash_pos = p;
             }
             else {
-                BUG(Span(), "Encounteded invalid character '" << *p << "' in '" << s << "'");
+                BUG(Span(), "Encounteded invalid character in symbol name while mangling: '" << *p << "' in '" << s << "'");
             }
         }
 
-        // If there's a hash, then prefix with a letter indicating its location?
-        // - Using a 3 character overhead currently (but a letter could work really well)
+        // If there's a hash, then encode such that it's removed
         if( hash_pos != nullptr )
         {
             auto pre_hash_len = static_cast<int>(hash_pos - s);
-#if 0
-            assert(pre_hash_len < 26);
-            // <posletter> <full_len> <body1> <body2>
-            m_os << 'a' + pre_hash_len;
-            m_os << size - 1;
-            m_os << ::stdx::string_view(s, s + pre_hash_len);
-            m_os << hash_pos + 1;;
-#else
-            // 'h' <len1> <body1> <len2> <body2>
-            m_os << "h";
-            m_os << pre_hash_len;
-            m_os << ::stdx::string_view(s, s + pre_hash_len);
-            m_os << size - pre_hash_len - 1;
-            m_os << hash_pos + 1;;
-#endif
+            // If the hash is at the start, and is followed by either a digit (expected) or an underscore (unlikely) - then encode with a leading underscore
+            if( hash_pos == s && (isdigit(hash_pos[1]) || hash_pos[1] == '_') ) {
+                // <len:base26> '_' <body2>
+                // An encoding that allows this pattern
+                fmt_base26_int(size-1);
+                ASSERT_BUG(Span(), hash_pos[1] != '_', "Leading underscore not valid in '" << s << "'");
+                m_os << '_';
+                m_os << hash_pos + 1;
+            }
+            else {
+                // <pos:base26> <len:int> <body1> <body2>
+                fmt_base26_int(pre_hash_len);
+                bool needs_leading_escape = (isdigit(s[0]) || s[0] == '_');
+                m_os << size - 1 + (needs_leading_escape ? 1 : 0);
+                // If the string starts with a digit or underscrore, then escape it with another underscore.
+                if( needs_leading_escape ) {
+                    m_os << '_';
+                }
+                for(const char* c = s; c != hash_pos; ++c) {
+                    if( *c == '-' || *c == '#' ) {
+                        m_os << '_';
+                    }
+                    else {
+                        m_os << *c;
+                    }
+                }
+                m_os << hash_pos + 1;
+            }
         }
         else
         {
-            m_os << size;
+            bool needs_leading_escape = (isdigit(s[0]) || s[0] == '_');
+            m_os << size + (needs_leading_escape ? 1 : 0);
+            if( needs_leading_escape ) {
+                m_os << '_';
+            }
             m_os << s;
         }
     }
     // SimplePath : <ncomp> 'c' [<RcString> ...]
     void fmt_simple_path(const ::HIR::SimplePath& sp)
     {
-        m_os << sp.m_components.size();
+        m_os << sp.components().size();
         m_os << "c";    // Needed to separate the component count from the crate name
-        this->fmt_name(sp.m_crate_name);
-        for(const auto& c : sp.m_components)
+        this->fmt_name(sp.crate_name());
+        for(const auto& c : sp.components())
         {
             this->fmt_name(c);
         }
@@ -96,10 +153,31 @@ public:
     {
         // Type Parameter count
         m_os << pp.m_types.size();
+        if(pp.m_values.size() > 0) {
+            m_os << "v";
+            m_os << pp.m_values.size();
+        }
         m_os << "g";
         for(const auto& ty : pp.m_types)
         {
             fmt_type(ty);
+        }
+        for(const auto& v : pp.m_values)
+        {
+            const auto& ev = *v.as_Evaluated();
+            m_os << "V";
+            m_os << ev.bytes.size();
+            m_os << "_";
+            // TODO: Base64 data? (`_` and `$` as the other two?)
+            for(size_t i = 0; i < ev.bytes.size(); i ++) {
+                m_os << "0123456789abcdef"[ ev.bytes[i] >> 4 ];
+                m_os << "0123456789abcdef"[ ev.bytes[i] & 0xF ];
+            }
+            if( ev.relocations.size() > 0 )
+            {
+                m_os << "_" << ev.relocations.size() << "R";
+                TODO(Span(), "Mangle relocated values");
+            }
         }
     }
     // GenericPath : <SimplePath> <PathParams>
@@ -147,7 +225,8 @@ public:
     // - TraitObject: 'D' <data:GenericPath> <nmarker> [markers: <GenericPath> ...] <naty> [<TypeRef> ...]    TODO: Does this need to include the ATY name?
     // - Borrow: 'B' ('s'|'u'|'o') <TypeRef>
     // - RawPointer: 'P' ('s'|'u'|'o') <TypeRef>
-    // - Function: 'F' <abi:RcString> <nargs> [args: <TypeRef> ...] <ret:TypeRef>
+    // - Named Function: 'f' <Path>
+    // - Function: 'F' (|'u') (| 'e' <abi:RcString>) <nargs> [args: <TypeRef> ...] <ret:TypeRef>
     // - Primitives::
     //   - u8  : 'C' 'a'
     //   - i8  : 'C' 'b'
@@ -175,7 +254,7 @@ public:
         case ::HIR::TypeData::TAG_Infer:
         case ::HIR::TypeData::TAG_Generic:
         case ::HIR::TypeData::TAG_ErasedType:
-        case ::HIR::TypeData::TAG_Closure:
+        case ::HIR::TypeData::TAG_NodeType:
             BUG(Span(), "Non-encodable type " << ty);
         TU_ARMA(Tuple, e) {
             m_os << "T" << e.size();
@@ -202,10 +281,15 @@ public:
             m_os << e.m_trait.m_type_bounds.size();
             // HACK: Assume all TraitObject types have the same aty set (std::map is deterministic)
             for(const auto& aty : e.m_trait.m_type_bounds)
-                this->fmt_type(aty.second);
+                this->fmt_type(aty.second.type);
             m_os << e.m_markers.size();
             for(const auto& p : e.m_markers)
                 this->fmt_generic_path(p);
+            }
+        TU_ARMA(NamedFunction, e) {
+            // - Named function: 'f' <path>
+            m_os << "f";
+            this->fmt_path(e.path);
             }
         TU_ARMA(Function, e) {
             // - Function: 'F' <abi:RcString> <nargs> [args: <TypeRef> ...] <ret:TypeRef>
@@ -254,8 +338,10 @@ public:
             case ::HIR::CoreType::I64 : m_os << 'C' << 'h'; break;
             case ::HIR::CoreType::U128: m_os << 'C' << 'i'; break;
             case ::HIR::CoreType::I128: m_os << 'C' << 'j'; break;
+            case ::HIR::CoreType::F16 : m_os << 'C' << 'm'; break;
             case ::HIR::CoreType::F32 : m_os << 'C' << 'n'; break;
             case ::HIR::CoreType::F64 : m_os << 'C' << 'o'; break;
+            case ::HIR::CoreType::F128: m_os << 'C' << 'p'; break;
             case ::HIR::CoreType::Usize: m_os << 'C' << 'u'; break;
             case ::HIR::CoreType::Isize: m_os << 'C' << 'v'; break;
             case ::HIR::CoreType::Bool: m_os << 'C' << 'w'; break;

@@ -27,6 +27,7 @@
 # include <spawn.h>
 # include <fcntl.h> // O_*
 # include <sys/wait.h>  // waitpid
+# include <signal.h>
 # define MRUSTC_PATH    "./bin/mrustc"
 #endif
 #include <algorithm>
@@ -53,15 +54,27 @@ struct Options
 
 struct TestDesc
 {
+    struct Message {
+        unsigned line;
+        enum class Type {
+            Error,
+        } type;
+        std::string substring;
+    };
+
     ::std::string   m_name;
     ::std::string   m_path;
-    ::std::vector<::std::string>    m_pre_build;
+    ::std::vector< std::pair<::std::string, std::vector<std::string> > >    m_pre_build;
     ::std::vector<::std::string>    m_extra_flags;
+    ::std::vector<Message>  m_messages;
     bool ignore;
     bool no_run;
+    bool compile_fail;
+
     TestDesc()
         :ignore(false)
         ,no_run(false)
+        ,compile_fail(false)
     {
     }
 };
@@ -264,19 +277,89 @@ int main(int argc, const char* argv[])
             TestDesc    td;
             td.ignore = false;
 
+            unsigned cur_line = 0;
             do
             {
                 ::std::string   line;
                 ::std::getline(in, line);
+                cur_line += 1;
+
+                while(!line.empty() && std::isblank(line.back()))
+                    line.pop_back();
+
+                // Look for `//~` in the line
+                // - e.g. `//~ ERROR <message>`
+                // - or   `//~^ ERROR <message>`
+                {
+                    auto p = line.find("//~");
+                    if( p != std::string::npos )
+                    {
+                        auto target_line = cur_line;
+                        p += 3;
+                        while( line[p] == '^' ) {
+                            target_line -= 1;
+                            p ++;
+                        }
+
+                        // Consume an ident (the message type)
+                        while(isspace(line[p]))
+                            p ++ ;
+                        auto type_start = p;
+                        while(isalnum(line[p]))
+                            p ++;
+                        auto type = line.substr(type_start, p-type_start);
+                        while(isspace(line[p]))
+                            p ++ ;
+                        auto rest = line.substr(p);
+
+                        if( type == "ERROR" ) {
+                            td.m_messages.push_back(TestDesc::Message { target_line, TestDesc::Message::Type::Error, rest });
+                            td.compile_fail = true;
+                        }
+                        else {
+                        }
+                    }
+                }
+
                 if( !(line[0] == '/' && line[1] == '/'/* && line[2] == ' '*/) )
                     continue ;
                 // TODO Parse a skewer-case ident and check against known set?
+                struct Parser {
+                    const char* p;
+                    Parser(const char* p): p(p) {}
+
+                    bool is_eof() const {
+                        return *p == '\0';
+                    }
+                    void consume_white() {
+                        while( *p && isblank(*p) )
+                            p ++;
+                    }
+                    std::string read_string() {
+                        std::string rv;
+                        while(*p && !isblank(*p)) {
+                            rv += *p;
+                            p ++;
+                        }
+                        return rv;
+                    }
+                };
 
                 size_t start = (line[2] == ' ' ? 3 : 2);
 
                 if( line.substr(start, 10) == "aux-build:" )
                 {
-                    td.m_pre_build.push_back( line.substr(start+10) );
+                    Parser  p(line.c_str() + start + 10);
+                    p.consume_white();
+                    std::vector<std::string>    args;
+                    auto file = p.read_string();
+                    p.consume_white();
+                    while(!p.is_eof())
+                    {
+                        args.push_back(p.read_string());
+                        p.consume_white();
+                    }
+                    td.m_pre_build.push_back(std::make_pair( std::move(file), std::move(args) ));
                 }
                 else if( line.substr(start, 11) == "ignore-test" )
                 {
@@ -331,7 +414,7 @@ int main(int argc, const char* argv[])
         // ---
         const bool SKIP_PASS = (getenv("TESTRUNNER_SKIPPASS") != nullptr);
         const bool NO_COMPILER_DEP = (getenv("TESTRUNNER_NOCOMPILERDEP") != nullptr);
-        const auto compiler_ts = Timestamp::for_file(MRUSTC_PATH);
+        const auto compiler_ts = getenv("MINICARGO_IGNTOOLS") ? Timestamp::infinite_past() : Timestamp::for_file(MRUSTC_PATH);
         unsigned n_skip = 0;
         unsigned n_cfail = 0;
         unsigned n_fail = 0;
@@ -380,18 +463,20 @@ int main(int argc, const char* argv[])
                     test_exe_ts = Timestamp::infinite_past();
                 }
             }
-            if( test_exe_ts == Timestamp::infinite_past() || (!NO_COMPILER_DEP && !SKIP_PASS && test_exe_ts < compiler_ts) )
+            if( test_exe_ts == Timestamp::infinite_past()
+             || test_exe_ts < Timestamp::for_file(test.m_path)
+             || (!NO_COMPILER_DEP && !SKIP_PASS && test_exe_ts < compiler_ts) )
             {
                 bool pre_build_failed = false;
-                for(const auto& file : test.m_pre_build)
+                for(const auto& pb : test.m_pre_build)
                 {
 #ifdef _WIN32
                     CreateDirectoryA(depdir.str().c_str(), NULL);
 #else
                     mkdir(depdir.str().c_str(), 0755);
 #endif
-                    auto infile = input_path / "auxiliary" / file;
-                    if( !run_compiler(opts, infile, depdir, {}, depdir, true) )
+                    auto infile = input_path / "auxiliary" / pb.first;
+                    if( !run_compiler(opts, infile, depdir, pb.second, depdir, true) )
                     {
                         DEBUG("COMPILE FAIL " << infile << " (dep of " << test.m_name << ")");
                         n_cfail ++;
@@ -414,14 +499,33 @@ int main(int argc, const char* argv[])
                 }
 
                 auto compile_logfile = test_exe + "-build.log";
-                if( !run_compiler(opts, test.m_path, test_exe, test.m_extra_flags, depdir) )
+
+                auto compile_succeeded = run_compiler(opts, test.m_path, test_exe, test.m_extra_flags, depdir);
+                // Check error/warning messages
                 {
-                    DEBUG("COMPILE FAIL " << test.m_name << ", log in " << compile_logfile);
-                    n_cfail ++;
-                    if( opts.fail_fast )
-                        return 1;
-                    else
-                        continue;
+                    std::ifstream   msg(compile_logfile);
+                }
+
+                if( !compile_succeeded )
+                {
+                    if( !test.compile_fail ) {
+                        DEBUG("COMPILE FAIL " << test.m_name << ", log in " << compile_logfile);
+                        n_cfail ++;
+                        if( opts.fail_fast )
+                            return 1;
+                        else
+                            continue;
+                    }
+                }
+                else {
+                    if( test.compile_fail ) {
+                        DEBUG("COMPILE PASSED? (should fail) " << test.m_name << ", log in " << compile_logfile);
+                        n_cfail ++;
+                        if( opts.fail_fast )
+                            return 1;
+                        else
+                            continue;
+                    }
                 }
                 test_exe_ts = Timestamp::for_file(test_exe);
             }
@@ -579,6 +683,26 @@ void Options::usage_full() const
 {
 }
 
+#ifdef _WIN32
+namespace {
+    class WinapiError {
+        DWORD   v;
+        WinapiError(DWORD v): v(v) {}
+    public:
+        static WinapiError get() {
+            return WinapiError(GetLastError());
+        }
+        friend std::ostream& operator<<(std::ostream& os, const WinapiError& x) {
+            char* buf;
+            FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER|FORMAT_MESSAGE_FROM_SYSTEM, NULL, x.v, 0, (LPSTR)&buf, 0, nullptr);
+            os << "0x" << std::hex << x.v << ": " << buf;
+            LocalFree(buf);
+            return os;
+        }
+    };
+}
+#endif
+
 ///
 bool run_executable(const ::helpers::path& exe_name, const ::std::vector<const char*>& args, const ::helpers::path& outfile, unsigned timeout_seconds)
 {
@@ -603,7 +727,10 @@ bool run_executable(const ::helpers::path& exe_name, const ::std::vector<const c
         //WriteFile(si.hStdOutput, cmdline_str.data(), static_cast<DWORD>(cmdline_str.size()), &tmp, NULL);
         //WriteFile(si.hStdOutput, "\n", 1, &tmp, NULL);
     }
-    DuplicateHandle(NULL, si.hStdOutput, NULL, &si.hStdError, GENERIC_WRITE, FALSE, FILE_SHARE_READ);
+    if( !DuplicateHandle(GetCurrentProcess(), si.hStdOutput, GetCurrentProcess(), &si.hStdError, /*dwDesiredAccess(unused)*/0, /*bInheritHandle*/TRUE, DUPLICATE_SAME_ACCESS) ) {
+        std::cerr << "DuplicateHandle failed: " << WinapiError::get() << std::endl;
+        return false;
+    }
     PROCESS_INFORMATION pi = { 0 };
     auto em = SetErrorMode(SEM_NOGPFAULTERRORBOX);
     CreateProcessA(exe_name.str().c_str(), (LPSTR)cmdline_str.c_str(), NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);

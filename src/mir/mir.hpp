@@ -11,8 +11,12 @@
 #include <string>
 #include <memory>   // std::unique_ptr
 #include <hir/type.hpp>
+#include "../hir/asm.hpp"
+#include <int128.h>
+#include <cstdint>
 
 struct MonomorphState;
+class StaticTraitResolve;
 
 namespace MIR {
 
@@ -93,9 +97,9 @@ struct LValue
         bool is_Local() const    { return (val & 3) == 1; }
         bool is_Static() const   { return (val & 3) == 2; }
 
-        const char     as_Return  () const { assert(is_Return()); return 0; }
-        const unsigned as_Argument() const { assert(is_Argument()); return static_cast<unsigned>( (val >> 2) - 1 ); }
-        const unsigned as_Local   () const { assert(is_Local()); return static_cast<unsigned>(val >> 2); }
+        char     as_Return  () const { assert(is_Return()); return 0; }
+        unsigned as_Argument() const { assert(is_Argument()); return static_cast<unsigned>( (val >> 2) - 1 ); }
+        unsigned as_Local   () const { assert(is_Local()); return static_cast<unsigned>(val >> 2); }
 
         const ::HIR::Path& as_Static() const { assert(is_Static()); return *reinterpret_cast<const ::HIR::Path*>(val & ~3llu); }
               ::HIR::Path& as_Static()       { assert(is_Static()); return *reinterpret_cast<      ::HIR::Path*>(val & ~3llu); }
@@ -138,11 +142,11 @@ struct LValue
         // Stores a Local index
         bool is_Index   () const { return (val & 3) == 3; }
 
-        const char     as_Deref   () const { assert(is_Deref()); return 0; }
-        const unsigned as_Field   () const { assert(is_Field()); return (val >> 2); }
-        const unsigned as_Downcast() const { assert(is_Downcast()); return (val >> 2); }
+        char     as_Deref   () const { assert(is_Deref()); return 0; }
+        unsigned as_Field   () const { assert(is_Field()); return (val >> 2); }
+        unsigned as_Downcast() const { assert(is_Downcast()); return (val >> 2); }
         // TODO: Should this return a LValue?
-        const unsigned as_Index   () const { assert(is_Index()); unsigned rv = (val >> 2); return rv; }
+        unsigned as_Index   () const { assert(is_Index()); unsigned rv = (val >> 2); return rv; }
 
         void inc_Field   () { assert(is_Field   ()); *this = Wrapper::new_Field   (as_Field   () + 1); }
         void inc_Downcast() { assert(is_Downcast()); *this = Wrapper::new_Downcast(as_Downcast() + 1); }
@@ -177,12 +181,12 @@ struct LValue
 
     bool is_Return() const { return m_wrappers.empty() && m_root.is_Return(); }
     bool is_Local () const { return m_wrappers.empty() && m_root.is_Local(); }
-    const unsigned as_Local() const { assert(m_wrappers.empty()); return m_root.as_Local(); }
+    unsigned as_Local() const { assert(m_wrappers.empty()); return m_root.as_Local(); }
 
     bool is_Deref   () const { return m_wrappers.size() > 0 && m_wrappers.back().is_Deref(); }
     bool is_Field   () const { return m_wrappers.size() > 0 && m_wrappers.back().is_Field(); }
     bool is_Downcast() const { return m_wrappers.size() > 0 && m_wrappers.back().is_Downcast(); }
-    const unsigned as_Field() const { assert(!m_wrappers.empty()); return m_wrappers.back().as_Field(); }
+    unsigned as_Field() const { assert(!m_wrappers.empty()); return m_wrappers.back().as_Field(); }
 
     void inc_Field   () { assert(m_wrappers.size() > 0); m_wrappers.back().inc_Field   (); }
     void inc_Downcast() { assert(m_wrappers.size() > 0); m_wrappers.back().inc_Downcast(); }
@@ -311,14 +315,14 @@ struct LValue
         bool is_Downcast() const { return m_wrapper_count >= 1 && m_lv->m_wrappers[m_wrapper_count-1].is_Downcast(); }
         bool is_Index   () const { return m_wrapper_count >= 1 && m_lv->m_wrappers[m_wrapper_count-1].is_Index   (); }
 
-        const unsigned   as_Local   () const { assert(is_Local   ()); return m_lv->m_root.as_Local   (); }
-        const char       as_Return  () const { assert(is_Return  ()); return m_lv->m_root.as_Return  (); }
-        const unsigned   as_Argument() const { assert(is_Argument()); return m_lv->m_root.as_Argument(); }
+        unsigned   as_Local   () const { assert(is_Local   ()); return m_lv->m_root.as_Local   (); }
+        char       as_Return  () const { assert(is_Return  ()); return m_lv->m_root.as_Return  (); }
+        unsigned   as_Argument() const { assert(is_Argument()); return m_lv->m_root.as_Argument(); }
         const HIR::Path& as_Static  () const { assert(is_Static  ()); return m_lv->m_root.as_Static  (); }
-        const char     as_Deref   () const { assert(is_Deref   ()); return m_lv->m_wrappers[m_wrapper_count-1].as_Deref   (); }
-        const unsigned as_Field   () const { assert(is_Field   ()); return m_lv->m_wrappers[m_wrapper_count-1].as_Field   (); }
-        const unsigned as_Downcast() const { assert(is_Downcast()); return m_lv->m_wrappers[m_wrapper_count-1].as_Downcast(); }
-        const unsigned as_Index   () const { assert(is_Index   ()); return m_lv->m_wrappers[m_wrapper_count-1].as_Index   (); }
+        char     as_Deref   () const { assert(is_Deref   ()); return m_lv->m_wrappers[m_wrapper_count-1].as_Deref   (); }
+        unsigned as_Field   () const { assert(is_Field   ()); return m_lv->m_wrappers[m_wrapper_count-1].as_Field   (); }
+        unsigned as_Downcast() const { assert(is_Downcast()); return m_lv->m_wrappers[m_wrapper_count-1].as_Downcast(); }
+        unsigned as_Index   () const { assert(is_Index   ()); return m_lv->m_wrappers[m_wrapper_count-1].as_Index   (); }
 
         void fmt(::std::ostream& os) const;
         Ordering ord(const RefCommon& b) const;
@@ -400,6 +404,8 @@ struct LValue
     Ordering ord(const LValue::MRef& x) const;
 };
 extern ::std::ostream& operator<<(::std::ostream& os, const LValue& x);
+extern ::std::ostream& operator<<(::std::ostream& os, const LValue::Storage& x);
+extern ::std::ostream& operator<<(::std::ostream& os, const LValue::Wrapper& x);
 static inline bool operator<(const LValue& a, const LValue::CRef& b) {
     return a.ord(b) == OrdLess;
 }
@@ -450,11 +456,11 @@ enum class eUniOp
 // Compile-time known values
 TAGGED_UNION_EX(Constant, (), Int, (
     (Int, struct {
-        ::std::int64_t  v;
+        S128    v;
         ::HIR::CoreType t;
         }),
     (Uint, struct {
-        ::std::uint64_t v;
+        U128    v;
         ::HIR::CoreType t;
         }),
     (Float, struct {
@@ -470,7 +476,10 @@ TAGGED_UNION_EX(Constant, (), Int, (
     // words, compared to 4 for MIR::Constant without it)
     (Const, struct { ::std::unique_ptr<::HIR::Path> p; }),   // `const`
     (Generic, ::HIR::GenericRef),
-    (ItemAddr, ::std::unique_ptr<::HIR::Path>) // address of a value
+    // ZST function type, NOT its address
+    (Function, struct { ::std::unique_ptr<::HIR::Path> p; }),
+    // Address of a value
+    (ItemAddr, ::std::unique_ptr<::HIR::Path>)
     ), (), (), (
         friend ::std::ostream& operator<<(::std::ostream& os, const Constant& v);
         ::Ordering ord(const Constant& b) const;
@@ -509,14 +518,15 @@ TAGGED_UNION_EX(RValue, (), Tuple, (
     (Use, LValue),
     (Borrow, struct {
         ::HIR::BorrowType   type;
+        bool is_raw;
         LValue  val;
         }),
     (Constant, Constant),
     (SizedArray, struct {
         Param   val;
-        unsigned int    count;
+        ::HIR::ArraySize    count;
         }),
-    // Cast on primitives
+    // Cast on primitives (thin pointers, integers, floats)
     (Cast, struct {
         LValue  val;
         ::HIR::TypeRef  type;
@@ -542,6 +552,7 @@ TAGGED_UNION_EX(RValue, (), Tuple, (
         LValue  val;
         }),
     // Construct a DST pointer from a thin pointer and metadata
+    // OR: (if `meta_val` is `Constant::ItemAddr(nullptr)`) A still-to-be-resolved unsizing coercion
     (MakeDst, struct {
         Param   ptr_val;
         Param   meta_val;
@@ -553,11 +564,18 @@ TAGGED_UNION_EX(RValue, (), Tuple, (
     (Array, struct {
         ::std::vector<Param>   vals;
         }),
-    // Create a new instance of a union (and eventually enum)
-    (Variant, struct {
+    // Create a new instance of a union
+    (UnionVariant, struct {
         ::HIR::GenericPath  path;
         unsigned int index;
         Param   val;
+        }),
+    // Create a new instance of an enum
+    // - Separate from UnionVariant, as the contents is needed when creating the body
+    (EnumVariant, struct {
+        ::HIR::GenericPath  path;
+        unsigned int index;
+        ::std::vector<Param>   vals;
         }),
     // Create a new instance of a struct
     (Struct, struct {
@@ -585,9 +603,12 @@ TAGGED_UNION(CallTarget, Intrinsic,
 TAGGED_UNION_EX(SwitchValues, (), Unsigned, (
     (Unsigned, ::std::vector<uint64_t>),
     (Signed, ::std::vector<int64_t>),
-    (String, ::std::vector<::std::string>)
+    (String, ::std::vector<::std::string>),
+    (ByteString, ::std::vector<::std::vector<uint8_t>>)
     ), (),(), (
         SwitchValues clone() const;
+        bool operator==(const SwitchValues& x) const;
+        bool operator!=(const SwitchValues& x) const { return !(*this == x); }
     )
     );
 
@@ -599,8 +620,8 @@ TAGGED_UNION(Terminator, Incomplete,
     (Panic, struct { BasicBlockId dst; }),  // ?
     (If, struct {
         LValue cond;
-        BasicBlockId    bb0;    // true
-        BasicBlockId    bb1;    // false
+        BasicBlockId    bb_true;
+        BasicBlockId    bb_false;
         }),
     (Switch, struct {
         LValue val;
@@ -626,6 +647,18 @@ static inline bool operator!=(const Terminator& a, const Terminator& b) {
     return !(a == b);
 }
 
+TAGGED_UNION(AsmParam, Const,
+    (Const, ::MIR::Constant),
+    (Sym, ::HIR::Path),
+    (Reg, struct {
+        AsmCommon::Direction    dir;
+        AsmCommon::RegisterSpec spec;
+        std::unique_ptr<MIR::Param> input;
+        std::unique_ptr<MIR::LValue> output;
+        })
+    );
+extern bool operator==(const AsmParam& a, const AsmParam& b);
+
 enum class eDropKind {
     SHALLOW,
     DEEP,
@@ -636,7 +669,7 @@ TAGGED_UNION(Statement, Asm,
         LValue  dst;
         RValue  src;
         }),
-    // Inline assembly
+    // Inline assembly (`llvm_asm!`)
     (Asm, struct {
         ::std::string   tpl;
         ::std::vector< ::std::pair<::std::string,LValue> >  outputs;
@@ -644,11 +677,35 @@ TAGGED_UNION(Statement, Asm,
         ::std::vector< ::std::string>   clobbers;
         ::std::vector< ::std::string>   flags;
         }),
+    // Inline assembly (stabilised)
+    (Asm2, struct {
+        AsmCommon::Options  options;
+        std::vector<AsmCommon::Line>   lines;
+        ::std::vector<AsmParam> params;
+        }),
     // Update the state of a drop flag
     (SetDropFlag, struct {
         unsigned int idx;
         bool new_val;   // If `other` is populated, this indicates that the other value should be negated
+        /// Other drop flag, used for copying/inverting another flag. If `~0u`, then the value of `new_val` is stored
         unsigned int other;
+        }),
+    // Save a drop flag to a bitset
+    (SaveDropFlag, struct {
+        /// Destination bit-set, an array of unsigned integers (nominally `u8`)
+        LValue  slot;
+        /// Destination bit v
+        unsigned int    bit_index;
+        /// Source drop flag index
+        unsigned int    idx;
+        }),
+    (LoadDropFlag, struct {
+        /// Destination drop flag index
+        unsigned int    idx;
+        /// Source bit-set, an array of unsigned integers (nominally `u8`)
+        LValue  slot;
+        /// Source bit index
+        unsigned int    bit_index;
         }),
     // Drop a value
     (Drop, struct {
@@ -699,5 +756,45 @@ public:
     mutable EnumCachePtr trans_enum_state;
 };
 
+class Cloner
+{
+public:
+    const Span& sp;
+    Cloner(const Span& sp): sp(sp) {}
+
+    virtual ::MIR::BasicBlockId map_bb_idx(::MIR::BasicBlockId idx) const {
+        return idx;
+    }
+    virtual unsigned map_local(unsigned f) const {
+        return f;
+    }
+    virtual unsigned map_drop_flag(unsigned f) const {
+        return f;
+    }
+
+    virtual const HIR::TypeRef& value_generic_type(HIR::GenericRef ce) const;
+    virtual const Monomorphiser& monomorphiser() const;
+    virtual const StaticTraitResolve* resolve() const { return nullptr; }
+
+    virtual ::MIR::Statement clone_stmt(const ::MIR::Statement& src) const;
+    virtual ::MIR::Terminator clone_term(const ::MIR::Terminator& src) const;
+
+    virtual ::MIR::LValue clone_lval(const ::MIR::LValue& src) const;
+    virtual ::MIR::RValue clone_rval(const ::MIR::RValue& src) const;
+    virtual ::MIR::Param clone_param(const ::MIR::Param& src) const;
+    virtual ::MIR::Constant clone_constant(const ::MIR::Constant& src) const;
+
+    ::std::vector<MIR::AsmParam> clone_asm_params(const ::std::vector<MIR::AsmParam>& params) const;
+    ::std::vector< ::std::pair<::std::string,::MIR::LValue> > clone_name_lval_vec(const ::std::vector< ::std::pair<::std::string,::MIR::LValue> >& src) const;
+    ::std::vector<::MIR::Param> clone_param_vec(const ::std::vector<::MIR::Param>& src) const;
+    ::std::vector<::MIR::LValue> clone_lval_vec(const ::std::vector<::MIR::LValue>& src) const;
+
+    // -- Monomorphise various types
+    ::HIR::TypeRef monomorph(const ::HIR::TypeRef& x) const;
+    ::HIR::GenericPath monomorph(const ::HIR::GenericPath& x) const;
+    ::HIR::Path monomorph(const ::HIR::Path& x) const;
+    ::HIR::PathParams monomorph(const ::HIR::PathParams& x) const;
 };
+
+} // namespace MIR
 

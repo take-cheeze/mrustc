@@ -36,9 +36,9 @@ struct CheckFailure:
 {
 };
 
-#define MIR_BUG(state, ...) do { (state).print_bug( [&](auto& _os){_os << __VA_ARGS__; } ); throw ""; } while(0)
+#define MIR_BUG(state, ...) do { const char* __fcn = __FUNCTION__; (state).print_bug( [&](auto& _os){_os << __fcn << ": " << __VA_ARGS__; } ); throw ""; } while(0)
 #define MIR_ASSERT(state, cnd, ...) do { if( !(cnd) ) (state).print_bug( [&](auto& _os){_os << __FILE__ << ":" << __LINE__ << " ASSERT " #cnd " failed - " << __VA_ARGS__; } ); } while(0)
-#define MIR_TODO(state, ...) do { (state).print_todo( [&](auto& _os){_os << __VA_ARGS__; } ); throw ""; } while(0)
+#define MIR_TODO(state, ...) do { (state).print_todo( [&](auto& _os){_os << __FILE__ << ":" << __LINE__ << ": " << __VA_ARGS__; } ); throw ""; } while(0)
 #define MIR_DEBUG(state, ...) do { DEBUG(FMT_CB(_ss, (state).fmt_pos(_ss);) << __VA_ARGS__); } while(0)
 
 class TypeResolve
@@ -58,6 +58,10 @@ public:
     const ::HIR::TypeRef&   m_ret_type;
     const args_t&    m_args;
     const ::MIR::Function&  m_fcn;
+
+    // If set, these override the list in `m_fcn`
+    const ::HIR::TypeRef*   m_monomorphed_rettype;
+    const ::std::vector<::HIR::TypeRef>*    m_monomorphed_locals;
 private:
     const ::HIR::SimplePath*    m_lang_Box = nullptr;
 
@@ -73,6 +77,8 @@ public:
         m_ret_type(ret_type),
         m_args(args),
         m_fcn(fcn)
+        , m_monomorphed_rettype(nullptr)
+        , m_monomorphed_locals(nullptr)
     {
         if( m_crate.m_lang_items.count("owned_box") > 0 ) {
             m_lang_Box = &m_crate.m_lang_items.at("owned_box");
@@ -131,6 +137,16 @@ public:
 
     bool lvalue_is_copy(const ::MIR::LValue& val) const;
     const ::HIR::TypeRef* is_type_owned_box(const ::HIR::TypeRef& ty) const;
+
+    /// @brief Handler for the `offset_of` intrinsic
+    /// @param ty Type
+    /// @param params Field names (must be Const::String)
+    /// @return Offset in bytes
+    size_t intrinsic_offset_of(const ::HIR::TypeRef& ty, const ::std::vector<MIR::Param>& params) const;
+    /// @brief Handler for the `type_name` intrinsic, strips out mrustc's helper comments
+    /// @param ty Type
+    /// @return Clean string form of the type
+    std::string intrinsic_type_name(const ::HIR::TypeRef& ty) const;
 
     friend ::std::ostream& operator<<(::std::ostream& os, const TypeResolve& x) {
         x.fmt_pos(os);
@@ -329,7 +345,11 @@ namespace visit {
                 }
             TU_ARMA (MakeDst, se) {
                 rv |= visit_param(se.ptr_val, ValUsage::Move);
-                rv |= visit_param(se.meta_val, ValUsage::Move);
+                if( TU_TEST2(se.meta_val, Constant, ,ItemAddr, .get() == nullptr) ) {
+                }
+                else {
+                    rv |= visit_param(se.meta_val, ValUsage::Move);
+                }
                 }
             TU_ARMA(Tuple, se) {
                 for(auto& v : se.vals)
@@ -339,9 +359,14 @@ namespace visit {
                 for(auto& v : se.vals)
                     rv |= visit_param(v, ValUsage::Move);
                 }
-            TU_ARMA(Variant, se) {
+            TU_ARMA(UnionVariant, se) {
                 visit_genericpath(se.path);
                 rv |= visit_param(se.val, ValUsage::Move);
+                }
+            TU_ARMA(EnumVariant, se) {
+                visit_genericpath(se.path);
+                for(auto& v : se.vals)
+                    rv |= visit_param(v, ValUsage::Move);
                 }
             TU_ARMA(Struct, se) {
                 visit_genericpath(se.path);
@@ -365,7 +390,30 @@ namespace visit {
                 for(auto& v : e.outputs)
                     rv |= visit_lvalue(v.second, ValUsage::Write);
                 }
+            TU_ARMA(Asm2, e) {
+                for(auto& p : e.params)
+                {
+                    TU_MATCH_HDRA( (p), { )
+                    TU_ARMA(Const, v)
+                        rv |= visit_const(v);
+                    TU_ARMA(Sym, v)
+                        /*rv |= */visit_path(v);
+                    TU_ARMA(Reg, v) {
+                        if(v.input)
+                            rv |= visit_param(*v.input, ValUsage::Read);
+                        if(v.output)
+                            rv |= visit_lvalue(*v.output, ValUsage::Write);
+                        }
+                    }
+                }
+                }
             TU_ARMA(SetDropFlag, e) {
+                }
+            TU_ARMA(SaveDropFlag, e) {
+                rv |= visit_lvalue(e.slot, ValUsage::Write);
+                }
+            TU_ARMA(LoadDropFlag, e) {
+                rv |= visit_lvalue(e.slot, ValUsage::Read);
                 }
             TU_ARMA(Drop, e) {
                 rv |= visit_lvalue(e.slot, ValUsage::Move);
@@ -398,8 +446,8 @@ namespace visit {
                 }
             TU_ARMA(If, e) {
                 rv |= visit_lvalue(e.cond, ValUsage::Read);
-                rv |= visit_block_id(e.bb0);
-                rv |= visit_block_id(e.bb1);
+                rv |= visit_block_id(e.bb_true);
+                rv |= visit_block_id(e.bb_false);
                 }
             TU_ARMA(Switch, e) {
                 rv |= visit_lvalue(e.val, ValUsage::Read);

@@ -48,7 +48,7 @@ class Decorator_NoPrelude:
 public:
     AttrStage stage() const override { return AttrStage::Pre; }
 
-    void handle(const Span& sp, const AST::Attribute& mi, ::AST::Crate& crate, const AST::Path& path, AST::Module& mod, slice<const AST::Attribute> attrs, AST::Item&i) const override {
+    void handle(const Span& sp, const AST::Attribute& mi, ::AST::Crate& crate, const AST::AbsolutePath& path, AST::Module&, size_t, slice<const AST::Attribute> attrs, const AST::Visibility& vis, AST::Item&i) const override {
         if( i.is_Module() ) {
             i.as_Module().m_insert_prelude = false;
         }
@@ -62,13 +62,14 @@ class Decorator_PreludeImport:
     public ExpandDecorator
 {
 public:
-    AttrStage stage() const override { return AttrStage::Post; }
+    AttrStage stage() const override { return AttrStage::Pre; }
 
-    void handle(const Span& sp, const AST::Attribute& mi, ::AST::Crate& crate, const AST::Path& path, AST::Module& mod, slice<const AST::Attribute> attrs, AST::Item&i) const override {
+    void handle(const Span& sp, const AST::Attribute& mi, ::AST::Crate& crate, const AST::AbsolutePath& path, AST::Module& , size_t , slice<const AST::Attribute> attrs, const AST::Visibility& vis, AST::Item&i) const override {
         if( const auto* e = i.opt_Use() ) {
             if(e->entries.size() != 1)
                 ERROR(sp, E0000, "#[prelude_import] should be on a single-entry use");
-            ASSERT_BUG(sp, path.nodes().back().name() == "", path);
+            ASSERT_BUG(sp, path.nodes.size() > 0, path);
+            ASSERT_BUG(sp, path.nodes.back() == "", path);
             if(e->entries.front().name != "")
                 ERROR(sp, E0000, "#[prelude_import] should be on a glob");
             const auto& p = e->entries.front().path;

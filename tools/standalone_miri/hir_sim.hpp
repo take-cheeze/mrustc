@@ -6,6 +6,7 @@
  * - Clones of the mrustc HIR types (HEADER)
  */
 #pragma once
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <memory>
@@ -51,6 +52,9 @@ enum class RawType
     Composite,  // Struct, Enum, Union, tuple, ...
     TraitObject,    // Data pointer is `*const ()`, vtable type stored in `composite_type`
 };
+static inline Ordering ord(RawType a, RawType b) {
+    return ord( int(a), int(b) );
+}
 struct TypeWrapper
 {
     enum class Ty
@@ -95,9 +99,21 @@ namespace HIR {
     struct GenericRef
     {
         // Should never be needed!
-        friend ::std::ostream& operator<<(::std::ostream& os, const GenericRef& x) {
+        friend ::std::ostream& operator<<(::std::ostream& os, const GenericRef& ) {
             return os << "GenericRef";
         }
+    };
+    struct ArraySize {
+        unsigned    count;
+        friend ::std::ostream& operator<<(::std::ostream& os, const ArraySize& x) {
+            return os << x.count;
+        }
+        Ordering ord(const ArraySize& x) const {
+            return ::ord(count, x.count);
+        }
+        bool operator<(const ArraySize& o) const { return count < o.count; }
+        bool operator==(const ArraySize& o) const { return count == o.count; }
+        bool operator!=(const ArraySize& o) const { return count != o.count; }
     };
 
     /// Definition of a type
@@ -229,6 +245,20 @@ namespace HIR {
         ::std::vector<TypeRef>  tys;
 
         friend ::std::ostream& operator<<(::std::ostream& os, const PathParams& x);
+
+        Ordering ord(const PathParams& x) const {
+            __ORD(tys);
+            return OrdEqual;
+        }
+        bool operator==(const PathParams& x) const {
+            return this->ord(x) == OrdEqual;
+        }
+        bool operator!=(const PathParams& x) const {
+            return this->ord(x) != OrdEqual;
+        }
+        bool operator<(const PathParams& x) const {
+            return this->ord(x) == OrdLess;
+        }
     };
 
     struct Path {
@@ -238,6 +268,8 @@ namespace HIR {
             return ::ord(n, x.n);
         }
 
+        bool operator==(const Path& p) const { return ord(p) == OrdEqual; }
+        bool operator!=(const Path& p) const { return ord(p) != OrdEqual; }
         friend ::std::ostream& operator<<(::std::ostream& os, const Path& x){
             return os << x.n;
         }
@@ -245,6 +277,11 @@ namespace HIR {
     struct GenericPath {
         RcString    n;
 
+        Ordering ord(const GenericPath& x) const {
+            return ::ord(n, x.n);
+        }
+        bool operator==(const GenericPath& p) const { return ord(p) == OrdEqual; }
+        bool operator!=(const GenericPath& p) const { return ord(p) != OrdEqual; }
         friend ::std::ostream& operator<<(::std::ostream& os, const GenericPath& x){
             return os << x.n;
         }

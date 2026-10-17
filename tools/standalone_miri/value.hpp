@@ -24,20 +24,36 @@ class Allocation;
 struct Value;
 struct ValueRef;
 
-struct FfiLayout
+struct FfiPointerInner
 {
     struct Range {
         size_t  len;
         bool    is_valid;
         bool    is_writable;
     };
-    ::std::vector<Range>    ranges;
 
-    static FfiLayout new_const_bytes(size_t s);
+    // FFI pointers require the following:
+    // - A tag indicating where they're valid/from
+    // - A data format (e.g. size of allocation, internal data format)
+    //   - If the data format is unspecified (null) then it's a void pointer
+    // - An actual pointer
+    // TODO: Add extra metadata
+
+    // Pointer value, returned by the FFI
+    void*   ptr_value;
+    // Tag name, used for validity checking by FFI hooks
+    const char* tag_name;
+
+    ::std::vector<Range>    layout;
+
+    void release() {
+        ptr_value = nullptr;
+        tag_name = "#released";
+    }
 
     size_t get_size() const {
         size_t rv = 0;
-        for(const auto& r : ranges)
+        for(const auto& r : layout)
             rv += r.len;
         return rv;
     }
@@ -45,28 +61,24 @@ struct FfiLayout
 };
 struct FFIPointer
 {
-    // FFI pointers require the following:
-    // - A tag indicating where they're valid/from
-    // - A data format (e.g. size of allocation, internal data format)
-    //   - If the data format is unspecified (null) then it's a void pointer
-    // - An actual pointer
+    ::std::shared_ptr<FfiPointerInner>    inner;
 
-    // Pointer value, returned by the FFI
-    void*   ptr_value;
-    // Tag name, used for validty checking by FFI hooks
-    const char* tag_name;
-    ::std::shared_ptr<FfiLayout>    layout;
+    const char* tag_name() const { return inner->tag_name; }
+    void* ptr_value() const { return inner->ptr_value; }
+    size_t get_size() const { return inner->get_size(); }
+    bool is_valid_read(size_t o, size_t s) const {
+        return inner->is_valid_read(o,s);
+    }
+    void release() {
+        inner->release();
+    }
 
     static FFIPointer new_void(const char* name, const void* v) {
-        return FFIPointer { const_cast<void*>(v), name, ::std::make_shared<FfiLayout>() };
+        return FFIPointer{ ::std::make_shared<FfiPointerInner>(FfiPointerInner{ const_cast<void*>(v), name, {} }) };
     }
     static FFIPointer new_const_bytes(const char* name, const void* s, size_t size) {
-        return FFIPointer { const_cast<void*>(s), name, ::std::make_shared<FfiLayout>(FfiLayout::new_const_bytes(size)) };
+        return FFIPointer{ ::std::make_shared<FfiPointerInner>(FfiPointerInner{ const_cast<void*>(s), name, { FfiPointerInner::Range { size, true, false } }}) };
     };
-
-    size_t get_size() const {
-        return (layout ? layout->get_size() : 0);
-    }
 };
 
 class AllocationHandle
@@ -103,7 +115,6 @@ public:
           Allocation* operator->()       { assert(m_ptr); return m_ptr; }
 };
 
-// TODO: Split into RelocationPtr and AllocationHandle
 class RelocationPtr
 {
     void* m_ptr;
@@ -136,7 +147,19 @@ public:
         return *this;
     }
 
+    bool operator==(const RelocationPtr& x) const {
+        return m_ptr == x.m_ptr;
+    }
+    bool operator!=(const RelocationPtr& x) const {
+        return !(*this == x);
+    }
+    bool operator<(const RelocationPtr& x) const {
+        // HACK: Just compare the pointers (won't be predictable... but should be stable)
+        return m_ptr < x.m_ptr;
+    }
+
     size_t get_size() const;
+    size_t get_base() const;
 
     operator bool() const { return m_ptr != 0; }
     bool is_alloc() const {
@@ -162,11 +185,17 @@ public:
         assert(get_ty() == Ty::StdString);
         return *static_cast<const ::std::string*>(get_ptr());
     }
+    FFIPointer& ffi() {
+        assert(*this);
+        assert(get_ty() == Ty::FfiPointer);
+        return *static_cast<FFIPointer*>(get_ptr());
+    }
     const FFIPointer& ffi() const {
         assert(*this);
         assert(get_ty() == Ty::FfiPointer);
         return *static_cast<const FFIPointer*>(get_ptr());
     }
+
 
     Ty get_ty() const {
         return static_cast<Ty>( reinterpret_cast<uintptr_t>(m_ptr) & 3 );
@@ -210,6 +239,23 @@ struct ValueCommonRead
     /// De-reference a pointer (of target type `ty`) at the given offset, and return a reference to it
     ValueRef deref(size_t ofs, const ::HIR::TypeRef& ty);
 
+    bool read_ptr_ofs(size_t ofs, size_t& v, RelocationPtr& reloc) const {
+        reloc = get_relocation(ofs);
+        v = read_usize(ofs);
+        if(reloc)
+        {
+            auto base = reloc.get_base();
+            //auto size = reloc.get_size();
+            if(v < base)
+                return false;
+            v -= base;
+            // TODO: Check size?
+        }
+        return true;
+    }
+
+    /// Read a pointer that should be a function pointer
+    const ::HIR::Path& read_pointer_fcn(size_t rd_ofs) const;
     /// Read a pointer that must be FFI with the specified tag (or NULL)
     void* read_pointer_tagged_null(size_t rd_ofs, const char* tag) const;
     /// Read a pointer that must be FFI with the specified tag (cannot be NULL)
@@ -242,6 +288,8 @@ struct ValueCommonWrite:
     public ValueCommonRead
 {
     virtual void write_bytes(size_t ofs, const void* src, size_t count) = 0;
+    //virtual void mark_bytes_valid(size_t ofs, size_t count) = 0;
+    //virtual uint8_t* data_ptr(size_t ofs, size_t count) = 0;
 
     void write_u8 (size_t ofs, uint8_t  v) { write_bytes(ofs, &v, 1); }
     void write_u16(size_t ofs, uint16_t v) { write_bytes(ofs, &v, 2); }
@@ -258,6 +306,10 @@ struct ValueCommonWrite:
     void write_usize(size_t ofs, uint64_t v);
     void write_isize(size_t ofs, int64_t v) { write_usize(ofs, static_cast<uint64_t>(v)); }
     virtual void write_ptr(size_t ofs, size_t ptr_ofs, RelocationPtr reloc) = 0;
+    void write_ptr_ofs(size_t ofs, size_t ptr_ofs, RelocationPtr reloc) {
+        ptr_ofs += reloc.get_base();
+        write_ptr(ofs, ptr_ofs, std::move(reloc));
+    }
 };
 
 class Allocation:
@@ -281,9 +333,6 @@ public:
 public:
     virtual ~Allocation() {}
     static AllocationHandle new_alloc(size_t size, ::std::string tag);
-
-    // NOTE: This should match the value in the MMIR backend
-    static const size_t PTR_BASE = 0x1000;
 
     const uint8_t* data_ptr() const { return reinterpret_cast<const uint8_t*>(this->m_data.data()); }
           uint8_t* data_ptr()       { return reinterpret_cast<      uint8_t*>(this->m_data.data()); }
@@ -321,7 +370,7 @@ public:
 };
 extern ::std::ostream& operator<<(::std::ostream& os, const Allocation& x);
 
-// TODO: Rename to be `StackSlot`
+// TODO: Rename to be `StackSlot`?
 struct Value:
     public ValueCommonWrite
 {
@@ -366,14 +415,14 @@ struct Value:
                 direct.~Direct();
             }
         }
-        Inner(const Inner& x) {
-            if(x.is_alloc) {
-                new(&this->alloc) Alloc(x.alloc);
-            }
-            else {
-                new(&this->direct) Direct(x.direct);
-            }
-        }
+        //Inner(const Inner& x) {
+        //    if(x.is_alloc) {
+        //        new(&this->alloc) Alloc(x.alloc);
+        //    }
+        //    else {
+        //        new(&this->direct) Direct(x.direct);
+        //    }
+        //}
         Inner(Inner&& x) {
             if(x.is_alloc) {
                 new(&this->alloc) Alloc(::std::move(x.alloc));
@@ -384,23 +433,22 @@ struct Value:
         }
         Inner& operator=(Inner&& x) {
             this->~Inner();
-            new(this) Inner(x);
+            new(this) Inner(std::move(x));
             return *this;
         }
-        Inner& operator=(const Inner& x) {
-            this->~Inner();
-            new(this) Inner(x);
-            return *this;
-        }
+        //Inner& operator=(const Inner& x) {
+        //    this->~Inner();
+        //    new(this) Inner(x);
+        //    return *this;
+        //}
     } m_inner;
 
 public:
     Value();
     Value(::HIR::TypeRef ty);
-    ~Value() {
-    }
+    ~Value();
 
-    Value(const Value&) = default;
+    Value(const Value&) = delete;
     Value(Value&&) = default;
     Value& operator=(const Value& x) = delete;
     Value& operator=(Value&& x) = default;
@@ -408,6 +456,7 @@ public:
     static Value with_size(size_t size, bool have_allocation);
     static Value new_fnptr(const ::HIR::Path& fn_path);
     static Value new_ffiptr(FFIPointer ffi);
+    static Value new_pointer_ofs(::HIR::TypeRef ty, uint64_t ofs, RelocationPtr r);
     static Value new_pointer(::HIR::TypeRef ty, uint64_t v, RelocationPtr r);
     static Value new_usize(uint64_t v);
     static Value new_isize(int64_t v);
@@ -417,14 +466,14 @@ public:
 
     AllocationHandle borrow(::std::string loc) {
         if( !m_inner.is_alloc )
-            create_allocation(/*loc*/);
+            create_allocation(loc);
         return m_inner.alloc.alloc;
     }
     void ensure_allocation() {
         if( !m_inner.is_alloc )
-            create_allocation();
+            create_allocation("ensure_allocation");
     }
-    void create_allocation();
+    void create_allocation(std::string loc);
     size_t size() const { return m_inner.is_alloc ? m_inner.alloc.alloc->size() : m_inner.direct.size; }
     const uint8_t* data_ptr() const { return m_inner.is_alloc ? m_inner.alloc.alloc->data_ptr() : m_inner.direct.data; }
           uint8_t* data_ptr()       { return m_inner.is_alloc ? m_inner.alloc.alloc->data_ptr() : m_inner.direct.data; }
@@ -454,7 +503,7 @@ public:
         }
         else
         {
-            this->create_allocation();
+            this->create_allocation("set_reloc");
             assert( m_inner.is_alloc );
             m_inner.alloc.alloc->set_reloc(ofs, size, ::std::move(p));
         }
@@ -473,6 +522,8 @@ public:
 };
 extern ::std::ostream& operator<<(::std::ostream& os, const Value& v);
 
+class ValueRefW;
+
 // A read-only reference to a value (to write, you have to go through it)
 struct ValueRef:
     public ValueCommonRead
@@ -482,6 +533,7 @@ struct ValueRef:
     Value*  m_value;
     size_t  m_offset;   // Offset within the value
     size_t  m_size; // Size in bytes of the referenced value
+    /// Fat pointer metadata for a hidden reference
     ::std::shared_ptr<Value>    m_metadata;
 
     static bool in_bounds(size_t ofs, size_t size, size_t max_size) {
@@ -524,7 +576,7 @@ struct ValueRef:
                 }
                 break;
             case RelocationPtr::Ty::Function:
-                LOG_TODO("");
+                LOG_TODO("Read from a function?");
             }
         }
     }
@@ -578,28 +630,7 @@ struct ValueRef:
         }
     }
 
-    // TODO: Remove these two (move to a helper?)
-    uint8_t* data_ptr_mut() {
-        if( m_alloc ) {
-            switch(m_alloc.get_ty())
-            {
-            case RelocationPtr::Ty::Allocation:
-                return m_alloc.alloc().data_ptr() + m_offset;
-                break;
-            default:
-                LOG_TODO("");
-            }
-        }
-        else if( m_value ) {
-            return m_value->data_ptr() + m_offset;
-        }
-        else {
-            return nullptr;
-        }
-    }
-    void mark_bytes_valid(size_t ofs, size_t size);
-
-    void read_bytes(size_t ofs, void* dst, size_t size) const {
+    void read_bytes(size_t ofs, void* dst, size_t size) const override {
         if( size == 0 )
             return ;
         LOG_ASSERT(in_bounds(ofs, size, m_size), "read_bytes(" << ofs << "+" << size << " > " << m_size <<")");
@@ -613,9 +644,13 @@ struct ValueRef:
                 assert(m_offset+ofs <= m_alloc.str().size() && size <= m_alloc.str().size() && m_offset+ofs+size <= m_alloc.str().size());
                 ::std::memcpy(dst, m_alloc.str().data() + m_offset + ofs, size);
                 break;
+            case RelocationPtr::Ty::FfiPointer:
+                assert( m_alloc.ffi().is_valid_read(m_offset + ofs, size) );
+                ::std::memcpy(dst, (const char*)m_alloc.ffi().ptr_value() + m_offset + ofs, size);
+                break;
             default:
                 //ASSERT_BUG(m_alloc.is_alloc(), "read_value on non-data backed Value - " << );
-                LOG_TODO("");
+                LOG_TODO("read_bytes from other alloc type");
             }
         }
         else {
@@ -646,9 +681,77 @@ struct ValueRef:
     }
 
     bool compare(size_t offset, const void* other, size_t other_len) const;
+
+    ValueRefW   to_write();
 };
 extern ::std::ostream& operator<<(::std::ostream& os, const ValueRef& v);
-//struct ValueRefMut:
-//    public ValueCommonWrite
-//{
-//};
+
+class ValueRefW:
+    public ValueCommonWrite
+{
+    ValueRef    m_inner;
+public:
+    ValueRefW(ValueRef inner)
+        : m_inner(std::move(inner))
+    {
+    }
+    RelocationPtr get_relocation(size_t ofs) const override {
+        return m_inner.get_relocation(ofs);
+    }
+    void read_bytes(size_t ofs, void* dst, size_t size) const override {
+        m_inner.read_bytes(ofs, dst, size);
+    }
+    void write_bytes(size_t ofs, const void* src, size_t size) override {
+        if( size == 0 )
+            return ;
+        LOG_ASSERT(ValueRef::in_bounds(ofs, size, m_inner.m_size), "read_bytes(" << ofs << "+" << size << " > " << m_inner.m_size <<")");
+        get_inner_w().write_bytes(m_inner.m_offset + ofs, src, size);
+    }
+    void write_ptr(size_t ofs, size_t ptr_ofs, RelocationPtr reloc) override;
+
+    void write_value(size_t ofs, Value v);
+
+    uint8_t* data_ptr_mut(size_t size) {
+        LOG_ASSERT(ValueRef::in_bounds(0, size, m_inner.m_size), "data_ptr_mut(" << 0 << "+" << size << " > " << m_inner.m_size <<")");
+        if( m_inner.m_alloc ) {
+            switch(m_inner.m_alloc.get_ty())
+            {
+            case RelocationPtr::Ty::Allocation:
+                return m_inner.m_alloc.alloc().data_ptr() + m_inner.m_offset;
+            default:
+                LOG_TODO("");
+            }
+        }
+        else if( m_inner.m_value ) {
+            return m_inner.m_value->data_ptr() + m_inner.m_offset;
+        }
+        else {
+            return nullptr;
+        }
+    }
+    void mark_bytes_valid(size_t ofs, size_t size);
+
+    friend ::std::ostream& operator<<(::std::ostream& os, const ValueRefW& v) {
+        return os << v.m_inner;
+    }
+
+private:
+    ValueCommonWrite& get_inner_w() {
+        if( m_inner.m_alloc ) {
+            switch(m_inner.m_alloc.get_ty())
+            {
+            case RelocationPtr::Ty::Allocation:
+                return m_inner.m_alloc.alloc();
+                break;
+            case RelocationPtr::Ty::StdString:
+                LOG_BUG("write on std::string backed value");
+                break;
+            default:
+                LOG_TODO("write on unkown - " << m_inner.m_alloc);
+            }
+        }
+        else {
+            return *m_inner.m_value;
+        }
+    }
+};

@@ -24,19 +24,58 @@ bool Token::operator==(const char* s) const
     return (this->type == TokenClass::Ident || this->type == TokenClass::Symbol) && this->strval == s;
 }
 
-uint64_t Token::integer() const
+uint64_t Token::integer_64(const Lexer& l) const
 {
-    if( this->type != TokenClass::Integer )
-        throw ::std::runtime_error(FMT_STRING("Expected interger, got " << *this));
+    if( this->type != TokenClass::Integer || !this->numbers.int_val.is_u64() ) {
+        ::std::cerr << l << "Syntax error: Expected [integer:64] - got " << *this << ::std::endl;
+        throw "ERROR";
+    }
+    return this->numbers.int_val.truncate_u64();
+}
+U128 Token::integer_128(const Lexer& l) const
+{
+    if( this->type != TokenClass::Integer ) {
+        ::std::cerr << l << "Syntax error: Expected [integer] - got " << *this << ::std::endl;
+        throw "ERROR";
+    }
     return this->numbers.int_val;
 }
-double Token::real() const
+double Token::real(const Lexer& l) const
 {
-    if( this->type != TokenClass::Real )
-        throw "";
+    if( this->type != TokenClass::Real ) {
+        ::std::cerr << l << "Syntax error: Expected [real] - got " << *this << ::std::endl;
+        throw "ERROR";
+    }
     return this->numbers.real_val;
 }
 
+namespace {
+    void dump_escaped(::std::ostream& os, const std::string& s) {
+        os << std::hex;
+        for(auto ch_s : s)
+        {
+            uint8_t ch = ch_s;
+            switch(ch)
+            {
+            case '\\':  os << "\\\\";   break;
+            case '\"':  os << "\\\"";   break;
+            case '\'':  os << "\\\'";   break;
+            default:
+                if(' ' <= ch && ch < 0x7F) {
+                    os << ch;
+                }
+                else if( ch < 16 ) {
+                    os << "\\x0" << int(ch);
+                }
+                else {
+                    os << "\\x" << int(ch);
+                }
+                break;
+            }
+        }
+        os << std::dec;
+    }
+}
 ::std::ostream& operator<<(::std::ostream& os, const Token& x)
 {
     switch(x.type)
@@ -57,7 +96,7 @@ double Token::real() const
         os << "Real(" << x.numbers.real_val << ")";
         break;
     case TokenClass::String:
-        os << "\"" << x.strval << "\"";
+        os << "\""; dump_escaped(os, x.strval); os << "\"";
         break;
     case TokenClass::ByteString:
         os << "b\"" << x.strval << "\"";
@@ -111,21 +150,21 @@ Token Lexer::consume()
 void Lexer::check(TokenClass tc)
 {
     if( next() != tc ) {
-        ::std::cerr << *this << "Syntax error: Expected token class #" << int(tc) << " - got '" << next().strval << "'" << ::std::endl;
+        ::std::cerr << *this << "Syntax error: Expected token class #" << int(tc) << " - got " << next() << ::std::endl;
         throw "ERROR";
     }
 }
 void Lexer::check(char ch)
 {
     if( next() != ch ) {
-        ::std::cerr << *this << "Syntax error: Expected '" << ch << "' - got '" << next().strval << "'" << ::std::endl;
+        ::std::cerr << *this << "Syntax error: Expected '" << ch << "' - got " << next() << ::std::endl;
         throw "ERROR";
     }
 }
 void Lexer::check(const char* s)
 {
     if( next() != s ) {
-        ::std::cerr << *this << "Syntax error: Expected '" << s << "' - got '" << next().strval << "'" << ::std::endl;
+        ::std::cerr << *this << "Syntax error: Expected '" << s << "' - got " << next() << ::std::endl;
         throw "ERROR";
     }
 }
@@ -149,10 +188,11 @@ void Lexer::advance()
         }
         if( ch == '/' )
         {
+            // Block comments '/*' with nesting support
             if( m_if.get() == '*' )
             {
                 unsigned level = 0;
-                while(1)
+                while(ch >= 0)
                 {
                     ch = m_if.get();
                     if( ch == '\n' )
@@ -179,6 +219,17 @@ void Lexer::advance()
                 }
 
                 continue ;
+            }
+            else {
+                m_if.unget();
+            }
+            // Line comments - '//' and consume until newline
+            if( m_if.get() == '/' ) {
+                while( ch >= 0 && ch != '\n' ) {
+                    ch = m_if.get();
+                }
+                m_cur_line += 1;
+                continue;
             }
             else {
                 m_if.unget();
@@ -248,7 +299,7 @@ void Lexer::advance()
                 if( !::std::isxdigit(ch) )
                     throw "ERROR";
 
-                uint64_t    rv = 0;
+                U128    rv(0);
                 while(::std::isxdigit(ch))
                 {
                     rv *= 16;
@@ -340,7 +391,7 @@ void Lexer::advance()
             }
         }
 
-        uint64_t    rv = 0;
+        U128    rv(0);
         while(::std::isdigit(ch))
         {
             rv *= 10;
@@ -482,6 +533,7 @@ void Lexer::advance()
                         throw "";
                     ch = m_if.get();
                 } while(ch != '}');
+                assert(ch == '}');
 
                 if( v < 0x80 ) {
                     val.push_back(static_cast<char>(v));

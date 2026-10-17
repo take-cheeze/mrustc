@@ -18,6 +18,7 @@
 // 0xFE indicates start of an unnamed object
 // 0xFF indicates end of an object
 
+#include <int128.h>
 #include <vector>
 #include <string>
 #include <map>
@@ -108,6 +109,13 @@ public:
         va |= (sign ? 1 : 0);
         write_u64c(va);
     }
+    void write_u128(U128 v) {
+        write_u64(v.get_lo());
+        write_u64(v.get_hi());
+    }
+    void write_i128(S128 v) {
+        write_u128(v.get_inner());
+    }
     void write_double(double v) {
         // - Just raw-writes the double
         this->write(&v, sizeof v);
@@ -118,21 +126,25 @@ public:
     }
     void write_count(size_t c) {
         DEBUG(c);
-        if(c < 0xFE) {
+        if(c < 0xFD) {
             write_u8( static_cast<uint8_t>(c) );
         }
         else if( c == ~0u ) {
             write_u8( 0xFF );
         }
-        else {
-            assert(c < (1u<<16));
-            write_u8( 0xFE );
+        else if( c < (1u << 16) ) {
+            write_u8( 0xFD );
             write_u16( static_cast<uint16_t>(c) );
+        }
+        else {
+            assert(c < (1u<<31));
+            write_u8( 0xFE );
+            write_u32( static_cast<uint32_t>(c) );
         }
     }
     void write_string(const RcString& v);
     void write_string(size_t len, const char* s) {
-        //DEBUG(FMT_CB(os, for(size_t i = 0; i < ));
+        TRACE_FUNCTION;
         if(len < 128) {
             write_u8( static_cast<uint8_t>(len) );
         }
@@ -147,6 +159,7 @@ public:
         write_string(v.size(), v.c_str());
     }
     void write_bool(bool v) {
+        TRACE_FUNCTION_F(v);
         write_u8(v ? 0xFF : 0x00);
     }
 
@@ -188,7 +201,7 @@ public:
         CloseOnDrop(Writer& r): r(&r) {}
     public:
         CloseOnDrop(CloseOnDrop&& x): r(x.r) { x.r = nullptr; }
-        ~CloseOnDrop(){ if(r) r->close_object(); }
+        ~CloseOnDrop(){ if(r) r->close_object(); r = nullptr; }
     };
     CloseOnDrop open_object(const char* name) {
         write_u8(0xFD);
@@ -274,6 +287,14 @@ public:
     int64_t read_i64() {
         return static_cast<int64_t>(read_u64());
     }
+    U128 read_u128() {
+        auto lo = read_u64();
+        auto hi = read_u64();
+        return U128(lo, hi);
+    }
+    S128 read_i128() {
+        return S128(read_u128());
+    }
     // Variable-length encoded u64 (for array sizes)
     uint64_t read_u64c() {
         auto v = read_u8();
@@ -324,11 +345,14 @@ public:
     size_t read_count() {
         size_t rv;
         auto v = read_u8();
-        if( v < 0xFE ) {
+        if( v < 0xFD ) {
             rv = v;
         }
-        else if( v == 0xFE ) {
+        else if( v == 0xFD ) {
             rv = read_u16( );
+        }
+        else if( v == 0xFE ) {
+            rv = read_u32( );
         }
         else /*if( v == 0xFF )*/ {
             rv = ~0u;
@@ -353,7 +377,15 @@ public:
         return rv;
     }
     bool read_bool() {
-        return read_u8() != 0x00;
+        auto v = read_u8();
+        switch(v)
+        {
+        case 0: return false;
+        case 255: return true;
+        default:
+            std::cerr << "Expected false(0)/true(255), got " << unsigned(v) << "u8" << ::std::endl;
+            abort();
+        }
     }
 
 
@@ -367,7 +399,7 @@ public:
         else {
             size_t len = v - 0xC0;
             uint64_t rv = 0;
-            for(int p = 0; p < len; p ++)
+            for(size_t p = 0; p < len; p ++)
             {
                 rv |= static_cast<uint64_t>(read_u8()) << (8*p);
             }
@@ -404,14 +436,15 @@ public:
         Reader* r;
         CloseOnDrop(Reader& r): r(&r) {}
     public:
+        CloseOnDrop(const CloseOnDrop&) = delete;
         CloseOnDrop(CloseOnDrop&& x): r(x.r) { x.r = nullptr; }
-        ~CloseOnDrop(){ if(r) r->close_object(); }
+        ~CloseOnDrop(){ if(r) r->close_object(); r = nullptr; }
     };
 
     CloseOnDrop open_object(const char* name) {
         auto v = read_u8();
         if( v != 0xFD ) {
-            std::cerr << "Expected OpenNamed(" << name << "), got " << unsigned(v) << ::std::endl;
+            std::cerr << "Expected OpenNamed(" << name << "), got " << unsigned(v) << "u8" << ::std::endl;
             abort();
         }
         auto key = raw_read_uint();
@@ -421,7 +454,10 @@ public:
         }
         assert(key < m_objname_cache.size());
         //std::cout << key << " = " << m_objname_cache[key] << std::endl;
-        assert(m_objname_cache[key] == name);
+        if( m_objname_cache[key] != name ) {
+            std::cerr << "Expecting OpenNamed(" << name << "), got OpenNamed(" << m_objname_cache[key] << ")" << std::endl;
+            abort();
+        }
         return CloseOnDrop(*this);
     }
     CloseOnDrop open_anon_object() {
@@ -433,7 +469,11 @@ public:
         return CloseOnDrop(*this);
     }
     void close_object() {
-        assert(read_u8() == 0xFF);
+        auto v = read_u8();
+        if( v != 0xFF ) {
+            std::cerr << "Expected CloseObject(0xFF), got " << unsigned(v) << ::std::endl;
+            abort();
+        }
     }
 };
 

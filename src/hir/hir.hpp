@@ -9,6 +9,7 @@
  */
 #pragma once
 #include <target_version.hpp>
+#include <int128.h>
 
 #include <cassert>
 #include <unordered_map>
@@ -17,6 +18,7 @@
 
 #include <tagged_union.hpp>
 
+#include <ast/edition.hpp>
 #include <macro_rules/macro_rules_ptr.hpp>
 
 #include <hir/type.hpp>
@@ -25,9 +27,11 @@
 #include <hir/expr_ptr.hpp>
 #include <hir/generic_params.hpp>
 #include <hir/crate_ptr.hpp>
+#include <hir/encoded_literal.hpp>
+#include <hir/inherent_cache.hpp>
+#include <hir/asm.hpp>
 
-#define ABI_RUST    "Rust"
-#define CRATE_BUILTINS  "#builtins" // used for macro re-exports of builtins
+class Monomorphiser;
 
 namespace HIR {
 
@@ -61,7 +65,12 @@ public:
         return Publicity(none_path);
     }
     static Publicity new_priv(::HIR::SimplePath p) {
-        return Publicity(::std::make_shared<HIR::SimplePath>(::std::move(p)));
+        size_t n_comp = p.components().size();
+        while(n_comp > 0 && p.components()[n_comp-1].c_str()[0] == '#' ) {
+            n_comp --;
+        }
+        auto s = std::span<const RcString>(p.components().data(), n_comp);
+        return Publicity(::std::make_shared<HIR::SimplePath>(p.crate_name(), s));
     }
 
     bool is_global() const {
@@ -96,6 +105,7 @@ struct Linkage
         Auto,   // Default
         Weak,   // Weak linkage (multiple definitions are allowed
         External, // Force the symbol to be externally visible
+        ExternWeak,   // A reference to a weak symbol
     };
 
     // Linkage type
@@ -103,18 +113,36 @@ struct Linkage
 
     // External symbol name
     ::std::string   name;
+    // Target section
+    ::std::string   section;
 };
 
 class Static
 {
 public:
+    // NOTE: The generics can't influence the value of this `const`
+    GenericParams   m_params;
+
     Linkage m_linkage;
     bool    m_is_mut;
     TypeRef m_type;
 
     ExprPtr m_value;
 
-    Literal   m_value_res;
+    EncodedLiteral  m_value_res;
+    bool    m_value_generated = false;
+    bool    m_save_literal = false;
+    bool    m_no_emit_value = false;
+
+    mutable ::std::map< ::HIR::Path, EncodedLiteral>   m_monomorph_cache;
+
+    Static(Linkage linkage, bool is_mut, TypeRef type, ExprPtr value)
+        : m_linkage( std::move(linkage) )
+        , m_is_mut(is_mut)
+        , m_type( std::move(type) )
+        , m_value( std::move(value) )
+    {
+    }
 };
 class Constant
 {
@@ -124,10 +152,25 @@ public:
 
     TypeRef m_type;
     ExprPtr m_value;
-    Literal   m_value_res;
+
+    EncodedLiteral  m_value_res;
+    enum class ValueState {
+        Unknown,
+        Generic,
+        Known
+    } m_value_state = ValueState::Unknown;
 
     // A cache of monomorphised versions when the `const` depends on generics for its value
-    mutable ::std::map< ::HIR::Path, Literal>   m_monomorph_cache;
+    // TODO: Wait, how?
+    mutable ::std::map< ::HIR::Path, EncodedLiteral>   m_monomorph_cache;
+
+    Constant() {}
+    Constant(GenericParams params, TypeRef type, ExprPtr value)
+        :m_params(::std::move(params))
+        ,m_type(::std::move(type))
+        ,m_value(::std::move(value))
+    {
+    }
 };
 class Function
 {
@@ -146,23 +189,49 @@ public:
 
     typedef ::std::vector< ::std::pair< ::HIR::Pattern, ::HIR::TypeRef> >   args_t;
 
-    bool    m_save_code;    // Filled by enumerate, defaults to false
+    bool    m_save_code = false;    // Filled by enumerate, defaults to false
     Linkage m_linkage;
 
-    Receiver    m_receiver;
-    ::std::string   m_abi;
-    bool    m_unsafe;
-    bool    m_const;
+    Receiver    m_receiver = Receiver::Free;
+    HIR::TypeRef    m_receiver_type;    // Receiver type for when a custom
+    RcString   m_abi = RcString::new_interned(ABI_RUST);
+    bool    m_unsafe = false;
+    bool    m_const = false;
 
     GenericParams   m_params;
 
     args_t  m_args;
-    bool    m_variadic;
+    bool    m_variadic = false;
     TypeRef m_return;
 
     ExprPtr m_code;
 
-    //::HIR::TypeRef make_ty(const Span& sp, const ::HIR::PathParams& params) const;
+    struct Markings {
+        std::vector<unsigned> rustc_legacy_const_generics;
+        bool track_caller = false;
+        bool is_naked = false;
+        enum Inline {
+            Auto,   // no annotation
+            Never,  // #[inline(never)]
+            Normal, // #[inline]
+            Always  // #[inline(always)]
+        } inline_type = Inline::Auto;
+    } m_markings;
+
+    Function()
+    {
+    }
+    Function(Receiver receiver, GenericParams params, args_t args, TypeRef ret_ty, ExprPtr code)
+        : m_receiver(receiver)
+        , m_params(std::move(params))
+        , m_args(std::move(args))
+        , m_variadic(false)
+        , m_return(std::move(ret_ty))
+        , m_code(std::move(code))
+    {
+    }
+
+    ::HIR::TypeRef make_ptr_ty(const Span& sp, const Monomorphiser& ms) const;
 };
 
 // --------------------------------------------------------------------
@@ -173,9 +242,23 @@ struct TypeAlias
     GenericParams   m_params;
     ::HIR::TypeRef  m_type;
 };
+struct TraitAlias
+{
+    GenericParams   m_params;
+    ::std::vector< ::HIR::TraitPath>    m_traits;
+};
 
 typedef ::std::vector< VisEnt<::HIR::TypeRef> > t_tuple_fields;
-typedef ::std::vector< ::std::pair< RcString, VisEnt<::HIR::TypeRef> > >   t_struct_fields;
+struct StructField {
+    RcString    name;
+    Publicity   vis;
+    HIR::TypeRef    ty;
+    /// @brief Default value for this field
+    ::std::unique_ptr<HIR::GenericPath> default_value;
+};
+typedef ::std::vector<StructField>   t_struct_fields;
+
+extern HIR::TypeRef fn_ptr_tuple_constructor(const Span& sp, const Monomorphiser& ms, HIR::TypeRef ret_ty, const t_tuple_fields& types);
 
 /// Cache of the state of various language traits on an enum/struct
 struct TraitMarkings
@@ -231,6 +314,10 @@ struct StructMarkings
 
     // #[rustc_nonnull_optimization_guaranteed]
     bool is_nonzero = false;
+
+    // #[rustc_layout_scalar_valid_range_end]
+    bool bounded_max = false;
+    U128    bounded_max_value;
 };
 
 class ExternType
@@ -247,12 +334,17 @@ public:
         RcString   name;
         bool is_struct; // Indicates that the variant does not show up in the value namespace
         ::HIR::TypeRef  type;
+
+        /// Optional explicit descriminant value, only valid when repr isn't Repr::Auto
+        ::HIR::ExprPtr  discriminant_expr;
+        // Constant-evaluated descriminant value
+        uint64_t discriminant_value;
     };
     enum class Repr
     {
-        Rust,
-        C,
+        Auto,
         Usize, U8, U16, U32, U64,
+        Isize, I8, I16, I32, I64,
     };
     struct ValueVariant {
         RcString   name;
@@ -263,13 +355,17 @@ public:
     TAGGED_UNION(Class, Data,
         (Data, ::std::vector<DataVariant>),
         (Value, struct {
-            Repr    repr;
             ::std::vector<ValueVariant> variants;
             })
         );
 
     GenericParams   m_params;
+    bool    m_is_c_repr;
+    Repr    m_tag_repr;
     Class   m_data;
+
+    // Flag indicating that constant evaluation has completed
+    bool    discriminants_evaluated;
 
     TraitMarkings   m_markings;
 
@@ -284,7 +380,7 @@ public:
     uint32_t get_value(size_t variant) const;
 
     /// Get a type for the given repr value
-    static ::HIR::TypeRef   get_repr_type(Repr r);
+    static ::HIR::CoreType   get_repr_type(Repr r);
 };
 class Struct
 {
@@ -293,9 +389,7 @@ public:
     {
         Rust,
         C,
-        Packed,
         Simd,
-        Aligned,    // Alignment stored elsewhere
         Transparent,
     };
     TAGGED_UNION(Data, Unit,
@@ -303,6 +397,18 @@ public:
         (Tuple, t_tuple_fields),
         (Named, t_struct_fields)
         );
+    struct FieldDefault
+    {
+        size_t index;
+        HIR::ExprPtr    expr;
+        EncodedLiteral  value_res;
+        Constant::ValueState state = Constant::ValueState::Unknown;
+
+        FieldDefault(size_t index, HIR::ExprPtr v)
+            : index(index)
+            , expr(std::move(v))
+        {}
+    };
 
     Struct(GenericParams params, Repr repr, Data data)
         :m_params(mv$(params))
@@ -324,6 +430,7 @@ public:
     Repr    m_repr;
     Data    m_data;
     unsigned    m_forced_alignment = 0;
+    unsigned    m_max_field_alignment = 0;    // for packed
 
     TraitMarkings   m_markings;
     StructMarkings  m_struct_markings;
@@ -350,6 +457,7 @@ public:
 
 struct AssociatedType
 {
+    ::HIR::GenericParams    m_generics;
     bool    is_sized;
     LifetimeRef m_lifetime_bound;
     ::std::vector< ::HIR::TraitPath>    m_trait_bounds;
@@ -365,6 +473,7 @@ class Trait
 public:
     GenericParams   m_params;
     LifetimeRef m_lifetime;
+    // NOTE: Not serialised!
     ::std::vector< ::HIR::TraitPath >  m_parent_traits;
 
     bool    m_is_marker;    // aka OIBIT
@@ -373,9 +482,12 @@ public:
     ::std::unordered_map< RcString, TraitValueItem >   m_values;
 
     // Indexes into the vtable for each present method and value
+    // - TODO: Find an easier way of having this be `(GenericPath,RcString) -> unsigned`
     ::std::unordered_multimap< RcString, ::std::pair<unsigned int,::HIR::GenericPath> > m_value_indexes;
     // Indexes in the vtable parameter list for each associated type
     ::std::unordered_map< RcString, unsigned int > m_type_indexes;
+    /// Index of the first vtable entry for parent traits
+    unsigned m_vtable_parent_traits_start;
 
     // Flattend set of parent traits (monomorphised and associated types fixed)
     ::std::vector< ::HIR::TraitPath >  m_all_parent_traits;
@@ -387,12 +499,23 @@ public:
         m_lifetime( mv$(lifetime) ),
         m_parent_traits( mv$(parents) ),
         m_is_marker( false )
+        , m_vtable_parent_traits_start(0)
     {}
+
+    ::HIR::TypeRef get_vtable_type(const Span& sp, const ::HIR::Crate& crate, const ::HIR::TypeData::Data_TraitObject& te) const;
+    unsigned get_vtable_value_index(const HIR::GenericPath& trait_path, const RcString& name) const;
+    unsigned get_vtable_parent_index(const Span& sp, const HIR::PathParams& this_params, const HIR::GenericPath& trait_path) const;
+    ::std::pair<const ::HIR::AssociatedType*,const ::HIR::PathParams*> get_aty_def(const RcString& name) const;
 };
 
 class ProcMacro
 {
 public:
+    enum class Ty {
+        Function,
+        Derive,
+        Attribute,
+    } ty;
     // Name of the macro
     RcString   name;
     // Path to the handler
@@ -414,7 +537,7 @@ public:
     // Macros!
     ::std::unordered_map< RcString, ::std::unique_ptr<VisEnt<MacroItem>> > m_macro_items;
 
-    ::std::vector< ::std::pair<RcString, Static> >  m_inline_statics;
+    ::std::vector< ::std::pair<RcString, std::unique_ptr<Static>> >  m_inline_statics;
 
     Module() {}
     Module(const Module&) = delete;
@@ -429,6 +552,7 @@ TAGGED_UNION(TypeItem, Import,
     (Import, struct { ::HIR::SimplePath path; bool is_variant; unsigned int idx; }),
     (Module, Module),
     (TypeAlias, TypeAlias), // NOTE: These don't introduce new values
+    (TraitAlias, TraitAlias),
     (ExternType, ExternType),
     (Enum,      Enum),
     (Struct,    Struct),
@@ -471,7 +595,7 @@ public:
 
     bool matches_type(const ::HIR::TypeRef& tr, t_cb_resolve_type ty_res) const;
     bool matches_type(const ::HIR::TypeRef& tr) const {
-        return matches_type(tr, [](const auto& x)->const auto&{ return x; });
+        return matches_type(tr, ResolvePlaceholdersNop());
     }
 };
 
@@ -501,7 +625,7 @@ public:
 
     bool matches_type(const ::HIR::TypeRef& tr, t_cb_resolve_type ty_res) const;
     bool matches_type(const ::HIR::TypeRef& tr) const {
-        return matches_type(tr, [](const auto& x)->const auto&{ return x; });
+        return matches_type(tr, ResolvePlaceholdersNop());
     }
 
     bool more_specific_than(const TraitImpl& x) const;
@@ -520,8 +644,16 @@ public:
 
     bool matches_type(const ::HIR::TypeRef& tr, t_cb_resolve_type ty_res) const;
     bool matches_type(const ::HIR::TypeRef& tr) const {
-        return matches_type(tr, [](const auto& x)->const auto&{ return x; });
+        return matches_type(tr, ResolvePlaceholdersNop());
     }
+};
+
+class GlobalAssembly
+{
+public:
+    ::std::vector<AsmCommon::Line>  m_lines;
+    ::std::vector<HIR::Path>    m_symbols;
+    AsmCommon::Options  m_options;
 };
 
 class ExternCrate
@@ -540,13 +672,18 @@ class Crate
 {
 public:
     RcString   m_crate_name;
+    AST::Edition    m_edition;
 
     Module  m_root_module;
+
+    // Placeholder for types created during constant evaluation
+    mutable std::vector<std::pair<RcString, std::unique_ptr<VisEnt<TypeItem>> >>  m_new_types;
+    mutable std::vector<std::pair<RcString, std::unique_ptr<VisEnt<ValueItem>> >> m_new_values;
 
     template<typename T>
     struct ImplGroup
     {
-        typedef ::std::vector<::std::unique_ptr<T>> list_t;
+        typedef ::std::vector<T> list_t;
         ::std::map<::HIR::SimplePath, list_t>   named;
         list_t  non_named; // TODO: use a map of HIR::TypeRef::Data::Tag
         list_t  generic;
@@ -579,11 +716,22 @@ public:
     // - Named type (sorted on the path)
     // - Primitive types
     // - Unsorted (generics, and everything before outer type resolution)
-    ImplGroup<::HIR::TypeImpl>  m_type_impls;
+    ImplGroup<::std::unique_ptr<::HIR::TypeImpl>>  m_type_impls;
+
+    /// CACHE: Cache of all inherent (non-trait) methods (for faster lookup)
+    InherentCache   m_inherent_method_cache;
 
     /// Impl blocks
-    ::std::map< ::HIR::SimplePath, ImplGroup<::HIR::TraitImpl> > m_trait_impls;
-    ::std::map< ::HIR::SimplePath, ImplGroup<::HIR::MarkerImpl> > m_marker_impls;
+    ::std::map< ::HIR::SimplePath, ImplGroup<::std::unique_ptr<::HIR::TraitImpl>> > m_trait_impls;
+    ::std::map< ::HIR::SimplePath, ImplGroup<::std::unique_ptr<::HIR::MarkerImpl>> > m_marker_impls;
+
+    /// Global assembly items
+    ::std::vector< ::HIR::GlobalAssembly>   m_global_asm;
+
+    /// Merged index versions of the above
+    ImplGroup<const ::HIR::TypeImpl*>   m_all_type_impls;
+    ::std::map< ::HIR::SimplePath, ImplGroup<const ::HIR::TraitImpl*> > m_all_trait_impls;
+    ::std::map< ::HIR::SimplePath, ImplGroup<const ::HIR::MarkerImpl*> > m_all_marker_impls;
 
     /// List of legacy-exported macros
     std::vector<RcString> m_exported_macro_names;
@@ -591,6 +739,9 @@ public:
     /// Language items avaliable through this crate (includes ones from loaded externs)
     ::std::unordered_map< ::std::string, ::HIR::SimplePath> m_lang_items;
 
+    /// Referenced crates (in load order) - Used to ensure final linking order is sane
+    // NOT SERIALISED
+    ::std::vector<RcString> m_ext_crates_ordered;
     /// Referenced crates
     ::std::unordered_map< RcString, ExternCrate>  m_ext_crates;
     /// Referenced system libraries
@@ -605,11 +756,13 @@ public:
     const ::HIR::SimplePath& get_lang_item_path(const Span& sp, const char* name) const;
     const ::HIR::SimplePath& get_lang_item_path_opt(const char* name) const;
 
+    const ::HIR::MacroItem& get_macroitem_by_path(const Span& sp, const ::HIR::SimplePath& path, bool ignore_crate_name=false, bool ignore_last_node=false) const;
+
     const ::HIR::TypeItem& get_typeitem_by_path(const Span& sp, const ::HIR::SimplePath& path, bool ignore_crate_name=false, bool ignore_last_node=false) const;
     const ::HIR::Trait& get_trait_by_path(const Span& sp, const ::HIR::SimplePath& path) const;
     const ::HIR::Struct& get_struct_by_path(const Span& sp, const ::HIR::SimplePath& path) const;
     const ::HIR::Union& get_union_by_path(const Span& sp, const ::HIR::SimplePath& path) const;
-    const ::HIR::Enum& get_enum_by_path(const Span& sp, const ::HIR::SimplePath& path) const;
+    const ::HIR::Enum& get_enum_by_path(const Span& sp, const ::HIR::SimplePath& path, bool ignore_crate_name=false, bool ignore_last_node=false) const;
     const ::HIR::Module& get_mod_by_path(const Span& sp, const ::HIR::SimplePath& path, bool ignore_last_node=false, bool ignore_crate_name=false) const;
 
     const ::HIR::ValueItem& get_valitem_by_path(const Span& sp, const ::HIR::SimplePath& path, bool ignore_crate_name=false) const;
@@ -632,14 +785,22 @@ public:
     bool find_auto_trait_impls(const ::HIR::SimplePath& path, const ::HIR::TypeRef& type, t_cb_resolve_type ty_res, ::std::function<bool(const ::HIR::MarkerImpl&)> callback) const;
     bool find_type_impls(const ::HIR::TypeRef& type, t_cb_resolve_type ty_res, ::std::function<bool(const ::HIR::TypeImpl&)> callback) const;
 
-    const ::MIR::Function* get_or_gen_mir(const ::HIR::ItemPath& ip, const ::HIR::ExprPtr& ep, const ::HIR::Function::args_t& args, const ::HIR::TypeRef& ret_ty) const;
+    const ::MIR::Function* get_or_gen_mir(const ::HIR::ItemPath& ip, const ::HIR::ExprPtr& ep, const ::HIR::Function::args_t& args, ::HIR::TypeRef& ret_ty) const;
     const ::MIR::Function* get_or_gen_mir(const ::HIR::ItemPath& ip, const ::HIR::Function& fcn) const {
-        return get_or_gen_mir(ip, fcn.m_code, fcn.m_args, fcn.m_return);
+        auto ty = fcn.m_return.clone_shallow();
+        return get_or_gen_mir(ip, fcn.m_code, fcn.m_args, ty);
     }
-    const ::MIR::Function* get_or_gen_mir(const ::HIR::ItemPath& ip, const ::HIR::ExprPtr& ep, const ::HIR::TypeRef& exp_ty) const {
+    const ::MIR::Function* get_or_gen_mir(const ::HIR::ItemPath& ip, const ::HIR::ExprPtr& ep, ::HIR::TypeRef& exp_ty) const {
         static ::HIR::Function::args_t  s_args;
         return get_or_gen_mir(ip, ep, s_args, exp_ty);
     }
 };
+
+
+/// Helper for obtaining the matching target for PathTuple/PathNamed
+const ::HIR::Struct& pattern_get_struct(const Span& sp, const ::HIR::Path& path, const ::HIR::Pattern::PathBinding& binding, bool is_tuple);
+const ::HIR::t_tuple_fields& pattern_get_tuple(const Span& sp, const ::HIR::Path& path, const ::HIR::Pattern::PathBinding& binding);
+const ::HIR::t_struct_fields& pattern_get_named(const Span& sp, const ::HIR::Path& path, const ::HIR::Pattern::PathBinding& binding);
+
 
 }   // namespace HIR

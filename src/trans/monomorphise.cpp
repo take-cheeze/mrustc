@@ -13,95 +13,39 @@
 #include <hir_conv/constant_evaluation.hpp>
 
 namespace {
-    ::MIR::LValue monomorph_LValue(const ::StaticTraitResolve& resolve, const Trans_Params& params, const ::MIR::LValue& tpl)
+    class Cloner: public ::MIR::Cloner
     {
-        if( tpl.m_root.is_Static() )
-        {
-            return ::MIR::LValue( ::MIR::LValue::Storage::new_Static(params.monomorph(resolve, tpl.m_root.as_Static())), tpl.m_wrappers );
-        }
-        else
-        {
-            return tpl.clone();
-        }
-    }
-    ::MIR::Constant monomorph_Constant(const ::StaticTraitResolve& resolve, const Trans_Params& params, const ::MIR::Constant& tpl)
-    {
-        TU_MATCH_HDRA( (tpl), {)
-        TU_ARMA(Int, ce) {
-            return ::MIR::Constant::make_Int(ce);
-            }
-        TU_ARMA(Uint, ce) {
-            return ::MIR::Constant::make_Uint(ce);
-            }
-        TU_ARMA(Float, ce) {
-            return ::MIR::Constant::make_Float(ce);
-            }
-        TU_ARMA(Bool, ce) {
-            return ::MIR::Constant::make_Bool(ce);
-            }
-        TU_ARMA(Bytes, ce) {
-            return ::MIR::Constant(ce);
-            }
-        TU_ARMA(StaticString, ce) {
-            return ::MIR::Constant(ce);
-            }
-        TU_ARMA(Const, ce) {
-            return ::MIR::Constant::make_Const({
-                box$(params.monomorph(resolve, *ce.p))
-                });
-            }
-        TU_ARMA(Generic, ce) {
-            auto val = params.get_value(params.sp, ce);
-            TU_MATCH_HDRA( (val), {)
+        const ::StaticTraitResolve& m_resolve;
+        const Trans_Params& params;
+    public:
+        Cloner(const Span& sp, const ::StaticTraitResolve& resolve, const Trans_Params& params)
+            : ::MIR::Cloner(sp)
+            , m_resolve(resolve)
+            , params(params)
+        {}
+
+        const HIR::TypeRef& value_generic_type(HIR::GenericRef g) const override {
+            switch(g.group())
+            {
+            case 0:
+                ASSERT_BUG(sp, g.idx() < m_resolve.impl_generics().m_values.size(),
+                    "Value generic " << g << " out of bounds in impl: " << m_resolve.impl_generics().m_values.size());
+                return m_resolve.impl_generics().m_values.at(g.idx()).m_type;
+            case 1:
+                ASSERT_BUG(sp, g.idx() < m_resolve.item_generics().m_values.size(),
+                    "Value generic " << g << " out of bounds in fcn: " << m_resolve.item_generics().m_values.size());
+                return m_resolve.item_generics().m_values.at(g.idx()).m_type;
             default:
-                TODO(params.sp, "Monomorphise MIR generic constant " << ce << " = " << val);
-            TU_ARMA(Integer, ve) {
-                // TODO: Need to know the expected type of this.
-                return ::MIR::Constant::make_Uint({ve, HIR::CoreType::Usize});
-                }
-            }
-            }
-        TU_ARMA(ItemAddr, ce) {
-            auto p = params.monomorph(resolve, *ce);
-            // TODO: If this is a pointer to a function on a trait object, replace with the address loaded from the vtable.
-            // - Requires creating a new temporary for the vtable pointer.
-            // - Also requires knowing what the receiver is.
-            return ::MIR::Constant( box$(p) );
+                BUG(Span(), "");
             }
         }
-        throw "";
-    }
-    ::MIR::Param monomorph_Param(const ::StaticTraitResolve& resolve, const Trans_Params& params, const ::MIR::Param& tpl)
-    {
-        TU_MATCHA( (tpl), (e),
-        (LValue,
-            return monomorph_LValue(resolve, params, e);
-            ),
-        (Borrow,
-            return ::MIR::Param::make_Borrow({ e.type, monomorph_LValue(resolve, params, e.val) });
-            ),
-        (Constant,
-            return monomorph_Constant(resolve, params, e);
-            )
-        )
-        throw "";
-    }
-    //::std::vector<::MIR::LValue> monomorph_LValue_list(const ::StaticTraitResolve& resolve, const Trans_Params& params, const ::std::vector<::MIR::LValue>& tpl)
-    //{
-    //    ::std::vector<::MIR::LValue>    rv;
-    //    rv.reserve( tpl.size() );
-    //    for(const auto& v : tpl)
-    //        rv.push_back( monomorph_LValue(resolve, params, v) );
-    //    return rv;
-    //}
-    ::std::vector<::MIR::Param> monomorph_Param_list(const ::StaticTraitResolve& resolve, const Trans_Params& params, const ::std::vector<::MIR::Param>& tpl)
-    {
-        ::std::vector<::MIR::Param>    rv;
-        rv.reserve( tpl.size() );
-        for(const auto& v : tpl)
-            rv.push_back( monomorph_Param(resolve, params, v) );
-        return rv;
-    }
+        const Monomorphiser& monomorphiser() const override {
+            return params;
+        }
+        const StaticTraitResolve* resolve() const override {
+            return &m_resolve;
+        }
+    };
 }
 
 ::MIR::FunctionPointer Trans_Monomorphise(const ::StaticTraitResolve& resolve, const Trans_Params& params, const ::MIR::FunctionPointer& tpl)
@@ -116,11 +60,13 @@ namespace {
     output.locals.reserve( tpl->locals.size() );
     for(const auto& var : tpl->locals)
     {
-        DEBUG("- _" << output.locals.size());
+        DEBUG("- _" << output.locals.size() << " (" << var << ")");
         output.locals.push_back( params.monomorph(resolve, var) );
+        DEBUG(" = " << output.locals.back());
     }
     output.drop_flags = tpl->drop_flags;
 
+    Cloner  c { sp, resolve, params };
     // 2. Monomorphise all paths
     output.blocks.reserve( tpl->blocks.size() );
     for(const auto& block : tpl->blocks)
@@ -133,195 +79,20 @@ namespace {
         {
             switch( stmt.tag() )
             {
-            case ::MIR::Statement::TAGDEAD: throw "";
-            case ::MIR::Statement::TAG_SetDropFlag:
-                statements.push_back( ::MIR::Statement( stmt.as_SetDropFlag() ) );
+            // LAZY: These _should_ be in `clone_stmt`, but they're not needed in optimising and MIR cloning
+            TU_ARM(stmt, SaveDropFlag, e) {
+                statements.push_back(::MIR::Statement::make_SaveDropFlag({ e.slot.clone(), e.bit_index, e.idx }));
+                } break;
+            TU_ARM(stmt, LoadDropFlag, e) {
+                statements.push_back(::MIR::Statement::make_LoadDropFlag({ e.idx, e.slot.clone(), e.bit_index}));
+                } break;
+            default:
+                statements.push_back(c.clone_stmt(stmt));
                 break;
-            case ::MIR::Statement::TAG_ScopeEnd:
-                statements.push_back( ::MIR::Statement( stmt.as_ScopeEnd() ) );
-                break;
-            case ::MIR::Statement::TAG_Drop: {
-                const auto& e = stmt.as_Drop();
-                DEBUG("- DROP " << e.slot);
-                statements.push_back( ::MIR::Statement::make_Drop({
-                    e.kind,
-                    monomorph_LValue(resolve, params, e.slot),
-                    e.flag_idx
-                    }) );
-                } break;
-            case ::MIR::Statement::TAG_Assign: {
-                const auto& e = stmt.as_Assign();
-                DEBUG("- " << e.dst << " = " << e.src);
-
-                ::MIR::RValue   rval;
-                TU_MATCHA( (e.src), (se),
-                (Use,
-                    rval = ::MIR::RValue( monomorph_LValue(resolve, params, se) );
-                    ),
-                (Constant,
-                    rval = monomorph_Constant(resolve, params, se);
-                    ),
-                (SizedArray,
-                    rval = ::MIR::RValue::make_SizedArray({
-                        monomorph_Param(resolve, params, se.val),
-                        se.count
-                        });
-                    ),
-                (Borrow,
-                    rval = ::MIR::RValue::make_Borrow({
-                        se.type,
-                        monomorph_LValue(resolve, params, se.val)
-                        });
-                    ),
-                (Cast,
-                    rval = ::MIR::RValue::make_Cast({
-                        monomorph_LValue(resolve, params, se.val),
-                        params.monomorph(resolve, se.type)
-                        });
-                    ),
-                (BinOp,
-                    rval = ::MIR::RValue::make_BinOp({
-                        monomorph_Param(resolve, params, se.val_l),
-                        se.op,
-                        monomorph_Param(resolve, params, se.val_r)
-                        });
-                    ),
-                (UniOp,
-                    rval = ::MIR::RValue::make_UniOp({
-                        monomorph_LValue(resolve, params, se.val),
-                        se.op
-                        });
-                    ),
-                (DstMeta,
-                    auto lv = monomorph_LValue(resolve, params, se.val);
-                    // TODO: Get the type of this, and if it's an array - replace with the size
-                    rval = ::MIR::RValue::make_DstMeta({ mv$(lv) });
-                    ),
-                (DstPtr,
-                    rval = ::MIR::RValue::make_DstPtr({ monomorph_LValue(resolve, params, se.val) });
-                    ),
-                (MakeDst,
-                    rval = ::MIR::RValue::make_MakeDst({
-                        monomorph_Param(resolve, params, se.ptr_val),
-                        monomorph_Param(resolve, params, se.meta_val)
-                        });
-                    ),
-                (Tuple,
-                    rval = ::MIR::RValue::make_Tuple({
-                        monomorph_Param_list(resolve, params, se.vals)
-                        });
-                    ),
-                (Array,
-                    rval = ::MIR::RValue::make_Array({
-                        monomorph_Param_list(resolve, params, se.vals)
-                        });
-                    ),
-                // Create a new instance of a union (and eventually enum)
-                (Variant,
-                    rval = ::MIR::RValue::make_Variant({
-                        params.monomorph(resolve, se.path),
-                        se.index,
-                        monomorph_Param(resolve, params, se.val)
-                        });
-                    ),
-                // Create a new instance of a struct (or enum)
-                (Struct,
-                    rval = ::MIR::RValue::make_Struct({
-                        params.monomorph(resolve, se.path),
-                        monomorph_Param_list(resolve, params, se.vals)
-                        });
-                    )
-                )
-
-                statements.push_back( ::MIR::Statement::make_Assign({
-                    monomorph_LValue(resolve, params, e.dst),
-                    mv$(rval)
-                    }) );
-                } break;
-            case ::MIR::Statement::TAG_Asm: {
-                const auto& e = stmt.as_Asm();
-                DEBUG("- asm! \"" << e.tpl << "\"");
-                ::std::vector< ::std::pair<::std::string, ::MIR::LValue>>   new_out, new_in;
-                new_out.reserve( e.outputs.size() );
-                for(auto& ent : e.outputs)
-                    new_out.push_back(::std::make_pair( ent.first, monomorph_LValue(resolve, params, ent.second) ));
-                new_in.reserve( e.inputs.size() );
-                for(auto& ent : e.inputs)
-                    new_in.push_back(::std::make_pair( ent.first, monomorph_LValue(resolve, params, ent.second) ));
-
-                statements.push_back( ::MIR::Statement::make_Asm({
-                    e.tpl, mv$(new_out), mv$(new_in), e.clobbers, e.flags
-                    }) );
-                } break;
             }
         }
 
-        ::MIR::Terminator   terminator;
-
-        DEBUG("> " << block.terminator);
-        TU_MATCHA( (block.terminator), (e),
-        (Incomplete,
-            //BUG(sp, "Incomplete block");
-            terminator = e;
-            ),
-        (Return,
-            terminator = e;
-            ),
-        (Diverge,
-            terminator = e;
-            ),
-        (Goto,
-            terminator = e;
-            ),
-        (Panic,
-            terminator = e;
-            ),
-        (If,
-            terminator = ::MIR::Terminator::make_If({
-                monomorph_LValue(resolve, params, e.cond),
-                e.bb0, e.bb1
-                });
-            ),
-        (Switch,
-            terminator = ::MIR::Terminator::make_Switch({
-                monomorph_LValue(resolve, params, e.val),
-                e.targets
-                });
-            ),
-        (SwitchValue,
-            terminator = ::MIR::Terminator::make_SwitchValue({
-                monomorph_LValue(resolve, params, e.val),
-                e.def_target,
-                e.targets,
-                e.values.clone()
-                });
-            ),
-        (Call,
-            struct H {
-                static ::MIR::CallTarget monomorph_calltarget(const ::StaticTraitResolve& resolve, const Trans_Params& params, const ::MIR::CallTarget& ct) {
-                    TU_MATCHA( (ct), (e),
-                    (Value,
-                        return monomorph_LValue(resolve, params, e);
-                        ),
-                    (Path,
-                        return params.monomorph(resolve, e);
-                        ),
-                    (Intrinsic,
-                        return ::MIR::CallTarget::make_Intrinsic({ e.name, params.monomorph(resolve, e.params) });
-                        )
-                    )
-                    throw "";
-                }
-            };
-            terminator = ::MIR::Terminator::make_Call({
-                e.ret_block, e.panic_block,
-                monomorph_LValue(resolve, params, e.ret_val),
-                H::monomorph_calltarget(resolve, params, e.fcn),
-                monomorph_Param_list(resolve, params, e.args)
-                });
-            )
-        )
-
+        ::MIR::Terminator   terminator = c.clone_term(block.terminator);
         output.blocks.push_back( ::MIR::BasicBlock { mv$(statements), mv$(terminator) } );
     }
 
@@ -332,17 +103,137 @@ namespace {
 void Trans_Monomorphise_List(const ::HIR::Crate& crate, TransList& list)
 {
     ::StaticTraitResolve    resolve { crate };
+    
+    struct Nvs: public ::HIR::Evaluator::Newval
+    {
+        TransList& out;
+        const HIR::Crate& crate;
+        unsigned count;
+        ::std::vector<std::pair<HIR::SimplePath,HIR::Static*>>  added;
+
+        Nvs(TransList& out, const HIR::Crate& crate)
+            : out(out)
+            , crate(crate)
+            , count(0)
+        {}
+
+        ::HIR::Path new_static(::HIR::TypeRef type, EncodedLiteral value) override {
+            // Ensure that the type is in enumeration (it should have been, but maybe not?)
+            {
+                bool found = false;
+                for(const auto& v : out.m_types) {
+                    if( v.first == type && !v.second ) {
+                        found = true;
+                        break;
+                    }
+                }
+                if( !found ) {
+                    out.m_types.push_back(::std::make_pair(type.clone(), false));
+                }
+            }
+            auto name = RcString::new_interned(FMT("ConstEvalMonomorph#" << count));
+            count ++;
+            auto p = ::HIR::SimplePath(crate.m_crate_name, {name});
+            auto ent = std::make_unique<HIR::VisEnt<HIR::ValueItem>>(HIR::VisEnt<HIR::ValueItem> {
+                HIR::Publicity::new_global(),
+                HIR::ValueItem(::HIR::Static(HIR::Linkage(), false, std::move(type), HIR::ExprPtr()))
+                });
+            
+            {
+                auto& s = ent->ent.as_Static();
+                s.m_value_generated = true;
+                s.m_value_res = std::move(value);
+                s.m_save_literal = false;
+                added.push_back(std::make_pair(p, &s));
+            }
+            const_cast<HIR::Module&>(crate.m_root_module).m_value_items.insert(std::make_pair(name, std::move(ent)));
+            return p;
+        }
+    } nvs { list, crate };
+
+    // Also do constants and statics (stored in where?)
+    // - NOTE: Done in reverse order, because consteval needs used constants to be evaluated
+    for(auto& ent : reverse(list.m_constants))
+    {
+        const auto& path = ent.first;
+        const auto& pp = ent.second->pp;
+        const auto& c = *ent.second->ptr;
+        TRACE_FUNCTION_FR("CONSTANT " << path, "CONSTANT " << path);
+        auto ty = pp.monomorph(resolve, c.m_type);
+        // 1. Evaluate the constant
+        auto eval = ::HIR::Evaluator { pp.sp, crate, nvs };
+        eval.resolve.set_both_generics_raw(pp.gdef_impl, &c.m_params);
+        MonomorphState   ms;
+        ms.self_ty = pp.self_type.clone();
+        ms.pp_impl = &pp.pp_impl;
+        ms.pp_method = &pp.pp_method;
+        DEBUG("ms = " << ms);
+        try
+        {
+            auto new_lit = eval.evaluate_constant(path, c.m_value, ::std::move(ty), ::std::move(ms));
+            // 2. Store evaluated HIR::Literal in c.m_monomorph_cache
+            c.m_monomorph_cache.insert(::std::make_pair( path.clone(), ::std::move(new_lit) ));
+        }
+        catch(...)
+        {
+            // Deferred - no update
+            BUG(Span(), "Exception thrown during evaluation of: " << path);
+        }
+    }
+
+    for(auto& ent : list.m_statics)
+    {
+        const auto& path = ent.first;
+        const auto& pp = ent.second->pp;
+        const auto& s = *ent.second->ptr;
+
+        if( !s.m_params.is_generic() )
+        {
+            continue ;
+        }
+
+        TRACE_FUNCTION_FR("STATIC " << path, "STATIC " << path);
+        auto ty = pp.monomorph(resolve, s.m_type);
+        // 1. Evaluate the constant
+        auto eval = ::HIR::Evaluator { pp.sp, crate, nvs };
+        eval.resolve.set_both_generics_raw(pp.gdef_impl, &s.m_params);
+        MonomorphState   ms;
+        ms.self_ty = pp.self_type.clone();
+        ms.pp_impl = &pp.pp_impl;
+        ms.pp_method = &pp.pp_method;
+        DEBUG("ms = " << ms);
+        try
+        {
+            auto new_lit = eval.evaluate_constant(path, s.m_value, ::std::move(ty), ::std::move(ms));
+            // 2. Store evaluated HIR::Literal in s.m_monomorph_cache
+            s.m_monomorph_cache.insert(::std::make_pair( path.clone(), ::std::move(new_lit) ));
+        }
+        catch(...)
+        {
+            // Deferred - no update
+            BUG(Span(), "Exception thrown during evaluation of: " << path);
+        }
+    }
+
     for(auto& fcn_ent : list.m_functions)
     {
         const auto& fcn = *fcn_ent.second->ptr;
         // Trait methods (which are the only case where `Self` can exist in the argument list at this stage) always need to be monomorphised.
-        bool is_method = ( fcn.m_args.size() > 0 && visit_ty_with(fcn.m_args[0].second, [&](const auto& x){return x == ::HIR::TypeRef("Self",0xFFFF);}) );
-        if(fcn_ent.second->pp.has_types() || is_method)
+        bool is_method = ( fcn.m_args.size() > 0 && visit_ty_with(fcn.m_args[0].second, [&](const auto& x){return x == ::HIR::TypeRef::new_self();}) );
+        bool monomorph_needed = fcn_ent.second->pp.has_types() || is_method;
+
+        if( monomorph_needed )
         {
             const auto& path = fcn_ent.first;
             const auto& pp = fcn_ent.second->pp;
-            TRACE_FUNCTION_FR(path, path);
+            TRACE_FUNCTION_FR("FUNCTION " << path, "FUNCTION " << path);
             ASSERT_BUG(Span(), fcn.m_code.m_mir, "No code for " << path);
+
+            // TODO: Get the item params too
+            if( fcn_ent.second->pp.pp_impl.has_params() ) {
+                assert(pp.gdef_impl);
+            }
+            resolve.set_both_generics_raw(pp.gdef_impl, &fcn.m_params);
 
             auto mir = Trans_Monomorphise(resolve, fcn_ent.second->pp, fcn.m_code.m_mir);
 
@@ -356,40 +247,24 @@ void Trans_Monomorphise_List(const ::HIR::Crate& crate, TransList& list)
             ::HIR::ItemPath ip(path);
             MIR_Validate(resolve, ip, *mir, args, ret_type);
             MIR_Cleanup(resolve, ip, *mir, args, ret_type);
-            MIR_Optimise(resolve, ip, *mir, args, ret_type);
+            MIR_Optimise(resolve, ip, *mir, args, ret_type, /*do_inline*/false);
             MIR_Validate(resolve, ip, *mir, args, ret_type);
 
             fcn_ent.second->monomorphised.ret_ty = ::std::move(ret_type);
             fcn_ent.second->monomorphised.arg_tys = ::std::move(args);
             fcn_ent.second->monomorphised.code = ::std::move(mir);
+            resolve.clear_both_generics();
+        }
+        else
+        {
+            DEBUG("Non-generic: FUNCTION " << fcn_ent.first);
         }
     }
 
-    // Also do constants and statics (stored in where?)
-    // - NOTE: Done in reverse order, because consteval needs used constants to be evaluated
-    for(auto& ent : reverse(list.m_constants))
-    {
-        const auto& path = ent.first;
-        const auto& pp = ent.second->pp;
-        const auto& c = *ent.second->ptr;
-        TRACE_FUNCTION_FR(path, path);
-        auto ty = pp.monomorph(resolve, c.m_type);
-        // 1. Evaluate the constant
-        struct Nvs: public ::HIR::Evaluator::Newval
-        {
-            ::HIR::Path new_static(::HIR::TypeRef type, ::HIR::Literal value) override {
-                TODO(Span(), "Create new static in monomorph pass - " << value << " : " << type);
-            }
-        } nvs;
-        auto eval = ::HIR::Evaluator { pp.sp, crate, nvs };
-        MonomorphState   ms;
-        ms.self_ty = pp.self_type.clone();
-        ms.pp_impl = &pp.pp_impl;
-        ms.pp_method = &pp.pp_method;
-        auto new_lit = eval.evaluate_constant(path, c.m_value, ::std::move(ty), ::std::move(ms));
-        ASSERT_BUG(Span(), !new_lit.is_Defer(), "Result of evaluating " << path << " was still Defer");
-        // 2. Store evaluated HIR::Literal in c.m_monomorph_cache
-        c.m_monomorph_cache.insert(::std::make_pair( path.clone(), ::std::move(new_lit) ));
+    for(auto& v : nvs.added) {
+        auto* o = list.add_static(HIR::Path(v.first));
+        ASSERT_BUG(Span(), o, "Generated static " << v.first << " already in TransList?");
+        o->ptr = v.second;
     }
 }
 

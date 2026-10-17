@@ -6,6 +6,8 @@
  * - MIR (Middle Intermediate Representation) definitions
  */
 #include "../../src/include/rc_string.hpp"
+struct Span {};
+struct Monomorphiser {};
 #include "../../src/mir/mir.hpp"
 #include "hir_sim.hpp"
 #include <iostream>
@@ -31,18 +33,82 @@ namespace std {
 }
 #endif
 
+namespace {
+    unsigned num_ch(const std::string& s) {
+        uint8_t bits[128/8] = {0};
+        for(char c : s) {
+            if( 0 <= c && c < 128 ) {
+                bits[c / 8] |= (1 << (c % 8));
+            }
+        }
+        unsigned rv = 0;
+        for(uint8_t v : bits) {
+            for(int i = 0; i < 8; i ++) {
+                if(v & (1 << i)) {
+                    rv += 1;
+                }
+            }
+        }
+        return rv;
+    }
+    
+    const char* tyname(const HIR::CoreType& t) {
+        switch(t.raw_type)
+        {
+        case RawType::I8  : return "i8";
+        case RawType::I16 : return "i16";
+        case RawType::I32 : return "i32";
+        case RawType::I64 : return "i64";
+        case RawType::I128: return "i128";
+        case RawType::U8  : return "u8";
+        case RawType::U16 : return "u16";
+        case RawType::U32 : return "u32";
+        case RawType::U64 : return "u64";
+        case RawType::U128: return "u128";
+        
+        case RawType::ISize: return "isize";
+        case RawType::USize: return "usize";
+
+        case RawType::F32 : return "f32";
+        case RawType::F64 : return "f64";
+        
+        case RawType::Bool: return "bool";
+        case RawType::Char: return "char";
+        case RawType::Unit: return "?()";
+        case RawType::Str : return "?str";
+
+        case RawType::Unreachable: return "!";
+        case RawType::Function: return "?fn";
+        case RawType::Composite: return "?stuct";
+        case RawType::TraitObject: return "?dyn";
+        }
+        return "?";
+    }
+}
+
 namespace MIR {
     ::std::ostream& operator<<(::std::ostream& os, const Constant& v) {
         TU_MATCHA( (v), (e),
         (Int,
             os << (e.v < 0 ? "-" : "+");
             os << (e.v < 0 ? -e.v : e.v);
+            os << " " << tyname(e.t);
             ),
         (Uint,
-            os << e.v;
+            std::ostringstream  ss_dec, ss_hex;
+            ss_dec << e.v;
+            ss_hex << std::hex << e.v;
+            if( num_ch(ss_dec.str()) < num_ch(ss_hex.str()) ) {
+                os << e.v;
+            }
+            else {
+                os << std::hex << "0x" << e.v << std::dec;
+            }
+            os << " " << tyname(e.t);
             ),
         (Float,
             os << e.v;
+            os << " " << tyname(e.t);
             ),
         (Bool,
             os << (e.v ? "true" : "false");
@@ -72,6 +138,9 @@ namespace MIR {
             ),
         (Generic,
             os << e;
+            ),
+        (Function,
+            os << "addr{fn} " << *e.p;
             ),
         (ItemAddr,
             os << "addr " << *e;
@@ -240,8 +309,11 @@ namespace MIR {
         (Array,
             os << "Array(" << e.vals << ")";
             ),
-        (Variant,
+        (UnionVariant,
             os << "Variant(" << e.path << " #" << e.index << ", " << e.val << ")";
+            ),
+        (EnumVariant,
+            os << "Variant(" << e.path << " #" << e.index << ", {" << e.vals << "})";
             ),
         (Struct,
             os << "Struct(" << e.path << ", {" << e.vals << "})";
@@ -265,10 +337,10 @@ namespace MIR {
             os << "Goto(" << e << ")";
             ),
         (Panic,
-            os << "Panic(" << e.dst << ";)";
+            os << "Panic(" << e.dst << ")";
             ),
         (If,
-            os << "If( " << e.cond << " : " << e.bb0 << ", " << e.bb1 << ")";
+            os << "If( " << e.cond << " goto " << e.bb_true << " else " << e.bb_false << ")";
             ),
         (Switch,
             os << "Switch( " << e.val << " : ";
@@ -289,7 +361,11 @@ namespace MIR {
                 ),
             (String,
                 for(unsigned int j = 0; j < e.targets.size(); j ++)
-                    os << "\"" << ve[j] << "\" => bb" << e.targets[j] << ", ";
+                    os << "\"" << FmtEscaped(ve[j]) << "\" => bb" << e.targets[j] << ", ";
+                ),
+            (ByteString,
+                for(unsigned int j = 0; j < e.targets.size(); j ++)
+                    os << "[" << ve[j] << "] => bb" << e.targets[j] << ", ";
                 )
             )
             os << "else bb" << e.def_target << ")";
@@ -331,6 +407,43 @@ namespace MIR {
                 os << "\"" << spec.first << "\" : " << spec.second << ", ";
             os << "), clobbers=[" << e.clobbers << "], flags=[" << e.flags << "])";
             ),
+        (Asm2,
+            os << "asm!(";
+            for(const auto& l : e.lines) {
+                if(&l != &e.lines.front())
+                    os << " ";
+                l.fmt(os);
+            }
+            for(const auto& p : e.params)
+            {
+                os << ", ";
+                TU_MATCH_HDRA( (p), { )
+                TU_ARMA(Const, v) {
+                    os << "const " << v;
+                    }
+                TU_ARMA(Sym, v) {
+                    os << "sym " << v;
+                    }
+                TU_ARMA(Reg, v) {
+                    os << "reg " << v.dir << " " << v.spec << " ";
+                    if(v.input)
+                        os << *v.input;
+                    else
+                        os << "_";
+                    os << " => ";
+                    if(v.output)
+                        os << *v.output;
+                    else
+                        os << "_";
+                    }
+                }
+            }
+            if(e.options.any()) {
+                os << ", ";
+                e.options.fmt(os);
+            }
+            os << ")";
+            ),
         (SetDropFlag,
             os << "df$" << e.idx << " = ";
             if( e.other == ~0u )
@@ -342,6 +455,8 @@ namespace MIR {
                 os << (e.new_val ? "!" : "") << "df$" << e.other;
             }
             ),
+        (SaveDropFlag, throw "todo";),
+        (LoadDropFlag, throw "todo";),
         (Drop,
             os << "drop(" << e.slot;
             if(e.kind == ::MIR::eDropKind::SHALLOW)
@@ -363,6 +478,317 @@ namespace MIR {
     EnumCachePtr::~EnumCachePtr()
     {
         assert(!this->p);
+    }
+
+    ::Ordering Constant::ord(const Constant& b) const
+    {
+        if( this->tag() != b.tag() )
+            return ::ord( static_cast<unsigned int>(this->tag()), static_cast<unsigned int>(b.tag()) );
+        TU_MATCHA( (*this,b), (ae,be),
+        (Int,
+            if( ae.v != be.v )
+                return ::ord(ae.v, be.v);
+            return ::ord(ae.t.raw_type, be.t.raw_type);
+            ),
+        (Uint,
+            if( ae.v != be.v )
+                return ::ord(ae.v, be.v);
+            return ::ord(ae.t.raw_type, be.t.raw_type);
+            ),
+        (Float,
+            if( ae.v != be.v )
+                return ::ord(ae.v, be.v);
+            return ::ord(ae.t.raw_type, be.t.raw_type);
+            ),
+        (Bool,
+            return ::ord(ae.v, be.v);
+            ),
+        (Bytes,
+            return ::ord(ae, be);
+            ),
+        (StaticString,
+            return ::ord(ae, be);
+            ),
+        (Const,
+            return ::ord(*ae.p, *be.p);
+            ),
+        (Function,
+            return ::ord(*ae.p, *be.p);
+            ),
+        (Generic,
+            //return ::ord(ae.binding, be.binding);
+            return OrdEqual;
+            ),
+        (ItemAddr,
+            ORD(static_cast<bool>(ae), static_cast<bool>(be));
+            if(ae) ORD(*ae, *be);
+            return OrdEqual;
+            )
+        )
+        throw "";
+    }
+    bool Param::operator==(const Param& x) const
+    {
+        if( this->tag() != x.tag() )
+            return false;
+        TU_MATCHA( (*this, x), (ea, eb),
+        (LValue,
+            return ea == eb;
+            ),
+        (Borrow,
+            return ea.type == eb.type && ea.val == eb.val;
+            ),
+        (Constant,
+            return ea == eb;
+            )
+        )
+        throw "";
+    }
+
+    bool operator==(const RValue& a, const RValue& b)
+    {
+        if( a.tag() != b.tag() )
+            return false;
+        TU_MATCHA( (a, b), (are, bre),
+        (Use,
+            return are == bre;
+            ),
+        (Constant,
+            return are == bre;
+            ),
+        (SizedArray,
+            if( are.val != bre.val )
+                return false;
+            if( are.count != bre.count )
+                return false;
+            return true;
+            ),
+        (Borrow,
+            if( are.type != bre.type )
+                return false;
+            if( are.val != bre.val )
+                return false;
+            return true;
+            ),
+        (Cast,
+            if( are.type != bre.type )
+                return false;
+            if( are.val != bre.val )
+                return false;
+            return true;
+            ),
+        (BinOp,
+            if( are.val_l != bre.val_l )
+                return false;
+            if( are.op != bre.op )
+                return false;
+            if( are.val_r != bre.val_r )
+                return false;
+            return true;
+            ),
+        (UniOp,
+            if( are.op != bre.op )
+                return false;
+            if( are.val != bre.val )
+                return false;
+            return true;
+            ),
+        (DstPtr,
+            return are.val == bre.val;
+            ),
+        (DstMeta,
+            return are.val == bre.val;
+            ),
+        (MakeDst,
+            if( are.meta_val != bre.meta_val )
+                return false;
+            if( are.ptr_val != bre.ptr_val )
+                return false;
+            return true;
+            ),
+        (Tuple,
+            return are.vals == bre.vals;
+            ),
+        (Array,
+            return are.vals == bre.vals;
+            ),
+        (UnionVariant,
+            if( are.path != bre.path )
+                return false;
+            if( are.index != bre.index )
+                return false;
+            return are.val == bre.val;
+            ),
+        (EnumVariant,
+            if( are.path != bre.path )
+                return false;
+            if( are.index != bre.index )
+                return false;
+            return are.vals == bre.vals;
+            ),
+        (Struct,
+            if( are.path != bre.path )
+                return false;
+            return are.vals == bre.vals;
+            )
+        )
+        throw "";
+    }
+    bool SwitchValues::operator==(const SwitchValues& x) const
+    {
+        if( this->tag() != x.tag() )
+            return false;
+        TU_MATCHA( ((*this), x), (ave, bve),
+        (Unsigned,
+            if( ave != bve )
+                return false;
+            ),
+        (Signed,
+            if( ave != bve )
+                return false;
+            ),
+        (String,
+            if( ave != bve )
+                return false;
+            ),
+        (ByteString,
+            if( ave != bve )
+                return false;
+            )
+        )
+        return true;
+    }
+    bool operator==(const AsmParam& a, const AsmParam& b)
+    {
+        if(a.tag() != b.tag())
+            return false;
+        TU_MATCH_HDRA( (a,b), {)
+        TU_ARMA(Const, ae, be) {
+            return ae == be;
+            }
+        TU_ARMA(Sym, ae, be) {
+            return ae == be;
+            }
+        TU_ARMA(Reg, ae, be) {
+            if(ae.dir != be.dir) return false;
+            if(ae.spec != be.spec)  return false;
+            if( !!ae.input != !!be.input )  return false;
+            if( ae.input && *ae.input != *be.input )    return false;
+            if( !!ae.output != !!be.output )  return false;
+            if( ae.output && *ae.output != *be.output ) return false;
+            }
+        }
+        return true;
+    }
+    bool operator==(const Statement& a, const Statement& b) {
+        if( a.tag() != b.tag() )
+            return false;
+        
+        TU_MATCH_HDRA( (a,b), {)
+        TU_ARMA(Assign, ae,be) {
+            return ae.dst == be.dst && ae.src == be.src;
+            }
+        TU_ARMA(Asm, ae,be) {
+            return ae.outputs == be.outputs
+                && ae.inputs == be.inputs
+                && ae.clobbers == be.clobbers
+                && ae.flags == be.flags
+                ;
+            }
+        TU_ARMA(Asm2, ae,be) {
+            return ae.lines == be.lines
+                && ae.options == be.options
+                && ae.params == be.params
+                ;
+            }
+        TU_ARMA(SetDropFlag, ae,be) {
+            return ae.idx == be.idx
+                && ae.other == be.other
+                && ae.new_val == be.new_val
+                ;
+            }
+        TU_ARMA(SaveDropFlag, ae,be) throw "todo";
+        TU_ARMA(LoadDropFlag, ae,be) throw "todo";
+        TU_ARMA(Drop, ae,be) {
+            return ae.slot == be.slot
+                && ae.kind == be.kind
+                && ae.flag_idx == be.flag_idx
+                ;
+            }
+        TU_ARMA(ScopeEnd, ae,be) {
+            return ae.slots == be.slots;
+            }
+        }
+        throw "";
+    }
+    bool operator==(const Terminator& a, const Terminator& b) {
+        if( a.tag() != b.tag() )
+            return false;
+        TU_MATCHA( (a,b), (ae,be),
+        (Incomplete,
+            ),
+        (Return,
+            ),
+        (Diverge,
+            ),
+        (Goto,
+            if( ae != be )
+                return false;
+            ),
+        (Panic,
+            if( ae.dst != be.dst )
+                return false;
+            ),
+        (If,
+            if( ae.cond != be.cond )
+                return false;
+            if( ae.bb_true != be.bb_true )
+                return false;
+            if( ae.bb_false != be.bb_false )
+                return false;
+            ),
+        (Switch,
+            if( ae.val != be.val )
+                return false;
+            if( ae.targets != be.targets )
+                return false;
+            ),
+        (SwitchValue,
+            if( ae.val != be.val )
+                return false;
+            if( ae.targets != be.targets )
+                return false;
+            if( ae.values != be.values)
+                return false;
+            ),
+        (Call,
+            if( ae.ret_val != be.ret_val )
+                return false;
+            TU_MATCHA( (ae.fcn, be.fcn), (afe, bfe),
+            (Value,
+                if( afe != bfe )
+                    return false;
+                ),
+            (Path,
+                if( afe != bfe )
+                    return false;
+                ),
+            (Intrinsic,
+                if( afe.name != bfe.name )
+                    return false;
+                if( afe.params != bfe.params )
+                    return false;
+                )
+            )
+            if( ae.args != be.args )
+                return false;
+            if( ae.ret_block != be.ret_block )
+                return false;
+            if( ae.panic_block != be.panic_block )
+                return false;
+            )
+        )
+        return true;
     }
 }
 

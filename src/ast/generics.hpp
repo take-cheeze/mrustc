@@ -57,6 +57,7 @@ class LifetimeParam
     Span    m_span;
     Ident   m_name;
 public:
+
     LifetimeParam(Span sp, ::AST::AttributeList attrs, Ident name):
         m_attrs( ::std::move(attrs) ),
         m_span( ::std::move(sp) ),
@@ -79,12 +80,14 @@ class ValueParam
     Span    m_span;
     Ident   m_name;
     TypeRef m_type;
+    Expr    m_default;
 public:
-    ValueParam(Span sp, ::AST::AttributeList attrs, Ident name, TypeRef type)
+    ValueParam(Span sp, ::AST::AttributeList attrs, Ident name, TypeRef type, Expr val)
         :m_attrs( ::std::move(attrs) )
         ,m_span( ::std::move(sp) )
         ,m_name( ::std::move(name) )
         ,m_type( ::std::move(type) )
+        ,m_default( ::std::move(val) )
     {
     }
     ValueParam(ValueParam&&) = default;
@@ -93,7 +96,8 @@ public:
         m_attrs( x.m_attrs ),
         m_span( x.m_span ),
         m_name( x.m_name ),
-        m_type( x.m_type.clone() )
+        m_type( x.m_type.clone() ),
+        m_default( x.m_default ? x.m_default.clone() : Expr() )
     {
     }
 
@@ -104,6 +108,9 @@ public:
     const TypeRef& type() const { return m_type; }
           TypeRef& type()       { return m_type; }
 
+    const Expr& default_value() const { return m_default; }
+          Expr& default_value()       { return m_default; }
+
     friend ::std::ostream& operator<<(::std::ostream& os, const ValueParam& p);
 };
 TAGGED_UNION_EX( GenericParam, (), None,
@@ -113,8 +120,10 @@ TAGGED_UNION_EX( GenericParam, (), None,
         (Type, TypeParam),
         (Value, ValueParam)
         ),
-    (), (),
+    (, bounds_start(x.bounds_start), bounds_end(x.bounds_end) ), ( bounds_start = x.bounds_start; bounds_end = x.bounds_end; ),
     (
+        size_t bounds_start = 0;
+        size_t bounds_end = 0;
         GenericParam clone() const;
 
         friend std::ostream& operator<<(std::ostream& os, const GenericParam& x);
@@ -138,6 +147,7 @@ TAGGED_UNION_EX( GenericBound, (), None,
         }),
     // Standard trait bound: "Type: [for<'a>] Trait"
     (IsTrait, struct {
+        Span    span;
         HigherRankedBounds  outer_hrbs;
         TypeRef type;
         HigherRankedBounds  inner_hrbs;
@@ -171,7 +181,7 @@ TAGGED_UNION_EX( GenericBound, (), None,
             (None, return make_None({}); ),
             (Lifetime,     return make_Lifetime({ent.test, ent.bound});     ),
             (TypeLifetime, return make_TypeLifetime({ent.type.clone(), ent.bound}); ),
-            (IsTrait,    return make_IsTrait({ent.outer_hrbs, ent.type.clone(), ent.inner_hrbs, ent.trait}); ),
+            (IsTrait,    return make_IsTrait({ent.span, ent.outer_hrbs, ent.type.clone(), ent.inner_hrbs, ent.trait}); ),
             (MaybeTrait, return make_MaybeTrait({ent.type.clone(), ent.trait}); ),
             (NotTrait,   return make_NotTrait({ent.type.clone(), ent.trait}); ),
             (Equality,   return make_Equality({ent.type.clone(), ent.replacement.clone()}); )
@@ -206,10 +216,18 @@ public:
     }
 
 
-    void add_lft_param(LifetimeParam lft) { m_params.push_back( ::std::move(lft) ); }
-    void add_ty_param(TypeParam param) { m_params.push_back( ::std::move(param) ); }
-    void add_value_param(Span sp, AttributeList attrs, Ident name, TypeRef ty) {
-        m_params.push_back(ValueParam(mv$(sp), mv$(attrs), mv$(name), mv$(ty)));
+    void add_param(GenericParam gp, size_t bounds_start, size_t bounds_end) {
+        m_params.push_back( ::std::move(gp) ); m_params.back().bounds_start = bounds_start; m_params.back().bounds_end = bounds_end;
+    }
+
+    void add_lft_param(LifetimeParam lft) { add_param( ::std::move(lft), SIZE_MAX, SIZE_MAX ); }
+    void add_lft_param(LifetimeParam lft, size_t bounds_start, size_t bounds_end) { add_param( ::std::move(lft), bounds_start, bounds_end); }
+
+    void add_ty_param(TypeParam param) { add_param( ::std::move(param), SIZE_MAX, SIZE_MAX); }
+    void add_ty_param(TypeParam param, size_t bounds_start, size_t bounds_end) { add_param( ::std::move(param), bounds_start, bounds_end); }
+
+    void add_value_param(Span sp, AttributeList attrs, Ident name, TypeRef ty, Expr val) {
+        m_params.push_back(ValueParam(mv$(sp), mv$(attrs), mv$(name), mv$(ty), mv$(val)));
     }
 
     void add_bound(GenericBound bound) {

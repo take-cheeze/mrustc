@@ -17,7 +17,7 @@
 
 void Repository::load_cache(const ::helpers::path& path)
 {
-    throw "";
+    throw ::std::runtime_error("TODO: Repository::load_cache");
 }
 void Repository::load_vendored(const ::helpers::path& path)
 {
@@ -104,9 +104,17 @@ void Repository::load_vendored(const ::helpers::path& path)
     auto it = m_path_cache.find(path);
     if(it == m_path_cache.end())
     {
-        ::std::shared_ptr<PackageManifest> rv ( new PackageManifest(PackageManifest::load_from_toml(path)) );
+        ::std::shared_ptr<PackageManifest> rv ( new PackageManifest(PackageManifest::load_from_toml(path, m_workspace_manifest)) );
 
         m_path_cache.insert( ::std::make_pair(::std::move(path), rv) );
+
+        if( rv->name().compare(0, 6+4+10, "rustc-std-workspace-", 6+4+10) == 0 && m_cache.count(rv->name()) == 0 ) {
+            Entry   cache_ent;
+            cache_ent.manifest_path = path;
+            cache_ent.loaded_manifest = rv;
+            cache_ent.version = rv->version();
+            m_cache.insert(::std::make_pair(rv->name(), cache_ent));
+        }
 
         return rv;
     }
@@ -119,7 +127,7 @@ void Repository::add_patch_path(const std::string& package_name, ::helpers::path
 {
     auto manifest_path = path / "Cargo.toml";
 
-    auto loaded_manifest = ::std::shared_ptr<PackageManifest>( new PackageManifest(PackageManifest::load_from_toml(manifest_path)) );
+    auto loaded_manifest = ::std::shared_ptr<PackageManifest>( new PackageManifest(PackageManifest::load_from_toml(manifest_path, m_workspace_manifest)) );
 
     Entry   cache_ent;
     cache_ent.manifest_path = manifest_path;
@@ -128,9 +136,9 @@ void Repository::add_patch_path(const std::string& package_name, ::helpers::path
     m_cache.insert(::std::make_pair( package_name, ::std::move(cache_ent) ));
     // TODO: If there's other packages with the same name, check for compatability (or otherwise ensure that this is the chosen version)
 }
-::std::shared_ptr<PackageManifest> Repository::find(const ::std::string& name, const PackageVersionSpec& version)
+::std::shared_ptr<PackageManifest> Repository::find(const ::std::string& name, const PackageVersionSpec& version, std::function<bool(const PackageVersion&)> filter_cb)
 {
-    DEBUG("FIND " << name << " matching " << version);
+    TRACE_FUNCTION_F("FIND " << name << " matching " << version);
     auto itp = m_cache.equal_range(name);
 
     Entry* best = nullptr;
@@ -138,10 +146,17 @@ void Repository::add_patch_path(const std::string& package_name, ::helpers::path
     {
         if( version.accepts(i->second.version) )
         {
-            DEBUG("Accept " << i->second.version);
-            if( !best || best->version < i->second.version )
+            if( !filter_cb(i->second.version) )
             {
+                DEBUG("Filtered out " << i->second.version);
+            }
+            else if( !best || i->second.version > best->version )
+            {
+                DEBUG("Accept " << i->second.version);
                 best = &i->second;
+            }
+            else {
+                DEBUG("Matched " << i->second.version);
             }
         }
         else
@@ -152,15 +167,16 @@ void Repository::add_patch_path(const std::string& package_name, ::helpers::path
 
     if( best )
     {
+        DEBUG("USING " << name << " " << best->version);
         if( !best->loaded_manifest )
         {
             if( best->manifest_path == "" )
             {
-                throw "TODO: Download package";
+                throw ::std::runtime_error("TODO: Download package");
             }
             try
             {
-                best->loaded_manifest = ::std::shared_ptr<PackageManifest>( new PackageManifest(PackageManifest::load_from_toml(best->manifest_path)) );
+                best->loaded_manifest = ::std::shared_ptr<PackageManifest>( new PackageManifest(PackageManifest::load_from_toml(best->manifest_path, m_workspace_manifest)) );
             }
             catch(const ::std::exception& e)
             {
@@ -174,4 +190,61 @@ void Repository::add_patch_path(const std::string& package_name, ::helpers::path
     {
         return {};
     }
+}
+::std::shared_ptr<PackageManifest> Repository::get_package(const ::std::string& name, const PackageVersion& version)
+{
+    TRACE_FUNCTION_F("GET " << name << " v" << version);
+    auto itp = m_cache.equal_range(name);
+    for(auto i = itp.first; i != itp.second; ++i)
+    {
+        if( i->second.version == version )
+        {
+            if( !i->second.loaded_manifest )
+            {
+                if( i->second.manifest_path == "" )
+                {
+                    throw ::std::runtime_error("TODO: Download package");
+                }
+                try
+                {
+                    i->second.loaded_manifest = ::std::shared_ptr<PackageManifest>( new PackageManifest(PackageManifest::load_from_toml(i->second.manifest_path, m_workspace_manifest)) );
+                }
+                catch(const ::std::exception& e)
+                {
+                    throw ::std::runtime_error( format("Error loading manifest '", i->second.manifest_path, "' - ", e.what()) );
+                }
+            }
+            return i->second.loaded_manifest;
+        }
+    }
+    return {};
+}
+::std::vector<PackageVersion> Repository::enum_matching_versions(const ::std::string& name, const PackageVersionSpec& version) const
+{
+    TRACE_FUNCTION_F("ENUM " << name << " matching " << version);
+    auto itp = m_cache.equal_range(name);
+
+    ::std::vector<PackageVersion>   rv;
+    // HACK: Detect a failed request for a `rustc-std-workspace-` crate, and inject it
+    // - This function should only be called if a matching crate hasn't already been loaded via a path dependency (which will happen when building std)
+    if( itp.first == itp.second && name.compare(0, 6+4+10, "rustc-std-workspace-", 6+4+10) == 0 ) {
+        Entry   ent;
+        ent.loaded_manifest = std::make_shared<PackageManifest>(PackageManifest::magic_manifest(name.c_str() + 6+4+10));
+        ent.version = ent.loaded_manifest->version();
+        const_cast<Repository&>(*this).m_cache.insert(std::make_pair(name, std::move(ent)));
+        itp = m_cache.equal_range(name);
+    }
+    for(auto i = itp.first; i != itp.second; ++i)
+    {
+        if( version.accepts(i->second.version) )
+        {
+            rv.push_back(i->second.version);
+            DEBUG("Matched " << i->second.version);
+        }
+        else
+        {
+            DEBUG("Ignore " << i->second.version);
+        }
+    }
+    return rv;
 }

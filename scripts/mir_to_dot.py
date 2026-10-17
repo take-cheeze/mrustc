@@ -14,9 +14,10 @@ def main():
     #cratename,pat = 'rustc', 'fn tables.*::"rustc"::ty::context::TyCtxt'
 
     argp = argparse.ArgumentParser()
-    argp.add_argument("--file", type=str)
-    argp.add_argument("--crate", type=str)
-    argp.add_argument("--fn-name", type=str, default='resize.*HashMap')
+    argp_src = argp.add_mutually_exclusive_group(required=True)
+    argp_src.add_argument("--file", type=str)
+    argp_src.add_argument("--crate", type=str)
+    argp.add_argument("--fn-name", type=str, required=True)
     args = argp.parse_args()
 
     pat = 'fn '+args.fn_name
@@ -28,7 +29,7 @@ def main():
     for line in fp:
         line = line.strip()
         if start_pat.match(line) != None:
-            print "# ",line
+            print("# ",line)
             def_line = line
             break
 
@@ -73,14 +74,14 @@ def main():
             if comment_level == 0:
                 outstr += line[i]
             i += 1
-        print "#",len(bbs),outstr
+        print("#",len(bbs),outstr)
 
         cur_bb_lines.append(outstr)
 
-    goto_regex = re.compile('goto bb(\d+);$')
-    call_regex = re.compile('.*goto bb(\d+) else bb(\d+)$')
-    if_regex = re.compile('.*goto bb(\d+); } else { goto bb(\d+); }$')
-    switch_regex = re.compile('(\d+) => bb(\d+),')
+    goto_regex = re.compile('goto bb(\\d+);$')
+    call_regex = re.compile('.*goto bb(\\d+) else bb(\\d+)$')
+    if_regex = re.compile('.*goto bb(\\d+); } else { goto bb(\\d+); }$')
+    switch_regex = re.compile('(\\d+) => bb(\\d+),')
 
     links = []
     for idx,bb in enumerate(bbs):
@@ -106,23 +107,48 @@ def main():
             continue
 
 
-        for m in switch_regex.finditer(bb[-1]):
-            links.append( Link(idx, int(m.group(2)), "var%s" % (m.group(1),) ) )
+        # Rewrite `switch` terminators to de-duplicate the most common arm
+        if bb[-1].startswith("switch "):
+            arms = []
+            counts = {}
+            for m in switch_regex.finditer(bb[-1]):
+                tgt = int(m.group(2))
+                arms.append(( tgt, "var%s" % (m.group(1),) ))
+                if not tgt in counts:
+                    counts[tgt] = 0
+                counts[tgt] += 1
+            max_arm = max([ (v,k) for k,v in counts.items() ])
+            # If one arm is used more times than there are arms, dedup it
+            if max_arm[0] > len(counts):
+                default_tgt = max_arm[1]
+                p = bb[-1].find('{')
+                bb[-1] = bb[-1][:p+1]
+                for tgt,var in arms:
+                    if tgt != default_tgt:
+                        links.append( Link(idx, tgt, var ) )
+                        bb[-1] += "{} => bb{}, ".format(var, tgt)
+                bb[-1] += "* => bb{} }}".format(default_tgt)
+                links.append(Link(idx, default_tgt, "*" ))
+            else:
+                for tgt,var in arms:
+                    links.append( Link(idx, tgt, var ) )
 
 
 
-    print "digraph {"
-    print "node [shape=box, labeljust=l; fontname=\"mono\"];"
+    print("digraph {")
+    print("node [shape=box, labeljust=l; fontname=\"mono\"];")
     for l in links:
-        print '"%s" -> "%s" [label="%s"];' % (l._src, l._dst, l._label)
+        print('"{}" -> "{}" [label="{}"];'.format(l._src, l._dst, l._label))
 
-    print ""
+    print("")
     for idx,bb in enumerate(bbs):
-        print '"bb%i" [label="BB%i:' % (idx,idx,),
+        if bb == ["diverge;"]:
+            continue
+        print('"bb{0}" [label="BB{0}:'.format(idx), end="")
         for stmt in bb:
-            print '\\l',stmt.replace('"', '\\"'),
-        print '"];'
-    print "}"
+            print('\\l',stmt.replace('"', '\\"'), end="")
+        print('"];')
+    print("}")
 
 
 main()

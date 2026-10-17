@@ -64,6 +64,9 @@ namespace {
                      || dynamic_cast< ::HIR::ExprNode_Deref*>(node_ptr.get())
                         )
                     {
+                        if( auto* inner = dynamic_cast< ::HIR::ExprNode_Deref*>(node_ptr.get()) ) {
+                            inner->m_value->m_usage = HIR::ValueUsage::Mutate;
+                        }
                         DEBUG("Insert reborrow - " << node_ptr->span() << " - type=" << node_ptr->m_res_type);
                         auto sp = node_ptr->span();
                         auto ty_mut = node_ptr->m_res_type.clone();
@@ -75,8 +78,15 @@ namespace {
                     // Recurse into blocks - Neater this way
                     else if( auto p = dynamic_cast< ::HIR::ExprNode_Block*>(node_ptr.get()) )
                     {
-                        ASSERT_BUG( node_ptr->span(), p->m_value_node, "reborrow into block that doesn't yield" );
-                        p->m_value_node = do_reborrow(mv$(p->m_value_node));
+                        if( p->m_value_node )
+                        {
+                            p->m_value_node = do_reborrow(mv$(p->m_value_node));
+                        }
+                        else
+                        {
+                            const auto* node = node_ptr.get();
+                            DEBUG("Node " << node << " is a non-yielding block");
+                        }
                     }
                     else
                     {
@@ -117,6 +127,13 @@ namespace {
             ::HIR::ExprVisitorDef::visit(node);
             for(auto& arg : node.m_args) {
                 arg = do_reborrow(mv$(arg));
+            }
+        }
+
+        void visit(::HIR::ExprNode_Match& node) override {
+            ::HIR::ExprVisitorDef::visit(node);
+            for(auto& arm : node.m_arms) {
+                arm.m_code = do_reborrow(std::move(arm.m_code));
             }
         }
 
@@ -165,26 +182,14 @@ namespace {
         {
         }
 
-        // NOTE: This is left here to ensure that any expressions that aren't handled by higher code cause a failure
         void visit_expr(::HIR::ExprPtr& exp) override {
-            BUG(Span(), "visit_expr hit in OuterVisitor");
+            if(exp)
+            {
+                ExprVisitor_Mutate  ev(m_crate);
+                ev.visit_node_ptr(exp);
+            }
         }
 
-        void visit_type(::HIR::TypeRef& ty) override
-        {
-            if(auto* e = ty.data_mut().opt_Array())
-            {
-                this->visit_type( e->inner );
-                DEBUG("Array size " << ty);
-                if( e->size.is_Unevaluated() ) {
-                    ExprVisitor_Mutate  ev(m_crate);
-                    ev.visit_node_ptr( *e->size.as_Unevaluated() );
-                }
-            }
-            else {
-                ::HIR::Visitor::visit_type(ty);
-            }
-        }
         // ------
         // Code-containing items
         // ------
@@ -201,40 +206,12 @@ namespace {
                 DEBUG("Function code " << p << " (none)");
             }
         }
-        void visit_static(::HIR::ItemPath p, ::HIR::Static& item) override {
-            if( item.m_value )
-            {
-                ExprVisitor_Mutate  ev(m_crate);
-                ev.visit_node_ptr(item.m_value);
-            }
-        }
-        void visit_constant(::HIR::ItemPath p, ::HIR::Constant& item) override {
-            if( item.m_value )
-            {
-                ExprVisitor_Mutate  ev(m_crate);
-                ev.visit_node_ptr(item.m_value);
-            }
-        }
-        void visit_enum(::HIR::ItemPath p, ::HIR::Enum& item) override {
-            if(auto* e = item.m_data.opt_Value())
-            {
-                for(auto& var : e->variants)
-                {
-                    DEBUG("Enum value " << p << " - " << var.name);
-
-                    if( var.expr )
-                    {
-                        ExprVisitor_Mutate  ev(m_crate);
-                        ev.visit_node_ptr(var.expr);
-                    }
-                }
-            }
-        }
     };
 }   // namespace
 
 void HIR_Expand_Reborrows_Expr(const ::HIR::Crate& crate, ::HIR::ExprPtr& exp)
 {
+    TRACE_FUNCTION;
     ExprVisitor_Mutate  ev(crate);
     ev.visit_node_ptr( exp );
 }

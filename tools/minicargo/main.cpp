@@ -9,6 +9,7 @@
 #include <iostream>
 #include <cstring>  // strcmp
 #include <map>
+#include <set>
 #include <debug.h>
 #include "manifest.h"
 #include <helpers.h>
@@ -17,6 +18,7 @@
 #include <toml.h>   // TomlFile (workspace)
 #include <fstream>  // for workspace enumeration
 #include "cfg.hpp"
+#include "resolve.h"
 
 struct ProgramOptions
 {
@@ -25,6 +27,9 @@ struct ProgramOptions
 
     // Directory containing build script outputs
     const char* override_directory = nullptr;
+
+    /// TOML file containing overrides/patches to the loaded manifests
+    const char* manifest_overrides = nullptr;
 
     // Directory containing "vendored" (packaged) copies of packages
     const char* vendor_dir = nullptr;
@@ -42,7 +47,9 @@ struct ProgramOptions
     ::std::vector<const char*>  lib_search_dirs;
 
     // Number of build jobs to run at a time
-    unsigned build_jobs = 1;
+    unsigned build_jobs = 0;
+    // Don't run build tasks, just print
+    bool    dry_run = false;
 
     // Pause for user input before quitting (useful for MSVC debugging)
     bool pause_before_quit = false;
@@ -50,10 +57,18 @@ struct ProgramOptions
     /// Build and run tests?
     bool test = false;
 
+    /// Enable debug output (`-g` passed)
+    bool enable_debug = false;
+
+    bool no_default_features = false;
     ::std::vector<::std::string>    features;
 
+    /// Panic strategy passed to the compiler as `-C panic=<strategy>` (e.g. "abort" or "unwind").
+    /// nullptr means "let the compiler pick its default" (mrustc: `panic_abort`).
+    const char* panic_strategy = nullptr;
+
     int parse(int argc, const char* argv[]);
-    void usage() const;
+    void usage(::std::ostream& os) const;
     void help() const;
 };
 
@@ -66,8 +81,10 @@ int main(int argc, const char* argv[])
 
     {
         Debug_DisablePhase("Load Repository");
+        Debug_DisablePhase("Load Overrides");
         Debug_DisablePhase("Load Root");
         Debug_DisablePhase("Load Workspace");
+        Debug_DisablePhase("Resolve Dependencies");
         Debug_DisablePhase("Load Dependencies");
         Debug_DisablePhase("Enumerate Build");
         Debug_DisablePhase("Run Build");
@@ -90,26 +107,23 @@ int main(int argc, const char* argv[])
         }
 
         auto bs_override_dir = opts.override_directory ? ::helpers::path(opts.override_directory) : ::helpers::path();
+        // Convert the path to an absolute path, so we can find the workspace in directories in/above the CWD
+        auto dir = ::helpers::path(opts.directory ? opts.directory : ".").to_absolute();
 
         Cfg_SetTarget(opts.target);
 
-        // 1. Load the Cargo.toml file from the passed directory
-        Debug_SetPhase("Load Root");
-        auto dir = ::helpers::path(opts.directory ? opts.directory : ".");
-        auto m = PackageManifest::load_from_toml( dir / "Cargo.toml" );
-        m.set_features(opts.features, opts.features.empty());
-
-        if(false)
+        Debug_SetPhase("Load Overrides");
+        if( opts.manifest_overrides )
         {
-            m.dump(std::cout);
+            Manifest_LoadOverrides(opts.manifest_overrides);
         }
 
         Debug_SetPhase("Load Workspace");
-        auto workspace_manifest_path = m.workspace_path();
-        if( !workspace_manifest_path.is_valid() )
+        WorkspaceManifest   workspace_manifest;
+        ::helpers::path workspace_manifest_path;
         {
-            auto p = helpers::path( m.manifest_path() );
-            p.pop_component();  // remove `Cargo.toml`
+            // Add `.` to the path, so the first `pop_component` returns the original path (in case the package and workspace manifests are the same file)
+            auto p = dir / ".";
             // Search parent dir and up (pop current dir and then start checking)
             while( p.pop_component() )
             {
@@ -127,6 +141,15 @@ int main(int argc, const char* argv[])
                         if( key_val.path[0] == "workspace" )
                         {
                             is_workspace = true;
+                            workspace_manifest_path = pp;
+                            break;
+                        }
+                        if( key_val.path[0] == "package" && key_val.path[1] == "workspace" )
+                        {
+                            // TODO: Is this only valid when `p == dir`?
+                            is_workspace = true;
+                            workspace_manifest_path = key_val.value.as_string();
+                            workspace_manifest_path /= "Cargo.toml";
                             break;
                         }
                     }
@@ -134,7 +157,6 @@ int main(int argc, const char* argv[])
 
                 if( is_workspace )
                 {
-                    workspace_manifest_path = pp;
                     break;
                 }
             }
@@ -146,63 +168,113 @@ int main(int argc, const char* argv[])
         else
         {
             DEBUG("Workspace manifest " << workspace_manifest_path);
-            TomlFile    toml_file(workspace_manifest_path);
+            workspace_manifest = WorkspaceManifest::load_from_toml(workspace_manifest_path);
+            DEBUG("- Applying patches");
+            for(const auto& p : workspace_manifest.patches()) {
+                repo.add_patch_path(p.first, p.second);
+            }
+            repo.set_workspace(workspace_manifest);
+        }
 
-            for(auto key_val : toml_file)
-            {
-                if( key_val.path[0] == "patch" )
-                {
-                    if( key_val.path.size() < 4 ) {
-                        DEBUG("Too-short path " << key_val.path);
-                        continue ;
-                    }
-                    const auto& repo_name = key_val.path[1];
-                    const auto& package_name = key_val.path[2];
-                    // This is a dependency section
-                    if( key_val.path[3] == "path" )
-                    {
-                        if( key_val.path.size() != 4 ) {
-                            DEBUG("Wrong-length path " << key_val.path);
-                            continue ;
-                        }
-                        if( key_val.value.m_type != TomlValue::Type::String ) {
-                            DEBUG("Incorrect type " << key_val.value);
-                            continue ;
-                        }
-                        if( repo_name == "crates-io" )
-                        {
-                            // Kinda hacky to do overrides in the repository, but it works
-                            auto p = workspace_manifest_path.parent() / key_val.value.as_string();
-                            DEBUG("Override " << package_name << " = path " << p);
-                            repo.add_patch_path(package_name, p);
-                        }
-                        else
-                        {
-                            DEBUG("TODO: Handle patching other types of dependencies");
-                        }
-                    }
-                    else
-                    {
-                        TODO("Handle workspace patch dependency frag '" << key_val.path[3] << "'");
-                    }
+        // 1. Load the Cargo.toml file from the passed directory
+        Debug_SetPhase("Load Root");
+        auto m = PackageManifest::load_from_toml( dir / "Cargo.toml", &workspace_manifest );
+        m.set_features(opts.features, !opts.no_default_features);
+
+        if(false)
+        {
+            m.dump(std::cout);
+        }
+
+        // Resolve dependencies to ensure only one version of each semver line exists
+        LockfileContents    lockfile;
+        {
+            Debug_SetPhase("Resolve Dependencies");
+            auto lockfile_path = workspace_manifest_path.is_valid()
+                ? workspace_manifest_path.parent() / "Cargo.lock"
+                : dir / "Cargo.lock"
+                ;
+            if( ::std::ifstream(lockfile_path).is_open() ) {
+                // TODO: Parse the lockfile and use it
+                //ResolveDepdencies_CargoLockFile(repo, m, lockfile_path);
+            }
+            // TODO: Implement the cargo resolver variants (need to find good docs)
+
+            if( false ) {
+                lockfile = ResolveDependencies_MinicargoOriginal(repo, m);
+            }
+            else {
+                lockfile = ResolveDependencies_Cargo(repo, m, 1/*workspace_manifest.resolver_version*/);
+            }
+
+            // TODO: Save the selected versions into a lockfile?
+            for(const auto& e : lockfile.package_deps) {
+                DEBUG(e.first.name << " v" << e.first.version << " => {");
+                for(const auto& d : e.second) {
+                    DEBUG("  " << d.name << " v" << d.version);
                 }
-                else if( key_val.path[0] == "replace" )
-                {
-                    TODO(toml_file.lexer() << ": Handle [replace]");
-                }
-                else if( key_val.path[0] == "profile" )
-                {
-                    // Igonore for now
-                }
-                else
-                {
-                }
+                DEBUG("}");
             }
         }
 
         // 2. Load all dependencies
         Debug_SetPhase("Load Dependencies");
-        m.load_dependencies(repo, !bs_override_dir.is_valid(), /*include_dev=*/opts.test);
+        {
+            {
+                struct ApplyState {
+                    /// Stack of packages to visit
+                    std::vector<const PackageManifest*> visit_stack;
+                    std::set<const PackageManifest*> visited;
+                    const PackageManifest* pop() {
+                        if( visit_stack.empty() ) {
+                            return nullptr;
+                        }
+                        else {
+                            auto rv = visit_stack.back();
+                            visit_stack.pop_back();
+                            return rv;
+                        }
+                    }
+                } s;
+                s.visit_stack.push_back(&m);
+                while(const auto* cur_manifest = s.pop())
+                {
+                    if( !s.visited.insert(cur_manifest).second ) {
+                        continue ;
+                    }
+                    DEBUG("Commiting for " << cur_manifest->name() << " " << cur_manifest->version());
+                    auto base_path = cur_manifest->directory();
+                    auto it = lockfile.package_deps.find( LockfileContents::PackageKey(*cur_manifest) );
+                    if(it == lockfile.package_deps.end()) {
+                        throw ::std::runtime_error(format("No lockfile entry for ", cur_manifest->name(), " ", cur_manifest->version()));
+                    }
+                    const auto& locked_deps = it->second;
+
+                    ::std::vector<const PackageRef*>    deps;
+                    cur_manifest->iter_main_dependencies([&](const PackageRef& dep_c) { deps.push_back(&dep_c); });
+                    cur_manifest->iter_build_dependencies([&](const PackageRef& dep_c) { deps.push_back(&dep_c); });
+
+                    for(const PackageRef* dep_v : deps) {
+                        auto dep = const_cast<PackageRef*>(dep_v);
+                        auto loaded = dep->load_manifest_raw(repo, base_path, [&](const PackageVersion& v) {
+                            return locked_deps.count( LockfileContents::PackageKey(dep->name(), v) ) != 0;
+                        });
+                        if( !loaded ) {
+                            // Error?
+                            DEBUG(">> " << *dep << " = ?");
+                        }
+                        else {
+                            DEBUG(">> " << *dep << " = " << loaded->name() << " " << loaded->version());
+                            s.visit_stack.push_back(loaded.get());
+                            dep->set_package(std::move(loaded));
+                        }
+                    }
+                }
+            }
+
+            // TODO: Pass lockfile here, instead of doing two passes
+            m.load_dependencies(repo, !bs_override_dir.is_valid(), /*include_dev=*/opts.test);
+        }
 
         // 3. Build dependency tree and build program.
         BuildOptions    build_opts;
@@ -210,7 +282,9 @@ int main(int argc, const char* argv[])
         build_opts.output_dir = opts.output_directory ? ::helpers::path(opts.output_directory) : ::helpers::path("output");
         build_opts.lib_search_dirs.reserve(opts.lib_search_dirs.size());
         build_opts.emit_mmir = opts.emit_mmir;
+        build_opts.enable_debug = opts.enable_debug;
         build_opts.target_name = opts.target;
+        build_opts.panic_strategy = opts.panic_strategy;
         for(const auto* d : opts.lib_search_dirs)
             build_opts.lib_search_dirs.push_back( ::helpers::path(d) );
         // Indicate desire to build tests (or examples) instead of the primary target
@@ -221,7 +295,7 @@ int main(int argc, const char* argv[])
         Debug_SetPhase("Enumerate Build");
         auto build_list = BuildList(m, build_opts);
         Debug_SetPhase("Run Build");
-        if( !build_list.build(::std::move(build_opts), opts.build_jobs) )
+        if( !build_list.build(::std::move(build_opts), opts.build_jobs, opts.dry_run) )
         {
             ::std::cerr << "BUILD FAILED" << ::std::endl;
             if(opts.pause_before_quit) {
@@ -309,11 +383,14 @@ int ProgramOptions::parse(int argc, const char* argv[])
                 }
                 break;
             case 'n':
-                this->build_jobs = 0;
+                this->dry_run = true;
+                break;
+            case 'g':
+                this->enable_debug = true;
                 break;
             case 'h':
                 this->help();
-                exit(1);
+                exit(0);
             default:
                 ::std::cerr << "Unknown flag -" << arg[1] << ::std::endl;
                 return 1;
@@ -328,7 +405,7 @@ int ProgramOptions::parse(int argc, const char* argv[])
             // Long arguments
             if( ::std::strcmp(arg, "--help") == 0 ) {
                 this->help();
-                exit(1);
+                exit(0);
             }
             else if( ::std::strcmp(arg, "--script-overrides") == 0 ) {
                 if(i+1 == argc) {
@@ -336,6 +413,13 @@ int ProgramOptions::parse(int argc, const char* argv[])
                     return 1;
                 }
                 this->override_directory = argv[++i];
+            }
+            else if( ::std::strcmp(arg, "--manifest-overrides") == 0 ) {
+                if(i+1 == argc) {
+                    ::std::cerr << "Flag " << arg << " takes an argument" << ::std::endl;
+                    return 1;
+                }
+                this->manifest_overrides = argv[++i];
             }
             else if( ::std::strcmp(arg, "--vendor-dir") == 0 ) {
                 if(i+1 == argc) {
@@ -371,6 +455,16 @@ int ProgramOptions::parse(int argc, const char* argv[])
                 }
                 this->features.push_back( ::std::string(a) );
             }
+            else if( ::std::strcmp(arg, "--no-default-features") == 0 ) {
+                this->no_default_features = true;
+            }
+            else if( ::std::strcmp(arg, "--panic") == 0 ) {
+                if(i+1 == argc) {
+                    ::std::cerr << "Flag " << arg << " takes an argument" << ::std::endl;
+                    return 1;
+                }
+                this->panic_strategy = argv[++i];
+            }
             else if( ::std::strcmp(arg, "--pause") == 0 ) {
                 this->pause_before_quit = true;
             }
@@ -386,16 +480,16 @@ int ProgramOptions::parse(int argc, const char* argv[])
 
     if( !this->directory /*|| !this->outfile*/ )
     {
-        usage();
+        usage(::std::cerr);
         exit(1);
     }
 
     return 0;
 }
 
-void ProgramOptions::usage() const
+void ProgramOptions::usage(::std::ostream& os) const
 {
-    ::std::cerr
+    os
         << "Usage: minicargo <package dir>" << ::std::endl
         << ::std::endl
         << "   Build a cargo package using mrustc. Point it at a directory containing Cargo.toml" << ::std::endl
@@ -404,8 +498,8 @@ void ProgramOptions::usage() const
 
 void ProgramOptions::help() const
 {
-    usage();
-    ::std::cerr
+    usage(::std::cout);
+    ::std::cout
         << ::std::endl
         << "--help, -h  : Show this help text\n"
         << "--script-overrides <dir> : Directory containing <package>.txt files containing the build script output\n"
@@ -414,5 +508,9 @@ void ProgramOptions::help() const
         << "-L <dir>                 : Search for pre-built crates (e.g. libstd) in the specified directory\n"
         << "-j <count>               : Run at most <count> build tasks at once (default is to run only one)\n"
         << "-n                       : Don't build any packages, just list the packages that would be built\n"
+        << "-g                       : Pass `-g` to compiler\n"
+        << "--no-default-features    : \n"
+        << "--features <list>        : \n"
+        << "--panic <strategy>       : Pass `-C panic=<strategy>` to the compiler (e.g. `unwind`)\n"
         ;
 }

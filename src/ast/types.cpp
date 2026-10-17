@@ -17,10 +17,12 @@ static const struct {
     const char* name;
     enum eCoreType  type;
 } CORETYPES[] = {
-    // NOTE: Sorted
+    // NOTE: Lexographically sorted (hence why 128 comes first)
     {"_", CORETYPE_ANY},
     {"bool", CORETYPE_BOOL},
     {"char", CORETYPE_CHAR},
+    {"f128", CORETYPE_F128},
+    {"f16", CORETYPE_F16},
     {"f32", CORETYPE_F32},
     {"f64", CORETYPE_F64},
     {"i128", CORETYPE_I128},
@@ -28,7 +30,7 @@ static const struct {
     {"i32", CORETYPE_I32},
     {"i64", CORETYPE_I64},
     {"i8", CORETYPE_I8},
-    {"int", CORETYPE_INT},
+    //{"int", CORETYPE_INT},
     {"isize", CORETYPE_INT},
     {"str", CORETYPE_STR},
     {"u128", CORETYPE_U128},
@@ -36,7 +38,7 @@ static const struct {
     {"u32", CORETYPE_U32},
     {"u64", CORETYPE_U64},
     {"u8",  CORETYPE_U8},
-    {"uint", CORETYPE_UINT},
+    //{"uint", CORETYPE_UINT},
     {"usize", CORETYPE_UINT},
 };
 
@@ -57,7 +59,7 @@ const char* coretype_name(const eCoreType ct ) {
     switch(ct)
     {
     case CORETYPE_INVAL:return "INVAL";
-    case CORETYPE_ANY:  return "_";
+    case CORETYPE_ANY:  return "_/*CORETYPE_ANY*/";
     case CORETYPE_CHAR: return "char";
     case CORETYPE_STR:  return "str";
     case CORETYPE_BOOL: return "bool";
@@ -73,17 +75,21 @@ const char* coretype_name(const eCoreType ct ) {
     case CORETYPE_I64:  return "i64";
     case CORETYPE_U128: return "u128";
     case CORETYPE_I128: return "i128";
+    case CORETYPE_F16:  return "f16";
     case CORETYPE_F32:  return "f32";
     case CORETYPE_F64:  return "f64";
+    case CORETYPE_F128: return "f128";
     }
     DEBUG("Unknown core type?! " << ct);
     return "NFI";
 }
 
 Type_Function::Type_Function(const Type_Function& other):
+    hrbs(other.hrbs),
     is_unsafe(other.is_unsafe),
     m_abi(other.m_abi),
-    m_rettype( box$( other.m_rettype->clone() ) )
+    m_rettype( box$( other.m_rettype->clone() ) ),
+    is_variadic(other.is_variadic)
 {
     for( const auto& at : other.m_arg_types )
         m_arg_types.push_back( at.clone() );
@@ -101,6 +107,21 @@ Ordering Type_Function::ord(const Type_Function& x) const
 }
 
 TypeRef::~TypeRef()
+{
+}
+
+TypeRef::TypeRef(TagMacro, ::AST::MacroInvocation inv):
+    m_span(inv.span()),
+    m_data(TypeData::make_Macro({box$(inv)}))
+{
+}
+TypeRef::TypeRef(TagPath, Span sp, AST::Path path):
+    m_span(mv$(sp)),
+    m_data(TypeData::make_Path( box$(path) ))
+{
+}
+TypeRef::TypeRef(Span sp, AST::Path path):
+    TypeRef(TagPath(), mv$(sp), mv$(path))
 {
 }
 
@@ -123,7 +144,7 @@ TypeRef TypeRef::clone() const
     _COPY(None)
     _COPY(Any)
     _COPY(Bang)
-    _CLONE(Macro, { old.inv.clone() })
+    _CLONE(Macro, { box$(old.inv->clone()) })
     //case TypeData::TAG_Macro:   assert( !"Copying an unexpanded type macro" );
     _COPY(Unit)
     _COPY(Primitive)
@@ -132,21 +153,37 @@ TypeRef TypeRef::clone() const
     _CLONE(Borrow,  { AST::LifetimeRef(old.lifetime), old.is_mut, box$(old.inner->clone()) })
     _CLONE(Pointer, { old.is_mut, box$(old.inner->clone()) })
     _CLONE(Array, { box$(old.inner->clone()), old.size })
+    _CLONE(Slice, { box$(old.inner->clone()) })
     _COPY(Generic)
-    _COPY(Path)
+    _CLONE(Path, std::make_unique<AST::Path>(*old))
     _COPY(TraitObject)
-    _COPY(ErasedType)
+    _CLONE(ErasedType, std::make_unique<Type_ErasedType>(Type_ErasedType {
+        old->traits, old->maybe_traits, old->lifetimes,
+        old->use ? box$(*old->use) : ::std::unique_ptr<AST::PathParams>(),
+        old->is_edition_2024_or_later
+    }))
     #undef _COPY
     #undef _CLONE
     }
     throw "";
 }
 
+Type_TraitPath::Type_TraitPath(AST::HigherRankedBounds hrbs, AST::Path path)
+    : hrbs(mv$(hrbs))
+    , path(box$(path))
+{
+}
+Type_TraitPath::Type_TraitPath(const Type_TraitPath& x)
+    : hrbs(x.hrbs)
+    , path(std::make_unique<AST::Path>(*x.path))
+{
+}
+
 Ordering Type_TraitPath::ord(const Type_TraitPath& x) const
 {
     Ordering    rv;
 
-    rv = ::ord( this->path, x.path );
+    rv = ::ord( *this->path, *x.path );
     if(rv != OrdEqual)  return rv;
 
     return rv;
@@ -192,17 +229,28 @@ Ordering TypeRef::ord(const TypeRef& x) const
         }
         return OrdEqual;
         ),
+    (Slice,
+        return (*ent.inner).ord( *x_ent.inner );
+        ),
     (Generic,
         return ::ord(ent.name, x_ent.name);
         ),
     (Path,
-        return ent.path.ord( x_ent.path );
+        return ent->ord( *x_ent );
         ),
     (TraitObject,
         return ::ord(ent.traits, x_ent.traits);
         ),
     (ErasedType,
-        return ::ord(ent.traits, x_ent.traits);
+        ORD(ent->traits, x_ent->traits);
+        ORD(ent->maybe_traits, x_ent->maybe_traits);
+        ORD(ent->lifetimes, x_ent->lifetimes);
+        ORD(ent->use != 0, x_ent->use != 0);
+        if( ent->use ) {
+            ORD(*ent->use, *x_ent->use);
+        }
+        ORD(ent->is_edition_2024_or_later, x_ent->is_edition_2024_or_later);
+        return OrdEqual;
         )
     )
     throw ::std::runtime_error(FMT("BUGCHECK - Unhandled TypeRef class '" << m_data.tag() << "'"));
@@ -216,11 +264,12 @@ void TypeRef::print(::std::ostream& os, bool is_debug/*=false*/) const
 {
     //os << "TypeRef(";
     #define _(VAR, ...) case TypeData::TAG_##VAR: { const auto &ent = this->m_data.as_##VAR(); (void)&ent; __VA_ARGS__ } break;
+    #define _2(VAR, brace) case TypeData::TAG_##VAR: { const auto &ent = this->m_data.as_##VAR(); (void)&ent;
     switch(this->m_data.tag())
     {
     case TypeData::TAGDEAD: throw "";
     _(None,
-        os << "!!";
+        os << "!/*none*/!";
         )
     _(Any,
         os << "_";
@@ -229,7 +278,7 @@ void TypeRef::print(::std::ostream& os, bool is_debug/*=false*/) const
         os << "!";
         )
     _(Macro,
-        os << ent.inv;
+        os << *ent.inv;
         )
     _(Unit,
         os << "()";
@@ -237,17 +286,23 @@ void TypeRef::print(::std::ostream& os, bool is_debug/*=false*/) const
     _(Primitive,
         os << ent.core_type;
         )
-    _(Function,
+    TU_ARM(m_data, Function, ent) {
+        os << ent.info.hrbs;
         if( ent.info.m_abi != "" )
             os << "extern \"" << ent.info.m_abi << "\" ";
-        os << "fn (";
+        if(ent.info.is_unsafe)
+            os << "unsafe ";
+        os << "fn(";
         for( const auto& arg : ent.info.m_arg_types )
         {
             arg.print(os, is_debug);
             os << ", ";
         }
-        os << ") -> " << *ent.info.m_rettype;
-        )
+        os << ")";
+        if( !ent.info.m_rettype->is_unit() ) {
+            os << " -> " << *ent.info.m_rettype;
+        }
+        } break;
     _(Tuple,
         os << "( ";
         for( const auto& it : ent.inner_types )
@@ -257,19 +312,32 @@ void TypeRef::print(::std::ostream& os, bool is_debug/*=false*/) const
         }
         os << ")";
         )
-    _(Borrow,
-        os << "&" << (ent.is_mut ? "mut " : "");
+    TU_ARM(m_data, Borrow, ent) {
+        os << "&";
+        if(ent.lifetime != AST::LifetimeRef())
+            os << ent.lifetime << " ";
+        os << (ent.is_mut ? "mut " : "");
         ent.inner->print(os, is_debug);
-        )
+        } break;
     _(Pointer,
-        os << "*" << (ent.is_mut ? "mut" : "const");
+        os << "*" << (ent.is_mut ? "mut " : "const ");
         ent.inner->print(os, is_debug);
         )
     _(Array,
         os << "[";
         ent.inner->print(os, is_debug);
-        if( ent.size.get() )
-            os << "; " << *ent.size;
+        os << "; ";
+        if( ent.size.get() ) {
+            os << *ent.size;
+        }
+        else {
+            os << "_";
+        }
+        os << "]";
+        )
+    _(Slice,
+        os << "[";
+        ent.inner->print(os, is_debug);
         os << "]";
         )
     _(Generic,
@@ -280,30 +348,54 @@ void TypeRef::print(::std::ostream& os, bool is_debug/*=false*/) const
             os << "/*"<<ent.index<<"*/";
         )
     _(Path,
-        ent.path.print_pretty(os, true, is_debug);
+        ent->print_pretty(os, true, is_debug);
         )
     _(TraitObject,
         os << "(";
+        bool needs_plus = false;
         for( const auto& it : ent.traits ) {
-            if( &it != &ent.traits.front() )
-                os << "+";
+            if(needs_plus)  os << "+";
+            needs_plus = true;
             os << it.hrbs;
-            it.path.print_pretty(os, true, is_debug);
+            it.path->print_pretty(os, true, is_debug);
+        }
+        for( const auto& it : ent.lifetimes ) {
+            if( it.binding() != AST::LifetimeRef::BINDING_UNSPECIFIED ) {
+                if(needs_plus)  os << "+";
+                needs_plus = true;
+                os << it;
+            }
         }
         os << ")";
         )
     _(ErasedType,
         os << "impl ";
-        for( const auto& it : ent.traits ) {
-            if( &it != &ent.traits.front() )
-                os << "+";
+        bool needs_plus = false;
+        for( const auto& it : ent->traits ) {
+            if(needs_plus)  os << "+";
+            needs_plus = true;
             os << it.hrbs;
-            it.path.print_pretty(os, true, is_debug);
+            it.path->print_pretty(os, true, is_debug);
+        }
+        for( const auto& it : ent->maybe_traits ) {
+            if(needs_plus)  os << "+";
+            needs_plus = true;
+            os << it.hrbs;
+            it.path->print_pretty(os, true, is_debug);
+        }
+        for( const auto& it : ent->lifetimes ) {
+            if(needs_plus)  os << "+";
+            needs_plus = true;
+            os << it;
+        }
+        if( ent->use ) {
+            os << "use" << *ent->use;
         }
         os << "";
         )
     }
     #undef _
+    #undef _2
 }
 
 ::std::ostream& operator<<(::std::ostream& os, const TypeRef& tr) {
@@ -322,6 +414,9 @@ namespace AST {
         }
         else if( x.m_binding == LifetimeRef::BINDING_INFER ) {
             os << "'_";
+        }
+        else if( x.m_binding == LifetimeRef::BINDING_UNSPECIFIED ) {
+            os << "/*'UNSPEC*/";
         }
         else {
             os << "'" << x.m_name.name;

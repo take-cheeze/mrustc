@@ -93,12 +93,12 @@ namespace {
 
             // - If the called value is a local closure, figure out how it's being used.
             // TODO: You can call via &-ptrs, but that currently isn't handled in typeck
-            if(const auto* e = node.m_value->m_res_type.data().opt_Closure() )
+            if(const auto* node_pp = TU_OPT1(node.m_value->m_res_type.data(), NodeType, .opt_Closure()) )
             {
                 if( node.m_trait_used == ::HIR::ExprNode_CallValue::TraitUsed::Unknown )
                 {
                     // NOTE: Closure node still exists, and will do until MIR construction deletes the HIR
-                    switch(e->node->m_class)
+                    switch( (*node_pp)->m_class)
                     {
                     case ::HIR::ExprNode_Closure::Class::Unknown:
                         BUG(sp, "References an ::Unknown closure");
@@ -128,7 +128,8 @@ namespace {
                 method_path = ::HIR::Path(
                     ty_val.clone(),
                     ::HIR::GenericPath( m_crate.get_lang_item_path(sp, "fn"), mv$(trait_args) ),
-                    "call"
+                    RcString::new_interned("call"),
+                    HIR::PathParams(HIR::LifetimeRef())
                     );
                 break;
             case ::HIR::ExprNode_CallValue::TraitUsed::FnMut:
@@ -137,7 +138,8 @@ namespace {
                 method_path = ::HIR::Path(
                     ty_val.clone(),
                     ::HIR::GenericPath( m_crate.get_lang_item_path(sp, "fn_mut"), mv$(trait_args) ),
-                    "call_mut"
+                    RcString::new_interned("call_mut"),
+                    HIR::PathParams(HIR::LifetimeRef())
                     );
                 break;
             case ::HIR::ExprNode_CallValue::TraitUsed::FnOnce:
@@ -145,7 +147,7 @@ namespace {
                 method_path = ::HIR::Path(
                     ty_val.clone(),
                     ::HIR::GenericPath( m_crate.get_lang_item_path(sp, "fn_once"), mv$(trait_args) ),
-                    "call_once"
+                    RcString::new_interned("call_once")
                     );
                 break;
 
@@ -322,16 +324,14 @@ namespace {
             assert( opname );
 
             // Needs replacement, continue
-            ::HIR::PathParams   trait_params;
-            trait_params.m_types.push_back( ty_val.clone() );
-            ::HIR::GenericPath  trait { m_crate.get_lang_item_path(node.span(), langitem), mv$(trait_params) };
+            ::HIR::GenericPath  trait { m_crate.get_lang_item_path(node.span(), langitem), ::HIR::PathParams( ty_val.clone() ) };
 
             auto slot_type_refmut = ::HIR::TypeRef::new_borrow(::HIR::BorrowType::Unique, ty_slot.clone());
             ::std::vector< ::HIR::ExprNodeP>    args;
             args.push_back(NEWNODE( slot_type_refmut.clone(), Borrow, sp,  ::HIR::BorrowType::Unique, mv$(node.m_slot) ));
             args.push_back( mv$(node.m_value) );
             m_replacement = NEWNODE(mv$(node.m_res_type), CallPath, sp,
-                ::HIR::Path(ty_slot.clone(), mv$(trait), opname),
+                ::HIR::Path(ty_slot.clone(), mv$(trait), RcString::new_interned(opname), HIR::PathParams(HIR::LifetimeRef())),
                 mv$(args)
                 );
 
@@ -383,6 +383,9 @@ namespace {
                 ::HIR::PathParams   trait_params;
                 trait_params.m_types.push_back( ty_r.clone() );
                 ::HIR::GenericPath  trait { m_crate.get_lang_item_path(node.span(), langitem), mv$(trait_params) };
+                ::HIR::PathParams   fcn_params;
+                fcn_params.m_lifetimes.push_back(HIR::LifetimeRef());
+                fcn_params.m_lifetimes.push_back(HIR::LifetimeRef());
 
                 auto ty_l_ref = ::HIR::TypeRef::new_borrow( ::HIR::BorrowType::Shared, ty_l.clone() );
                 auto ty_r_ref = ::HIR::TypeRef::new_borrow( ::HIR::BorrowType::Shared, ty_r.clone() );
@@ -394,7 +397,7 @@ namespace {
                 args.push_back(NEWNODE(ty_r_ref.clone(), Borrow, sp_right,  ::HIR::BorrowType::Shared, mv$(node.m_right) ));
 
                 m_replacement = NEWNODE(mv$(node.m_res_type), CallPath, sp,
-                    ::HIR::Path(ty_l.clone(), mv$(trait), method),
+                    ::HIR::Path(ty_l.clone(), mv$(trait), RcString::new_interned(method), mv$(fcn_params)),
                     mv$(args)
                     );
 
@@ -450,7 +453,7 @@ namespace {
             args.push_back( mv$(node.m_right) );
 
             m_replacement = NEWNODE(mv$(node.m_res_type), CallPath, sp,
-                ::HIR::Path(ty_l.clone(), mv$(trait), method),
+                ::HIR::Path(ty_l.clone(), mv$(trait), RcString::new_interned(method)),
                 mv$(args)
                 );
 
@@ -527,7 +530,7 @@ namespace {
             args.push_back( mv$(node.m_value) );
 
             m_replacement = NEWNODE(mv$(node.m_res_type), CallPath, sp,
-                ::HIR::Path(ty_val.clone(), mv$(trait), method),
+                ::HIR::Path(ty_val.clone(), mv$(trait), RcString::new_interned(method)),
                 mv$(args)
                 );
 
@@ -537,7 +540,8 @@ namespace {
             arg_types.push_back( m_replacement->m_res_type.clone() );
         }
 
-
+        // NOTE: These are now in MIR generation, to handle temporary raising
+#if 0
         void visit(::HIR::ExprNode_Index& node) override
         {
             const auto& sp = node.span();
@@ -573,7 +577,7 @@ namespace {
             switch( node.m_value->m_usage )
             {
             case ::HIR::ValueUsage::Unknown:
-                BUG(sp, "Usage of value in index op is unknown");
+                BUG(sp, "Usage of index reciever is still `Unknown`");
                 break;
             case ::HIR::ValueUsage::Borrow:
                 bt = ::HIR::BorrowType::Shared;
@@ -600,8 +604,11 @@ namespace {
             args.push_back( NEWNODE( ::HIR::TypeRef::new_borrow(bt, ty_val.clone()), Borrow, sp, bt, mv$(node.m_value) ) );
             args.push_back( mv$(node.m_index) );
 
+            ::HIR::PathParams   pp_method;
+            pp_method.m_lifetimes.push_back(HIR::LifetimeRef());
+
             m_replacement = NEWNODE( ::HIR::TypeRef::new_borrow(bt, node.m_res_type.clone()), CallPath, sp,
-                ::HIR::Path(ty_val.clone(), mv$(trait), method),
+                ::HIR::Path(ty_val.clone(), mv$(trait), RcString::new_interned(method), mv$(pp_method)),
                 mv$(args)
                 );
             // Populate the cache for later passes
@@ -615,6 +622,7 @@ namespace {
             // - Dereference the result (which is an &-ptr)
             m_replacement = NEWNODE( mv$(node.m_res_type), Deref, sp,  mv$(m_replacement) );
         }
+#endif
 
 #if 0
         void visit(::HIR::ExprNode_Deref& node) override
@@ -752,19 +760,13 @@ namespace {
             BUG(Span(), "visit_expr hit in OuterVisitor");
         }
 
-        void visit_type(::HIR::TypeRef& ty) override
+        void visit_constgeneric(::HIR::ConstGeneric& c) override
         {
-            if(auto* e = ty.data_mut().opt_Array())
+            HIR::Visitor::visit_constgeneric(c);
+            if( auto* e = c.opt_Unevaluated() )
             {
-                this->visit_type( e->inner );
-                DEBUG("Array size " << ty);
-                if( e->size.is_Unevaluated() ) {
-                    ExprVisitor_Mutate  ev(m_crate);
-                    ev.visit_node_ptr( *e->size.as_Unevaluated() );
-                }
-            }
-            else {
-                ::HIR::Visitor::visit_type(ty);
+                ExprVisitor_Mutate  ev(m_crate);
+                ev.visit_node_ptr( *(*e)->expr );
             }
         }
         // ------
@@ -817,6 +819,7 @@ namespace {
 
 void HIR_Expand_UfcsEverything_Expr(const ::HIR::Crate& crate, ::HIR::ExprPtr& exp)
 {
+    TRACE_FUNCTION;
     ExprVisitor_Mutate  ev { crate };
     ev.visit_node_ptr(exp);
 }

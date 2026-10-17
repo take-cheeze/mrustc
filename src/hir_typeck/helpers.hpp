@@ -11,6 +11,7 @@
 #include <hir/expr.hpp> // t_trait_list
 
 #include "common.hpp"
+#include "resolve_common.hpp"
 
 static inline bool type_is_unbounded_infer(const ::HIR::TypeRef& ty)
 {
@@ -20,7 +21,6 @@ static inline bool type_is_unbounded_infer(const ::HIR::TypeRef& ty)
         case ::HIR::InferClass::Integer:    return false;
         case ::HIR::InferClass::Float:      return false;
         case ::HIR::InferClass::None:   return true;
-        case ::HIR::InferClass::Diverge:return true;
         }
     }
     return false;
@@ -57,7 +57,7 @@ public:
 public: // ?? - Needed once, anymore?
     struct IVar
     {
-        //bool could_be_diverge;    // TODO: use this instead of InferClass::Diverge
+        //bool could_be_diverge;
         unsigned int alias; // If not ~0, this points to another ivar
         ::std::unique_ptr< ::HIR::TypeRef> type;    // Type (only nullptr if alias!=0)
 
@@ -69,6 +69,17 @@ public: // ?? - Needed once, anymore?
     };
 
     ::std::vector< IVar>    m_ivars;
+    struct IVarValue {
+        unsigned int alias;
+        ::std::unique_ptr< ::HIR::ConstGeneric> val;
+        IVarValue():
+            alias(~0u),
+            val(new ::HIR::ConstGeneric())
+        {}
+        bool is_alias() const { return alias != ~0u; }
+    };
+    ::std::vector< IVarValue>    m_values;
+
     bool    m_has_changed;
 
 public:
@@ -96,8 +107,9 @@ public:
 
     void dump() const;
 
-    void print_type(::std::ostream& os, const ::HIR::TypeRef& tr) const;
-    void print_pathparams(::std::ostream& os, const ::HIR::PathParams& pps) const;
+    void print_type(::std::ostream& os, const ::HIR::TypeRef& tr, LList<const ::HIR::TypeRef*> stack = {}) const;
+    void print_genericpath(::std::ostream& os, const ::HIR::GenericPath& pps, LList<const ::HIR::TypeRef*> stack) const;
+    void print_pathparams(::std::ostream& os, const ::HIR::PathParams& pps, LList<const ::HIR::TypeRef*> stack = {}) const;
 
     FmtType fmt_type(const ::HIR::TypeRef& tr) const {
         return FmtType(*this, tr);
@@ -108,16 +120,30 @@ public:
 
     /// Add (and bind) all '_' types in `type`
     void add_ivars(::HIR::TypeRef& type);
+    void add_ivars(::HIR::ConstGeneric& val);
     // (helper) Add ivars to path parameters
     void add_ivars_params(::HIR::PathParams& params);
 
-    ::std::function<const ::HIR::TypeRef&(const ::HIR::TypeRef&)> callback_resolve_infer() const {
-        return [&](const auto& ty)->const auto& {
-                if( ty.data().is_Infer() )
-                    return this->get_type(ty);
-                else
-                    return ty;
-            };
+    struct ResolvePlaceholders: public HIR::ResolvePlaceholders {
+        const HMTypeInferrence& m_parent;
+        ResolvePlaceholders(const HMTypeInferrence& parent): m_parent(parent) {
+        }
+
+        const ::HIR::TypeRef& get_type(const Span& sp, const HIR::TypeRef& ty) const override {
+            if( ty.data().is_Infer() )
+                return m_parent.get_type(ty);
+            else
+                return ty;
+        }
+        const ::HIR::ConstGeneric& get_val(const Span& sp, const HIR::ConstGeneric& v) const override {
+            if( v.is_Infer() )
+                return m_parent.get_value(v);
+            else
+                return v;
+        }
+    };
+    ResolvePlaceholders callback_resolve_infer() const {
+        return ResolvePlaceholders(*this);
     }
 
     // Mutation
@@ -126,63 +152,67 @@ public:
     void set_ivar_to(unsigned int slot, ::HIR::TypeRef type);
     void ivar_unify(unsigned int left_slot, unsigned int right_slot);
 
+    // 
+    unsigned int new_ivar_val();
+    void set_ivar_val_to(unsigned int slot, ::HIR::ConstGeneric val);
+    void ivar_val_unify(unsigned int left_slot, unsigned int right_slot);
+
+    ::HIR::ConstGeneric new_val_ivar();
+    void set_val_ivar_to(unsigned int slot, ::HIR::ConstGeneric val);
+
     // Lookup
-    ::HIR::TypeRef& get_type(::HIR::TypeRef& type);
+    //::HIR::TypeRef& get_type(::HIR::TypeRef& type);
     const ::HIR::TypeRef& get_type(const ::HIR::TypeRef& type) const;
           ::HIR::TypeRef& get_type(unsigned idx);
     const ::HIR::TypeRef& get_type(unsigned idx) const;
+
+    const ::HIR::ConstGeneric& get_value(const ::HIR::ConstGeneric& val) const;
+    const ::HIR::ConstGeneric& get_value(unsigned idx) const;
 
     void check_for_loops();
     void expand_ivars(::HIR::TypeRef& type);
     void expand_ivars_params(::HIR::PathParams& params);
 
     // Helpers
-    bool pathparams_contain_ivars(const ::HIR::PathParams& pps) const;
-    bool type_contains_ivars(const ::HIR::TypeRef& ty) const;
+    bool pathparams_contain_ivars(const ::HIR::PathParams& pps, bool only_unbound) const;
+    bool type_contains_ivars(const ::HIR::TypeRef& ty, bool only_unbound=false) const;
     bool pathparams_equal(const ::HIR::PathParams& pps_l, const ::HIR::PathParams& pps_r) const;
     bool types_equal(const ::HIR::TypeRef& l, const ::HIR::TypeRef& r) const;
 private:
     IVar& get_pointed_ivar(unsigned int slot) const;
 };
 
-class TraitResolution
+class TraitResolution:
+    public TraitResolveCommon
 {
+    const HIR::SimplePath&  m_lang_Deref;
     const HMTypeInferrence& m_ivars;
 
-    const ::HIR::Crate& m_crate;
-    const ::HIR::GenericParams* m_impl_params;
-    const ::HIR::GenericParams* m_item_params;
-    const ::HIR::SimplePath&    m_vis_path;
-
-    ::std::map< ::HIR::TypeRef, ::HIR::TypeRef> m_type_equalities;
-
-    ::HIR::SimplePath   m_lang_Box;
-    mutable ::std::vector< ::HIR::TypeRef>  m_eat_active_stack;
 public:
-    TraitResolution(const HMTypeInferrence& ivars, const ::HIR::Crate& crate, const ::HIR::GenericParams* impl_params, const ::HIR::GenericParams* item_params, const ::HIR::SimplePath& vis_path):
-        m_ivars(ivars),
-        m_crate(crate),
-        m_impl_params( impl_params ),
-        m_item_params( item_params )
+    const ::HIR::SimplePath&    m_vis_path;
+private:
+    const ::HIR::GenericPath*   m_current_trait_path;
+    const ::HIR::Trait* m_current_trait_ptr;
+
+    mutable ::std::map<std::string, HIR::TypeRef>  m_eat_cache;
+    mutable ::std::vector<std::unique_ptr<::HIR::TypeRef>>  m_eat_active_stack;
+public:
+    TraitResolution(const HMTypeInferrence& ivars, const ::HIR::Crate& crate, const ::HIR::GenericParams* impl_params, const ::HIR::GenericParams* item_params, const ::HIR::SimplePath& vis_path,  const ::HIR::GenericPath* current_trait):
+        TraitResolveCommon(crate)
+        ,m_lang_Deref(crate.get_lang_item_path_opt("deref"))
+        ,m_ivars(ivars)
         ,m_vis_path(vis_path)
+        ,m_current_trait_path(current_trait)
+        ,m_current_trait_ptr(current_trait ? &crate.get_trait_by_path(Span(), current_trait->m_path) : nullptr)
     {
-        prep_indexes();
-        m_lang_Box = crate.get_lang_item_path_opt("owned_box");
+        m_impl_generics = impl_params;
+        m_item_generics = item_params;
+        prep_indexes(Span());
     }
 
-    const ::HIR::GenericParams& impl_params() const {
-        static ::HIR::GenericParams empty;
-        return m_impl_params ? *m_impl_params : empty;
+    const ::HIR::GenericPath* current_trait_path() const {
+        return m_current_trait_path;
     }
-    const ::HIR::GenericParams& item_params() const {
-        static ::HIR::GenericParams empty;
-        return m_item_params ? *m_item_params : empty;
-    }
-
-    const ::HIR::TypeRef& get_const_param_type(const Span& sp, unsigned binding) const;
-
-    void prep_indexes();
-
     ::HIR::Compare compare_pp(const Span& sp, const ::HIR::PathParams& left, const ::HIR::PathParams& right) const;
 
     void compact_ivars(HMTypeInferrence& m_ivars);
@@ -203,23 +233,25 @@ public:
         }
     }
 
-    /// Iterate over in-scope bounds (function then top)
-    bool iterate_bounds( ::std::function<bool(const ::HIR::GenericBound&)> cb) const;
-    bool iterate_bounds_traits(const Span& sp, ::std::function<bool(const ::HIR::TypeRef&, const ::HIR::TraitPath& trait)> cb) const;
+    typedef ::std::function<bool(HIR::Compare cmp, const ::HIR::TypeRef&, const ::HIR::GenericPath& trait_path, const CachedBound& info)> t_cb_bound;
+    bool iterate_bounds_traits(const Span& sp, const HIR::TypeRef& type, const HIR::SimplePath& trait, t_cb_bound cb) const;
+    bool iterate_bounds_traits(const Span& sp, const HIR::TypeRef& type, t_cb_bound cb) const;
+    bool iterate_bounds_traits(const Span& sp, t_cb_bound cb) const;
     bool iterate_aty_bounds(const Span& sp, const ::HIR::Path::Data::Data_UfcsKnown& pe, ::std::function<bool(const ::HIR::TraitPath&)> cb) const;
 
-    typedef ::std::function<bool(const ::HIR::TypeRef&, const ::HIR::PathParams&, const ::std::map< RcString,::HIR::TypeRef>&)> t_cb_trait_impl;
+    typedef ::std::function<bool(const ::HIR::TypeRef&, const ::HIR::PathParams&, const ::HIR::TraitPath::assoc_list_t&)> t_cb_trait_impl;
     typedef ::std::function<bool(ImplRef, ::HIR::Compare)> t_cb_trait_impl_r;
 
     /// Searches for a trait impl that matches the provided trait name and type
     bool find_trait_impls(const Span& sp, const ::HIR::SimplePath& trait, const ::HIR::PathParams& params, const ::HIR::TypeRef& type,  t_cb_trait_impl_r callback, bool magic_trait_impls=true) const;
 
+    typedef ::std::function<bool(const ::HIR::TraitPath&)> t_cb_find_trait;
     /// Locate a named trait in the provied trait (either itself or as a parent trait)
     bool find_named_trait_in_trait(const Span& sp,
             const ::HIR::SimplePath& des, const ::HIR::PathParams& params,
             const ::HIR::Trait& trait_ptr, const ::HIR::SimplePath& trait_path, const ::HIR::PathParams& pp,
             const ::HIR::TypeRef& self_type,
-            t_cb_trait_impl callback
+            t_cb_find_trait callback
             ) const;
     /// Search for a trait implementation in current bounds
     bool find_trait_impls_bound(const Span& sp, const ::HIR::SimplePath& trait, const ::HIR::PathParams& params, const ::HIR::TypeRef& type,  t_cb_trait_impl_r callback) const;
@@ -231,6 +263,10 @@ public:
     bool find_trait_impls_crate(const Span& sp, const ::HIR::SimplePath& trait, const ::HIR::PathParams* params, const ::HIR::TypeRef& type,  t_cb_trait_impl_r callback) const;
     /// Check for magic (automatically determined) trait implementations
     bool find_trait_impls_magic(const Span& sp, const ::HIR::SimplePath& trait, const ::HIR::PathParams& params, const ::HIR::TypeRef& type,  t_cb_trait_impl_r callback) const;
+    /// Check for trait implementations on magical types (closures, generators, fn pointers, ...)
+    bool find_trait_impls_types(const Span& sp, const ::HIR::SimplePath& trait, const ::HIR::PathParams& params, const ::HIR::TypeRef& type,  t_cb_trait_impl_r callback) const;
+
+    struct RecursionDetected {};
 
 private:
     ::HIR::Compare check_auto_trait_impl_destructure(const Span& sp, const ::HIR::SimplePath& trait, const ::HIR::PathParams* params_ptr, const ::HIR::TypeRef& type) const;
@@ -251,17 +287,17 @@ public:
     /// Locate the named method by applying auto-dereferencing.
     /// \return Number of times deref was applied (or ~0 if _ was hit)
     unsigned int autoderef_find_method(const Span& sp,
-            const HIR::t_trait_list& traits, const ::std::vector<unsigned>& ivars, const ::HIR::TypeRef& top_ty, const char* method_name,
+            const HIR::t_trait_list& traits, const ::std::vector<unsigned>& ivars, const ::HIR::TypeRef& top_ty, const RcString& method_name,
             /* Out -> */::std::vector<::std::pair<AutoderefBorrow,::HIR::Path>>& possibilities
             ) const;
     /// Locate the named field by applying auto-dereferencing.
     /// \return Number of times deref was applied (or ~0 if _ was hit)
-    unsigned int autoderef_find_field(const Span& sp, const ::HIR::TypeRef& top_ty, const char* name,  /* Out -> */::HIR::TypeRef& field_type) const;
+    unsigned int autoderef_find_field(const Span& sp, const ::HIR::TypeRef& top_ty, const RcString& name,  /* Out -> */::HIR::TypeRef& field_type) const;
 
     /// Apply an automatic dereference
     const ::HIR::TypeRef* autoderef(const Span& sp, const ::HIR::TypeRef& ty,  ::HIR::TypeRef& tmp_type) const;
 
-    bool find_field(const Span& sp, const ::HIR::TypeRef& ty, const char* name,  /* Out -> */::HIR::TypeRef& field_type) const;
+    bool find_field(const Span& sp, const ::HIR::TypeRef& ty, const RcString& name,  /* Out -> */::HIR::TypeRef& field_type) const;
 
     enum class MethodAccess {
         Shared,
@@ -280,12 +316,12 @@ public:
     };
     friend ::std::ostream& operator<<(::std::ostream& os, const AllowedReceivers& x);
     bool find_method(const Span& sp,
-            const HIR::t_trait_list& traits, const ::std::vector<unsigned>& ivars, const ::HIR::TypeRef& ty, const char* method_name, MethodAccess access,
+            const HIR::t_trait_list& traits, const ::std::vector<unsigned>& ivars, const ::HIR::TypeRef& ty, const RcString& method_name, MethodAccess access,
             AutoderefBorrow borrow_type, /* Out -> */::std::vector<::std::pair<AutoderefBorrow,::HIR::Path>>& possibilities
             ) const;
 
     /// Locates a named method in a trait, and returns the path of the trait that contains it (with fixed parameters)
-    const ::HIR::Function* trait_contains_method(const Span& sp, const ::HIR::GenericPath& trait_path, const ::HIR::Trait& trait_ptr, const ::HIR::TypeRef& self, const char* name,  ::HIR::GenericPath& out_path) const;
+    const ::HIR::Function* trait_contains_method(const Span& sp, const ::HIR::GenericPath& trait_path, const ::HIR::Trait& trait_ptr, const ::HIR::TypeRef& self, const RcString& name,  ::HIR::GenericPath& out_path) const;
     bool trait_contains_type(const Span& sp, const ::HIR::GenericPath& trait_path, const ::HIR::Trait& trait_ptr, const char* name,  ::HIR::GenericPath& out_path) const;
 
     ::HIR::Compare type_is_sized(const Span& sp, const ::HIR::TypeRef& ty) const;

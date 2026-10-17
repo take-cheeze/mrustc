@@ -72,6 +72,8 @@ public:
 
     operator bool () const { return ptr != nullptr; }
 
+    ExprStatePtr clone() const;
+
           ::HIR::ExprState& operator*()       { assert(ptr); return *ptr; }
     const ::HIR::ExprState& operator*() const { assert(ptr); return *ptr; }
           ::HIR::ExprState* operator->()       { assert(ptr); return ptr; }
@@ -99,6 +101,7 @@ public:
     ExprPtr(::std::unique_ptr< ::HIR::ExprNode> _);
     ExprPtr(const ExprPtr&) = delete;
     ExprPtr(ExprPtr&&) = default;
+    ExprPtr& operator=(ExprPtr&&) = default;
 
     /// Take the innards and turn into a unique_ptr - used so typecheck can edit the root node.
     ::std::unique_ptr< ::HIR::ExprNode> into_unique();

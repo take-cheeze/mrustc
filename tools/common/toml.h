@@ -11,11 +11,12 @@
 #include <vector>
 #include <string>
 #include <unordered_map>
+#include <cstdint>
 
 class TomlFileIter;
 struct TomlKeyValue;
 
-struct Token;
+struct TomlToken;
 class TomlLexer
 {
     friend class TomlFile;
@@ -26,7 +27,7 @@ class TomlLexer
     unsigned    m_line;
 protected:
     TomlLexer(const ::std::string& filename);
-    Token   get_token();
+    TomlToken   get_token();
 
 public:
     friend ::std::ostream& operator<<(::std::ostream& os, const TomlLexer& x);
@@ -41,7 +42,7 @@ class TomlFile
     ::std::vector<::std::string>    m_current_block;
 
     /// Path suffix of the current composite (none if empty)
-    ::std::vector<::std::string>    m_current_composite;
+    ::std::vector< std::vector<std::string>>    m_current_composite;
 
     /// Index of the next array field (if zero, not parsing an array)
     unsigned int m_next_array_index;
@@ -59,6 +60,14 @@ public:
     TomlKeyValue get_next_value();
 
     const TomlLexer& lexer() const { return m_lexer; }
+
+private:
+    std::vector<std::string>    get_path(std::vector<std::string> tail) const;
+    /// Consume a balanced `[...]` / `{...}` group (nested groups included),
+    /// discarding its contents. The opening bracket/brace must already have
+    /// been consumed. Used to skip nested arrays / inline tables that only
+    /// appear in sections minicargo never reads (e.g. `[package.metadata.*]`).
+    void skip_composite_value();
 };
 
 struct TomlValue
@@ -110,23 +119,25 @@ struct TomlValue
     ::std::string   m_str_value;
     ::std::vector<TomlValue>    m_sub_values;
 
-    TomlValue():
-        m_type(Type::String)
+    TomlValue()
+        : m_type(Type::String)
+        , m_int_value(0)
     {
     }
-    TomlValue(::std::string s):
-        m_type( Type::String ),
-        m_str_value(::std::move(s))
+    TomlValue(::std::string s)
+        : m_type( Type::String )
+        , m_int_value(0)
+        , m_str_value(::std::move(s))
     {
     }
-    TomlValue(int64_t v):
-        m_type(Type::Integer),
-        m_int_value(v)
+    TomlValue(int64_t v)
+        : m_type(Type::Integer)
+        , m_int_value(v)
     {
     }
-    TomlValue(bool v) :
-        m_type(Type::Boolean),
-        m_int_value(v ? 1 : 0)
+    TomlValue(bool v)
+        : m_type(Type::Boolean)
+        , m_int_value(v ? 1 : 0)
     {
     }
 
@@ -167,7 +178,24 @@ struct TomlValue
             os << "]";
             break;
         case Type::String:
-            os << "\"" << x.m_str_value << "\"";
+            os << "\"";
+            for(uint8_t c : x.m_str_value) {
+                switch(c)
+                {
+                case '\n':  os << "\\n";    break;
+                case '\r':  os << "\\n";    break;
+                case '\t':  os << "\\t";    break;
+                default:
+                    if( 0x20 <= c && c <= 0x7F ) {
+                        os << c;
+                    }
+                    else {
+                        static const char* H = "0123456789ABCDEF";
+                        os << "\\x" << H[c >> 4] << H[c & 0xF];
+                    }
+                }
+            }
+            os << "\"";
             break;
         }
         return os;
@@ -176,9 +204,10 @@ struct TomlValue
 
 struct TomlKeyValue
 {
+    typedef ::std::vector<::std::string>    Path;
     // Path to the value (last node is the value name)
     // TODO: How are things like `[[bin]]` handled?
-    ::std::vector<::std::string>    path;
+    Path    path;
     // Relevant value
     TomlValue   value;
 };

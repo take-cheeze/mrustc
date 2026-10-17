@@ -16,11 +16,12 @@
 #include "types.hpp"
 #include "pattern.hpp"
 #include "attrs.hpp"
+#include "expr_ptr.hpp"
+#include "../hir/asm.hpp"
 
 namespace AST {
 
-using ::std::unique_ptr;
-
+class Pattern;
 class NodeVisitor;
 
 class ExprNode
@@ -32,7 +33,7 @@ public:
 
     virtual void visit(NodeVisitor& nv) = 0;
     virtual void print(::std::ostream& os) const = 0;
-    virtual ::std::unique_ptr<ExprNode> clone() const = 0;
+    virtual ExprNodeP clone() const = 0;
 
     void set_span(Span s) { m_span = ::std::move(s); }
     const Span& span() const { return m_span; }
@@ -44,32 +45,84 @@ public:
     }
     AttributeList& attrs() { return m_attrs; }
 };
-typedef ::std::unique_ptr<ExprNode> ExprNodeP;
 
 #define NODE_METHODS()  \
     void visit(NodeVisitor& nv) override;\
     void print(::std::ostream& os) const override; \
-    ::std::unique_ptr<ExprNode> clone() const override;
+    ExprNodeP clone() const override;
 
 struct ExprNode_Block:
     public ExprNode
 {
-    bool m_is_unsafe;
-    bool m_yields_final_value;
+    enum class Type {
+        Bare,
+        Unsafe,
+        Const,
+    };
+    Type m_block_type;
+    Ident   m_label;
     ::std::shared_ptr<AST::Module> m_local_mod;
-    ::std::vector<ExprNodeP>    m_nodes;
+    struct Line {
+        bool has_semicolon;
+        ExprNodeP   node;
+    };
+    ::std::vector<Line>    m_nodes;
 
-    ExprNode_Block(::std::vector<ExprNodeP> nodes={}):
-        m_is_unsafe(false),
-        m_yields_final_value(true),
+    ExprNode_Block(::std::vector<Line> nodes={}):
+        m_block_type(Type::Bare),
+        m_label(""),
         m_local_mod(),
-        m_nodes( mv$(nodes) )
+        m_nodes( ::std::move(nodes) )
     {}
-    ExprNode_Block(bool is_unsafe, bool yields_final_value, ::std::vector<ExprNodeP> nodes, ::std::shared_ptr<AST::Module> local_mod):
-        m_is_unsafe(is_unsafe),
-        m_yields_final_value(yields_final_value),
-        m_local_mod( move(local_mod) ),
-        m_nodes( move(nodes) )
+    /// Shortcut for a block that returns a contained node
+    ExprNode_Block(ExprNodeP value)
+        : ExprNode_Block()
+    {
+        set_span(value->span());
+        m_nodes.push_back({false, std::move(value)});
+    }
+    ExprNode_Block(Type type, ::std::vector<Line> nodes, ::std::shared_ptr<AST::Module> local_mod):
+        m_block_type(type),
+        m_label(""),
+        m_local_mod( ::std::move(local_mod) ),
+        m_nodes( ::std::move(nodes) )
+    {
+    }
+
+    void push_stmt(AST::ExprNodeP node) {
+        m_nodes.push_back({ true, std::move(node) });
+    }
+    void push_tail_expr(AST::ExprNodeP node) {
+        m_nodes.push_back({ false, std::move(node) });
+    }
+
+    NODE_METHODS();
+};
+
+struct ExprNode_AsyncBlock:
+    public ExprNode
+{
+    ExprNodeP   m_inner;
+    bool m_is_move;
+
+    ExprNode_AsyncBlock(ExprNodeP inner, bool is_move)
+        : m_inner(std::move(inner))
+        , m_is_move(is_move)
+    {
+    }
+
+    NODE_METHODS();
+};
+
+struct ExprNode_GeneratorBlock:
+    public ExprNode
+{
+    ExprNodeP   m_inner;
+    bool m_is_move;
+
+    ExprNode_GeneratorBlock(ExprNodeP inner, bool is_move)
+        : m_inner(std::move(inner))
+        , m_is_move(is_move)
     {
     }
 
@@ -82,7 +135,7 @@ struct ExprNode_Try:
     ExprNodeP   m_inner;
 
     ExprNode_Try(ExprNodeP inner):
-        m_inner(mv$(inner))
+        m_inner( ::std::move(inner) )
     {
     }
 
@@ -95,24 +148,26 @@ struct ExprNode_Macro:
     AST::Path   m_path;
     RcString   m_ident;
     ::TokenTree m_tokens;
+    bool    m_is_braced;
 
-    ExprNode_Macro(AST::Path name, RcString ident, ::TokenTree&& tokens):
-        m_path( move(name) ),
+    ExprNode_Macro(AST::Path name, RcString ident, ::TokenTree&& tokens, bool is_braced=false):
+        m_path( ::std::move(name) ),
         m_ident(ident),
-        m_tokens( move(tokens) )
+        m_tokens( ::std::move(tokens) )
+        , m_is_braced(is_braced)
     {}
 
     NODE_METHODS();
 };
 
-// asm! macro
+// llvm_asm! macro
 struct ExprNode_Asm:
     public ExprNode
 {
     struct ValRef
     {
         ::std::string   name;
-        unique_ptr<ExprNode>    value;
+        ExprNodeP   value;
     };
 
     ::std::string   m_text;
@@ -122,11 +177,45 @@ struct ExprNode_Asm:
     ::std::vector<::std::string>    m_flags;
 
     ExprNode_Asm(::std::string text, ::std::vector<ValRef> output, ::std::vector<ValRef> input, ::std::vector<::std::string> clobbers, ::std::vector<::std::string> flags):
-        m_text( move(text) ),
-        m_output( move(output) ),
-        m_input( move(input) ),
-        m_clobbers( move(clobbers) ),
-        m_flags( move(flags) )
+        m_text( ::std::move(text) ),
+        m_output( ::std::move(output) ),
+        m_input( ::std::move(input) ),
+        m_clobbers( ::std::move(clobbers) ),
+        m_flags( ::std::move(flags) )
+    {
+    }
+
+    NODE_METHODS();
+};
+
+// asm! macro
+struct ExprNode_Asm2:
+    public ExprNode
+{
+    TAGGED_UNION(Param, Const,
+        (Const, AST::ExprNodeP),
+        (Sym, AST::Path),
+        (RegSingle, struct {
+            AsmCommon::Direction    dir;
+            AsmCommon::RegisterSpec spec;
+            AST::ExprNodeP  val;
+            }),
+        (Reg, struct {
+            AsmCommon::Direction    dir;
+            AsmCommon::RegisterSpec spec;
+            AST::ExprNodeP  val_in;
+            AST::ExprNodeP  val_out;
+            })
+        );
+
+    AsmCommon::Options  m_options;
+    std::vector<AsmCommon::Line>   m_lines;
+    std::vector<Param>  m_params;
+
+    ExprNode_Asm2(AsmCommon::Options options, std::vector<AsmCommon::Line> lines, std::vector<Param> params)
+        : m_options(options)
+        , m_lines( ::std::move(lines) )
+        , m_params( ::std::move(params) )
     {
     }
 
@@ -139,16 +228,19 @@ struct ExprNode_Flow:
 {
     enum Type {
         RETURN,
+        YIELD,
         CONTINUE,
         BREAK,
+        // `do yeet value` - a failed `?`
+        YEET,
     } m_type;
-    RcString   m_target;
-    unique_ptr<ExprNode>    m_value;
+    Ident   m_target;
+    ExprNodeP    m_value;
 
-    ExprNode_Flow(Type type, RcString target, unique_ptr<ExprNode>&& value):
+    ExprNode_Flow(Type type, Ident target, ExprNodeP value):
         m_type(type),
-        m_target( move(target) ),
-        m_value( move(value) )
+        m_target( ::std::move(target) ),
+        m_value( ::std::move(value) )
     {
     }
 
@@ -159,12 +251,16 @@ struct ExprNode_LetBinding:
 {
     Pattern m_pat;
     TypeRef m_type;
-    unique_ptr<ExprNode>    m_value;
+    ExprNodeP    m_value;
+    ExprNodeP    m_else;
+    /// Allocated binding slots/indexes for the pattern in `let-else`
+    ::std::pair<unsigned,unsigned>  m_letelse_slots;
 
-    ExprNode_LetBinding(Pattern pat, TypeRef type, unique_ptr<ExprNode>&& value):
-        m_pat( move(pat) ),
-        m_type( move(type) ),
-        m_value( move(value) )
+    ExprNode_LetBinding(Pattern pat, TypeRef type, ExprNodeP value, ExprNodeP else_arm={})
+        : m_pat( ::std::move(pat) )
+        , m_type( ::std::move(type) )
+        , m_value( ::std::move(value) )
+        , m_else( ::std::move(else_arm) )
     {
     }
 
@@ -180,14 +276,14 @@ struct ExprNode_Assign:
         AND, OR , XOR,
         SHR, SHL,
     } m_op;
-    unique_ptr<ExprNode>    m_slot;
-    unique_ptr<ExprNode>    m_value;
+    ExprNodeP    m_slot;
+    ExprNodeP    m_value;
 
     ExprNode_Assign(): m_op(NONE) {}
-    ExprNode_Assign(Operation op, unique_ptr<ExprNode>&& slot, unique_ptr<ExprNode>&& value):
+    ExprNode_Assign(Operation op, ExprNodeP slot, ExprNodeP value):
         m_op(op),
-        m_slot( move(slot) ),
-        m_value( move(value) )
+        m_slot( ::std::move(slot) ),
+        m_value( ::std::move(value) )
     {
     }
 
@@ -197,11 +293,11 @@ struct ExprNode_CallPath:
     public ExprNode
 {
     Path    m_path;
-    ::std::vector<unique_ptr<ExprNode>> m_args;
+    ::std::vector<ExprNodeP> m_args;
 
-    ExprNode_CallPath(Path&& path, ::std::vector<unique_ptr<ExprNode>>&& args):
-        m_path( move(path) ),
-        m_args( move(args) )
+    ExprNode_CallPath(Path&& path, ::std::vector<ExprNodeP>&& args):
+        m_path( ::std::move(path) ),
+        m_args( ::std::move(args) )
     {
     }
 
@@ -210,14 +306,14 @@ struct ExprNode_CallPath:
 struct ExprNode_CallMethod:
     public ExprNode
 {
-    unique_ptr<ExprNode>    m_val;
+    ExprNodeP    m_val;
     PathNode    m_method;
-    ::std::vector<unique_ptr<ExprNode>> m_args;
+    ::std::vector<ExprNodeP> m_args;
 
-    ExprNode_CallMethod(unique_ptr<ExprNode> obj, PathNode method, ::std::vector<unique_ptr<ExprNode>> args):
-        m_val( move(obj) ),
-        m_method( move(method) ),
-        m_args( move(args) )
+    ExprNode_CallMethod(ExprNodeP obj, PathNode method, ::std::vector<ExprNodeP> args):
+        m_val( ::std::move(obj) ),
+        m_method( ::std::move(method) ),
+        m_args( ::std::move(args) )
     {
     }
 
@@ -227,12 +323,12 @@ struct ExprNode_CallMethod:
 struct ExprNode_CallObject:
     public ExprNode
 {
-    unique_ptr<ExprNode>    m_val;
-    ::std::vector<unique_ptr<ExprNode>> m_args;
+    ExprNodeP    m_val;
+    ::std::vector<ExprNodeP> m_args;
 
-    ExprNode_CallObject(unique_ptr<ExprNode>&& val, ::std::vector< unique_ptr<ExprNode> >&& args):
-        m_val( move(val) ),
-        m_args( move(args) )
+    ExprNode_CallObject(ExprNodeP val, ::std::vector< ExprNodeP >&& args):
+        m_val( ::std::move(val) ),
+        m_args( ::std::move(args) )
     {
     }
     NODE_METHODS();
@@ -241,35 +337,51 @@ struct ExprNode_CallObject:
 struct ExprNode_Loop:
     public ExprNode
 {
-    enum Type {
-        LOOP,
-        WHILE,
-        WHILELET,
-        FOR,
-    } m_type;
-    RcString   m_label;
-    AST::Pattern    m_pattern;
-    unique_ptr<ExprNode>    m_cond; // if NULL, loop is a 'loop'
-    unique_ptr<ExprNode>    m_code;
+    Ident   m_label;
+    ExprNodeP    m_code;
 
-    ExprNode_Loop(): m_type(LOOP) {}
-    ExprNode_Loop(RcString label, unique_ptr<ExprNode> code):
-        m_type(LOOP),
+    ExprNode_Loop():
+        m_label("")
+    {
+    }
+    ExprNode_Loop(Ident label, ExprNodeP code):
         m_label( ::std::move(label) ),
         m_code( ::std::move(code) )
     {}
-    ExprNode_Loop(RcString label, unique_ptr<ExprNode> cond, unique_ptr<ExprNode> code):
-        m_type(WHILE),
-        m_label( ::std::move(label) ),
-        m_cond( ::std::move(cond) ),
-        m_code( ::std::move(code) )
-    {}
-    ExprNode_Loop(RcString label, Type type, AST::Pattern pattern, unique_ptr<ExprNode> val, unique_ptr<ExprNode> code):
-        m_type(type),
+    NODE_METHODS();
+};
+struct ExprNode_For:
+    public ExprNode
+{
+    Ident   m_label;
+    AST::Pattern    m_pattern;
+    ExprNodeP    m_value;
+    ExprNodeP    m_code;
+
+    ExprNode_For(Ident label, AST::Pattern pattern, ExprNodeP val, ExprNodeP code):
         m_label( ::std::move(label) ),
         m_pattern( ::std::move(pattern) ),
-        m_cond( ::std::move(val) ),
+        m_value( ::std::move(val) ),
         m_code( ::std::move(code) )
+    {}
+    NODE_METHODS();
+};
+struct IfLet_Condition
+{
+    ::std::unique_ptr<AST::Pattern> opt_pat;
+    ExprNodeP    value;
+};
+struct ExprNode_While:
+    public ExprNode
+{
+    Ident   m_label;
+    std::vector<IfLet_Condition> m_conditions;
+    ExprNodeP    m_code;
+
+    ExprNode_While(Ident label, std::vector<IfLet_Condition> conditions, ExprNodeP code)
+        : m_label( ::std::move(label) )
+        , m_conditions( ::std::move(conditions) )
+        , m_code( ::std::move(code) )
     {}
     NODE_METHODS();
 };
@@ -278,16 +390,16 @@ struct ExprNode_Match_Arm
 {
     AttributeList   m_attrs;
     ::std::vector<Pattern>  m_patterns;
-    unique_ptr<ExprNode>    m_cond;
+    std::vector<IfLet_Condition> m_guard;
 
-    unique_ptr<ExprNode>    m_code;
+    ExprNodeP    m_code;
 
 
     ExprNode_Match_Arm()
     {}
-    ExprNode_Match_Arm(::std::vector<Pattern> patterns, unique_ptr<ExprNode> cond, unique_ptr<ExprNode> code):
+    ExprNode_Match_Arm(::std::vector<Pattern> patterns, std::vector<IfLet_Condition> guard, ExprNodeP code):
         m_patterns( mv$(patterns) ),
-        m_cond( mv$(cond) ),
+        m_guard( mv$(guard) ),
         m_code( mv$(code) )
     {}
 };
@@ -295,10 +407,10 @@ struct ExprNode_Match_Arm
 struct ExprNode_Match:
     public ExprNode
 {
-    unique_ptr<ExprNode>    m_val;
+    ExprNodeP    m_val;
     ::std::vector<ExprNode_Match_Arm>  m_arms;
 
-    ExprNode_Match(unique_ptr<ExprNode> val, ::std::vector<ExprNode_Match_Arm> arms):
+    ExprNode_Match(ExprNodeP val, ::std::vector<ExprNode_Match_Arm> arms):
         m_val( ::std::move(val) ),
         m_arms( ::std::move(arms) )
     {
@@ -309,33 +421,24 @@ struct ExprNode_Match:
 struct ExprNode_If:
     public ExprNode
 {
-    unique_ptr<ExprNode>    m_cond;
-    unique_ptr<ExprNode>    m_true;
-    unique_ptr<ExprNode>    m_false;
+    struct Arm {
+        std::vector<IfLet_Condition>   m_conditions;
+        ExprNodeP    m_body;
+    };
+    std::vector<Arm>    m_arms;
+    ExprNodeP    m_else;
 
-    ExprNode_If(unique_ptr<ExprNode>&& cond, unique_ptr<ExprNode>&& true_code, unique_ptr<ExprNode>&& false_code):
-        m_cond( ::std::move(cond) ),
-        m_true( ::std::move(true_code) ),
-        m_false( ::std::move(false_code) )
+    ExprNode_If(std::vector<Arm> arms, ExprNodeP else_code):
+        m_arms( ::std::move(arms) ),
+        m_else( ::std::move(else_code) )
     {
     }
     NODE_METHODS();
 };
-struct ExprNode_IfLet:
+/// Represents `_` in expression position
+struct ExprNode_WildcardPattern:
     public ExprNode
 {
-    std::vector<AST::Pattern>   m_patterns;
-    unique_ptr<ExprNode>    m_value;
-    unique_ptr<ExprNode>    m_true;
-    unique_ptr<ExprNode>    m_false;
-
-    ExprNode_IfLet(std::vector<AST::Pattern> patterns, unique_ptr<ExprNode>&& cond, unique_ptr<ExprNode>&& true_code, unique_ptr<ExprNode>&& false_code):
-        m_patterns( ::std::move(patterns) ),
-        m_value( ::std::move(cond) ),
-        m_true( ::std::move(true_code) ),
-        m_false( ::std::move(false_code) )
-    {
-    }
     NODE_METHODS();
 };
 // Literal integer
@@ -343,9 +446,9 @@ struct ExprNode_Integer:
     public ExprNode
 {
     enum eCoreType  m_datatype;
-    uint64_t    m_value;
+    U128    m_value;
 
-    ExprNode_Integer(uint64_t value, enum eCoreType datatype):
+    ExprNode_Integer(U128 value, enum eCoreType datatype):
         m_datatype(datatype),
         m_value(value)
     {
@@ -386,9 +489,12 @@ struct ExprNode_String:
     public ExprNode
 {
     ::std::string   m_value;
+    /// Hygiene for format strings
+    Ident::Hygiene  m_hygiene;
 
-    ExprNode_String(::std::string value):
-        m_value( ::std::move(value) )
+    ExprNode_String(::std::string value, Ident::Hygiene h={})
+        : m_value( ::std::move(value) )
+        , m_hygiene( ::std::move(h) )
     {}
 
     NODE_METHODS();
@@ -405,6 +511,18 @@ struct ExprNode_ByteString:
 
     NODE_METHODS();
 };
+// Literal C string
+struct ExprNode_CString:
+    public ExprNode
+{
+    ::std::string   m_value;
+
+    ExprNode_CString(::std::string value):
+        m_value( ::std::move(value) )
+    {}
+
+    NODE_METHODS();
+};
 
 // Closure / Lambda
 struct ExprNode_Closure:
@@ -414,14 +532,16 @@ struct ExprNode_Closure:
 
     args_t  m_args;
     TypeRef m_return;
-    unique_ptr<ExprNode>    m_code;
-    bool m_is_move;
-
-    ExprNode_Closure(args_t args, TypeRef rv, unique_ptr<ExprNode> code, bool is_move):
+    ExprNodeP    m_code;
+    bool m_is_move;     //< The closure takes ownership of all values
+    bool m_is_pinned;   //< The closure cannot be moved (this is for generators)
+    
+    ExprNode_Closure(args_t args, TypeRef rv, ExprNodeP code, bool is_move, bool is_pinned):
         m_args( ::std::move(args) ),
         m_return( ::std::move(rv) ),
         m_code( ::std::move(code) ),
-        m_is_move( is_move )
+        m_is_move( is_move ),
+        m_is_pinned( is_pinned )
     {}
 
     NODE_METHODS();
@@ -433,17 +553,33 @@ struct ExprNode_StructLiteral:
     struct Ent {
         AttributeList   attrs;
         RcString   name;
-        unique_ptr<ExprNode>    value;
+        ExprNodeP    value;
     };
     typedef ::std::vector<Ent> t_values;
     Path    m_path;
-    unique_ptr<ExprNode>    m_base_value;
+    ExprNodeP    m_base_value;
     t_values    m_values;
 
-    ExprNode_StructLiteral(Path path, unique_ptr<ExprNode>&& base_value, t_values&& values ):
-        m_path( move(path) ),
-        m_base_value( move(base_value) ),
-        m_values( move(values) )
+    ExprNode_StructLiteral(Path path, ExprNodeP base_value, t_values&& values ):
+        m_path( std::move(path) ),
+        m_base_value( std::move(base_value) ),
+        m_values( std::move(values) )
+    {}
+
+    NODE_METHODS();
+};
+// Struct literal pattern only
+// This implicitly has a `..` in it
+struct ExprNode_StructLiteralPattern:
+    public ExprNode
+{
+    typedef ::std::vector<ExprNode_StructLiteral::Ent> t_values;
+    Path    m_path;
+    t_values    m_values;
+
+    ExprNode_StructLiteralPattern(Path path, t_values&& values)
+        : m_path( std::move(path) )
+        , m_values( std::move(values) )
     {}
 
     NODE_METHODS();
@@ -452,13 +588,13 @@ struct ExprNode_StructLiteral:
 struct ExprNode_Array:
     public ExprNode
 {
-    unique_ptr<ExprNode>    m_size; // if non-NULL, it's a sized array
-    ::std::vector< unique_ptr<ExprNode> >   m_values;
+    ExprNodeP    m_size; // if non-NULL, it's a sized array
+    ::std::vector< ExprNodeP >   m_values;
 
-    ExprNode_Array(::std::vector< unique_ptr<ExprNode> > vals):
+    ExprNode_Array(::std::vector< ExprNodeP > vals):
         m_values( ::std::move(vals) )
     {}
-    ExprNode_Array(unique_ptr<ExprNode> val, unique_ptr<ExprNode> size):
+    ExprNode_Array(ExprNodeP val, ExprNodeP size):
         m_size( ::std::move(size) )
     {
         m_values.push_back( ::std::move(val) );
@@ -470,9 +606,9 @@ struct ExprNode_Array:
 struct ExprNode_Tuple:
     public ExprNode
 {
-    ::std::vector< unique_ptr<ExprNode> >   m_values;
+    ::std::vector< ExprNodeP >   m_values;
 
-    ExprNode_Tuple(::std::vector< unique_ptr<ExprNode> > vals):
+    ExprNode_Tuple(::std::vector< ExprNodeP > vals):
         m_values( ::std::move(vals) )
     {}
 
@@ -484,7 +620,7 @@ struct ExprNode_NamedValue:
 {
     Path    m_path;
 
-    ExprNode_NamedValue(Path&& path):
+    ExprNode_NamedValue(Path path):
         m_path( ::std::move(path) )
     {
     }
@@ -494,10 +630,10 @@ struct ExprNode_NamedValue:
 struct ExprNode_Field:
     public ExprNode
 {
-    ::std::unique_ptr<ExprNode> m_obj;
-    RcString   m_name;
+    ExprNodeP   m_obj;
+    RcString    m_name;
 
-    ExprNode_Field(::std::unique_ptr<ExprNode>&& obj, RcString name):
+    ExprNode_Field(ExprNodeP obj, RcString name):
         m_obj( ::std::move(obj) ),
         m_name( ::std::move(name) )
     {
@@ -507,10 +643,10 @@ struct ExprNode_Field:
 struct ExprNode_Index:
     public ExprNode
 {
-    ::std::unique_ptr<ExprNode> m_obj;
-    ::std::unique_ptr<ExprNode> m_idx;
+    ExprNodeP m_obj;
+    ExprNodeP m_idx;
 
-    ExprNode_Index(::std::unique_ptr<ExprNode> obj, ::std::unique_ptr<ExprNode> idx):
+    ExprNode_Index(ExprNodeP obj, ExprNodeP idx):
         m_obj( ::std::move(obj) ),
         m_idx( ::std::move(idx) )
     {}
@@ -522,9 +658,9 @@ struct ExprNode_Index:
 struct ExprNode_Deref:
     public ExprNode
 {
-    ::std::unique_ptr<ExprNode>    m_value;
+    ExprNodeP    m_value;
 
-    ExprNode_Deref(::std::unique_ptr<ExprNode> value):
+    ExprNode_Deref(ExprNodeP value):
         m_value( ::std::move(value) )
     {
     }
@@ -536,12 +672,12 @@ struct ExprNode_Deref:
 struct ExprNode_Cast:
     public ExprNode
 {
-    unique_ptr<ExprNode>    m_value;
+    ExprNodeP    m_value;
     TypeRef m_type;
 
-    ExprNode_Cast(unique_ptr<ExprNode>&& value, TypeRef&& dst_type):
-        m_value( move(value) ),
-        m_type( move(dst_type) )
+    ExprNode_Cast(ExprNodeP value, TypeRef&& dst_type):
+        m_value( ::std::move(value) ),
+        m_type( ::std::move(dst_type) )
     {
     }
     NODE_METHODS();
@@ -551,12 +687,12 @@ struct ExprNode_Cast:
 struct ExprNode_TypeAnnotation:
     public ExprNode
 {
-    unique_ptr<ExprNode>    m_value;
+    ExprNodeP    m_value;
     TypeRef m_type;
 
-    ExprNode_TypeAnnotation(unique_ptr<ExprNode>&& value, TypeRef&& dst_type):
-        m_value( move(value) ),
-        m_type( move(dst_type) )
+    ExprNode_TypeAnnotation(ExprNodeP value, TypeRef&& dst_type):
+        m_value( ::std::move(value) ),
+        m_type( ::std::move(dst_type) )
     {
     }
     NODE_METHODS();
@@ -596,10 +732,10 @@ struct ExprNode_BinOp:
     };
 
     Type    m_type;
-    ::std::unique_ptr<ExprNode> m_left;
-    ::std::unique_ptr<ExprNode> m_right;
+    ExprNodeP m_left;
+    ExprNodeP m_right;
 
-    ExprNode_BinOp(Type type, ::std::unique_ptr<ExprNode> left, ::std::unique_ptr<ExprNode> right):
+    ExprNode_BinOp(Type type, ExprNodeP left, ExprNodeP right):
         m_type(type),
         m_left( ::std::move(left) ),
         m_right( ::std::move(right) )
@@ -615,16 +751,19 @@ struct ExprNode_UniOp:
     enum Type {
         REF,    // '& <expr>'
         REFMUT, // '&mut <expr>'
+        RawBorrow,
+        RawBorrowMut,
         BOX,    // 'box <expr>'
         INVERT, // '!<expr>'
         NEGATE, // '-<expr>'
         QMARK, // '<expr>?'
+        AWait,  // `.await`
     };
 
     enum Type   m_type;
-    ::std::unique_ptr<ExprNode> m_value;
+    ExprNodeP m_value;
 
-    ExprNode_UniOp(Type type, ::std::unique_ptr<ExprNode> value):
+    ExprNode_UniOp(Type type, ExprNodeP value):
         m_type(type),
         m_value( ::std::move(value) )
     {
@@ -639,7 +778,7 @@ class NodeVisitor
 {
 public:
     virtual ~NodeVisitor() = default;
-    inline void visit(const unique_ptr<ExprNode>& cnode) {
+    inline void visit(ExprNodeP& cnode) {
         if(cnode.get())
             cnode->visit(*this);
     }
@@ -649,9 +788,12 @@ public:
         virtual void visit(nt& node) = 0/*; \
         virtual void visit(const nt& node) = 0*/
     NT(ExprNode_Block);
+    NT(ExprNode_AsyncBlock);
+    NT(ExprNode_GeneratorBlock);
     NT(ExprNode_Try);
     NT(ExprNode_Macro);
     NT(ExprNode_Asm);
+    NT(ExprNode_Asm2);
     NT(ExprNode_Flow);
     NT(ExprNode_LetBinding);
     NT(ExprNode_Assign);
@@ -659,17 +801,21 @@ public:
     NT(ExprNode_CallMethod);
     NT(ExprNode_CallObject);
     NT(ExprNode_Loop);
+    NT(ExprNode_For);
+    NT(ExprNode_While);
     NT(ExprNode_Match);
     NT(ExprNode_If);
-    NT(ExprNode_IfLet);
 
+    NT(ExprNode_WildcardPattern);
     NT(ExprNode_Integer);
     NT(ExprNode_Float);
     NT(ExprNode_Bool);
     NT(ExprNode_String);
     NT(ExprNode_ByteString);
+    NT(ExprNode_CString);
     NT(ExprNode_Closure);
     NT(ExprNode_StructLiteral);
+    NT(ExprNode_StructLiteralPattern);
     NT(ExprNode_Array);
     NT(ExprNode_Tuple);
     NT(ExprNode_NamedValue);
@@ -687,17 +833,22 @@ class NodeVisitorDef:
     public NodeVisitor
 {
 public:
-    inline void visit(const unique_ptr<ExprNode>& cnode) {
-        if(cnode.get())
+    inline void visit(ExprNodeP& cnode) {
+        if(cnode.is_valid()) {
+            TRACE_FUNCTION_F(cnode.type_name());
             cnode->visit(*this);
+        }
     }
     #define NT(nt) \
         virtual void visit(nt& node) override;/* \
         virtual void visit(const nt& node) override*/
     NT(ExprNode_Block);
+    NT(ExprNode_AsyncBlock);
+    NT(ExprNode_GeneratorBlock);
     NT(ExprNode_Try);
     NT(ExprNode_Macro);
     NT(ExprNode_Asm);
+    NT(ExprNode_Asm2);
     NT(ExprNode_Flow);
     NT(ExprNode_LetBinding);
     NT(ExprNode_Assign);
@@ -705,17 +856,21 @@ public:
     NT(ExprNode_CallMethod);
     NT(ExprNode_CallObject);
     NT(ExprNode_Loop);
+    NT(ExprNode_For);
+    NT(ExprNode_While);
     NT(ExprNode_Match);
     NT(ExprNode_If);
-    NT(ExprNode_IfLet);
 
+    NT(ExprNode_WildcardPattern);
     NT(ExprNode_Integer);
     NT(ExprNode_Float);
     NT(ExprNode_Bool);
     NT(ExprNode_String);
     NT(ExprNode_ByteString);
+    NT(ExprNode_CString);
     NT(ExprNode_Closure);
     NT(ExprNode_StructLiteral);
+    NT(ExprNode_StructLiteralPattern);
     NT(ExprNode_Array);
     NT(ExprNode_Tuple);
     NT(ExprNode_NamedValue);

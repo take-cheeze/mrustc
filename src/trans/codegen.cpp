@@ -11,22 +11,23 @@
 #include <mir/mir.hpp>
 #include <mir/operations.hpp>
 #include <algorithm>
+#include "target.hpp"
 
 #include "codegen.hpp"
 #include "monomorphise.hpp"
 
-void Trans_Codegen(const ::std::string& outfile, CodegenOutput out_ty, const TransOptions& opt, const ::HIR::Crate& crate, const TransList& list, const ::std::string& hir_file)
+void Trans_Codegen(const ::std::string& outfile, CodegenOutput out_ty, const TransOptions& opt, ::HIR::CratePtr crate_ptr, TransList list, const ::std::string& hir_file)
 {
     static Span sp;
 
     ::std::unique_ptr<CodeGenerator>    codegen;
     if( opt.mode == "monomir" )
     {
-        codegen = Trans_Codegen_GetGenerator_MonoMir(crate, outfile);
+        codegen = Trans_Codegen_GetGenerator_MonoMir(*crate_ptr, outfile);
     }
     else if( opt.mode == "c" )
     {
-        codegen = Trans_Codegen_GetGeneratorC(crate, outfile);
+        codegen = Trans_Codegen_GetGeneratorC(*crate_ptr, outfile);
     }
     else
     {
@@ -65,10 +66,12 @@ void Trans_Codegen(const ::std::string& outfile, CodegenOutput out_ty, const Tra
             codegen->emit_type(ty.first);
         }
     }
+    list.m_types.clear();
     for(const auto& ty : list.m_typeids)
     {
         codegen->emit_type_id(ty);
     }
+    list.m_typeids.clear();
     // Emit required constructor methods (and other wrappers)
     for(const auto& path : list.m_constructors)
     {
@@ -77,12 +80,12 @@ void Trans_Codegen(const ::std::string& outfile, CodegenOutput out_ty, const Tra
         // - Struct (must be a tuple struct)
         // - Enum variant (must be a tuple variant)
         const ::HIR::Module* mod_ptr = nullptr;
-        if(path.m_path.m_components.size() > 1)
+        if(path.m_path.components().size() > 1)
         {
-            const auto& nse = crate.get_typeitem_by_path(sp, path.m_path, false, true);
+            const auto& nse = crate_ptr->get_typeitem_by_path(sp, path.m_path, false, true);
             if(const auto* e = nse.opt_Enum())
             {
-                auto var_idx = e->find_variant(path.m_path.m_components.back());
+                auto var_idx = e->find_variant(path.m_path.components().back());
                 codegen->emit_constructor_enum(sp, path, *e, var_idx);
                 continue ;
             }
@@ -90,13 +93,14 @@ void Trans_Codegen(const ::std::string& outfile, CodegenOutput out_ty, const Tra
         }
         else
         {
-            mod_ptr = &crate.get_mod_by_path(sp, path.m_path, true);
+            mod_ptr = &crate_ptr->get_mod_by_path(sp, path.m_path, true);
         }
 
         // Not an enum, currently must be a struct
-        const auto& te = mod_ptr->m_mod_items.at(path.m_path.m_components.back())->ent;
+        const auto& te = mod_ptr->m_mod_items.at(path.m_path.components().back())->ent;
         codegen->emit_constructor_struct(sp, path, te.as_Struct());
     }
+    list.m_constructors.clear();
 
     // 2. Emit function prototypes
     for(const auto& ent : list.m_functions)
@@ -106,7 +110,7 @@ void Trans_Codegen(const ::std::string& outfile, CodegenOutput out_ty, const Tra
         const auto& fcn = *ent.second->ptr;
         // Extern if there isn't any HIR
         bool is_extern = ! static_cast<bool>(fcn.m_code);
-        if( fcn.m_code.m_mir ) {
+        if( fcn.m_code.m_mir && !ent.second->force_prototype ) {
             codegen->emit_function_proto(ent.first, fcn, ent.second->pp, is_extern);
         }
     }
@@ -116,7 +120,7 @@ void Trans_Codegen(const ::std::string& outfile, CodegenOutput out_ty, const Tra
         //DEBUG("FUNCTION " << ent.first);
         assert( ent.second->ptr );
         const auto& fcn = *ent.second->ptr;
-        if( fcn.m_code.m_mir ) {
+        if( fcn.m_code.m_mir && !ent.second->force_prototype ) {
         }
         else {
             // TODO: Why would an intrinsic be in the queue?
@@ -129,22 +133,16 @@ void Trans_Codegen(const ::std::string& outfile, CodegenOutput out_ty, const Tra
         }
     }
     // VTables (may be needed by statics)
-    for(const auto& ent : list.m_vtables)
-    {
-        const auto& trait = ent.first.m_data.as_UfcsKnown().trait;
-        const auto& type = ent.first.m_data.as_UfcsKnown().type;
-        DEBUG("VTABLE " << trait << " for " << type);
-
-        codegen->emit_vtable(ent.first, crate.get_trait_by_path(Span(), trait.m_path));
-    }
+    assert(list.m_vtables.empty());
     // 3. Emit statics
     for(const auto& ent : list.m_statics)
     {
-        DEBUG("STATIC proto " << ent.first);
         assert(ent.second->ptr);
         const auto& stat = *ent.second->ptr;
 
-        if( ! stat.m_value_res.is_Invalid() )
+        DEBUG("STATIC proto " << ent.first << ": "
+            << "(m_value_generated=" << stat.m_value_generated << " && !m_no_emit_value=" << stat.m_no_emit_value << ") || is_generic=" << stat.m_params.is_generic());
+        if( (stat.m_value_generated && !stat.m_no_emit_value) || stat.m_params.is_generic() )
         {
             codegen->emit_static_proto(ent.first, stat, ent.second->pp);
         }
@@ -159,17 +157,24 @@ void Trans_Codegen(const ::std::string& outfile, CodegenOutput out_ty, const Tra
         assert(ent.second->ptr);
         const auto& stat = *ent.second->ptr;
 
-        if( ! stat.m_value_res.is_Invalid() )
+        if( stat.m_params.is_generic() )
         {
-            codegen->emit_static_local(ent.first, stat, ent.second->pp);
+            codegen->emit_static_local(ent.first, stat, ent.second->pp, stat.m_monomorph_cache.at(ent.first));
+        }
+        else if( stat.m_value_generated && !stat.m_no_emit_value )
+        {
+            codegen->emit_static_local(ent.first, stat, ent.second->pp, stat.m_value_res);
+        }
+        else
+        {
         }
     }
-
+    list.m_statics.clear();
 
     // 4. Emit function code
     for(const auto& ent : list.m_functions)
     {
-        if( ent.second->ptr && ent.second->ptr->m_code.m_mir )
+        if( ent.second->ptr && ent.second->ptr->m_code.m_mir && !ent.second->force_prototype )
         {
             const auto& path = ent.first;
             const auto& fcn = *ent.second->ptr;
@@ -179,21 +184,31 @@ void Trans_Codegen(const ::std::string& outfile, CodegenOutput out_ty, const Tra
             // `is_extern` is set if there's no HIR (i.e. this function is from an external crate)
             bool is_extern = ! static_cast<bool>(fcn.m_code);
             // If this is a provided trait method, it needs to be monomorphised too.
-            bool is_method = ( fcn.m_args.size() > 0 && visit_ty_with(fcn.m_args[0].second, [&](const auto& x){return x == ::HIR::TypeRef("Self",0xFFFF);}) );
-            if( pp.has_types() || is_method )
-            {
-                ASSERT_BUG(sp, ent.second->monomorphised.code, "Function that required monomorphisation wasn't monomorphised");
+            bool is_method = ( fcn.m_args.size() > 0 && visit_ty_with(fcn.m_args[0].second, [&](const auto& x){return x == ::HIR::TypeRef::new_self();}) );
 
+            bool is_monomorph = pp.has_types() || is_method;
+            if( ent.second->monomorphised.code ) {
                 // TODO: Flag that this should be a weak (or weak-er) symbol?
                 // - If it's from an external crate, it should be weak, but what about local ones?
-                codegen->emit_function_code(path, fcn, ent.second->pp, is_extern,  ent.second->monomorphised.code);
+                codegen->emit_function_code(path, fcn, pp, is_extern,  ent.second->monomorphised.code);
             }
             else {
+                ASSERT_BUG(sp, !is_monomorph, "Function that required monomorphisation wasn't monomorphised");
                 codegen->emit_function_code(path, fcn, pp, is_extern,  fcn.m_code.m_mir);
             }
         }
     }
+    list.m_functions.clear();
 
+    for(const auto& a : crate_ptr->m_global_asm)
+    {
+        codegen->emit_global_asm(a);
+    }
+
+    // NOTE: Completely reinitialise the `TransList` to free all monomorphised memory before calling the backend compilation tool
+    // - This can save several GB of working set
+    list = TransList();
+    // Would drop the entire crate, but finalise tends to need it
     codegen->finalise(opt, out_ty, hir_file);
 }
 

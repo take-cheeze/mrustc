@@ -46,12 +46,12 @@ namespace {
                 {
                     m_os << indent();
 
-                    TU_MATCHA( (stmt), (e),
-                    (Assign,
+                    TU_MATCH_HDRA( (stmt), {)
+                    TU_ARMA(Assign, e) {
                         //DEBUG("- Assign " << e.dst << " = " << e.src);
                         m_os << FMT_M(e.dst) << " = " << FMT_M(e.src) << ";\n";
-                        ),
-                    (Asm,
+                        }
+                    TU_ARMA(Asm, e) {
                         //DEBUG("- Asm");
                         m_os << "(";
                         for(const auto& v : e.outputs)
@@ -68,8 +68,40 @@ namespace {
                         for(const auto& v : e.flags)
                             m_os << " \"" << v << "\"";
                         m_os << ";\n";
-                        ),
-                    (SetDropFlag,
+                        }
+                    TU_ARMA(Asm2, e) {
+                        m_os << "asm2!(";
+                        for(const auto& l : e.lines)
+                            l.fmt(m_os);
+                        for(const auto& p : e.params)
+                        {
+                            m_os << ", ";
+                            TU_MATCH_HDRA( (p), { )
+                            TU_ARMA(Const, v) {
+                                m_os << "const " << v;
+                                }
+                            TU_ARMA(Sym, v) {
+                                m_os << "sym " << v;
+                                }
+                            TU_ARMA(Reg, v) {
+                                m_os << "reg " << v.dir << " " << v.spec;
+                                if(v.input)
+                                    m_os << FMT_M(*v.input);
+                                else
+                                    m_os << "_";
+                                m_os << " => ";
+                                if(v.output)
+                                    m_os << FMT_M(*v.output);
+                                else
+                                    m_os << "_";
+                                }
+                            }
+                        }
+                        if(e.options.any())
+                            e.options.fmt(m_os);
+                        m_os << ")";
+                        }
+                    TU_ARMA(SetDropFlag, e) {
                         m_os << "df$" << e.idx << " = ";
                         if( e.other == ~0u )
                             m_os << e.new_val;
@@ -78,8 +110,14 @@ namespace {
                         else
                             m_os << "! df$" << e.other;
                         m_os << ";\n";
-                        ),
-                    (Drop,
+                        }
+                    TU_ARMA(SaveDropFlag, e) {
+                        m_os << "SaveDropFlag(" << FMT_M(e.slot) << " BIT " << e.bit_index << " = df$" << e.idx << ")";
+                        }
+                    TU_ARMA(LoadDropFlag, e) {
+                        m_os << "LoadDropFlag(df$" << e.idx << " = " << FMT_M(e.slot) << " BIT " << e.bit_index << ")";
+                        }
+                    TU_ARMA(Drop, e) {
                         //DEBUG("- DROP " << e.slot);
                         m_os << "drop(" << FMT_M(e.slot);
                         switch( e.kind )
@@ -95,14 +133,14 @@ namespace {
                             m_os << " IF df$" << e.flag_idx;
                         }
                         m_os << ");\n";
-                        ),
-                    (ScopeEnd,
+                        }
+                    TU_ARMA(ScopeEnd, e) {
                         m_os << "// Scope End: ";
                         for(auto idx : e.slots)
                             m_os << "_$" << idx << ",";
                         m_os << "\n";
-                        )
-                    )
+                        }
+                    }
                 }
 
                 m_os << indent();
@@ -123,7 +161,7 @@ namespace {
                     m_os << "panic bb" << e.dst << ";\n";
                     ),
                 (If,
-                    m_os << "if " << FMT_M(e.cond) << " { goto bb" << e.bb0 << "; } else { goto bb" << e.bb1 << "; }\n";
+                    m_os << "if " << FMT_M(e.cond) << " { goto bb" << e.bb_true << "; } else { goto bb" << e.bb_false << "; }\n";
                     ),
                 (Switch,
                     m_os << "switch " << FMT_M(e.val) << " {";
@@ -145,6 +183,30 @@ namespace {
                     (String,
                         for(unsigned int j = 0; j < e.targets.size(); j ++)
                             m_os << "\"" << FmtEscaped(ve[j]) << "\" => bb" << e.targets[j] << ", ";
+                        ),
+                    (ByteString,
+                        for(unsigned int j = 0; j < e.targets.size(); j ++) {
+                            m_os << "b\"";
+                            for(size_t i = 0; i < ve[j].size(); i ++) {
+                                auto b = ve[j][i];
+                                switch(b)
+                                {
+                                case '\\': m_os << "\\\\"; break;
+                                case '\"': m_os << "\\\""; break;
+                                default:
+                                    if( ' ' <= b && b < 0x7f ) {
+                                        m_os << char(ve[j][i]);
+                                    }
+                                    else {
+                                        m_os << "\\x";
+                                        m_os << "0123456789ABCDEF"[b >> 4];
+                                        m_os << "0123456789ABCDEF"[b & 15];
+                                    }
+                                    break;
+                                }
+                            }
+                            m_os << "\" => bb" << e.targets[j] << ", ";
+                        }
                         )
                     )
                     m_os << "_ => bb" << e.def_target <<  "}\n";
@@ -309,10 +371,18 @@ namespace {
                 }
                 os << "]";
                 ),
-            (Variant,
+            (UnionVariant,
                 os << e.path << " #" << e.index << " (";
                 fmt_val(os, e.val);
                 os << ")";
+                ),
+            (EnumVariant,
+                os << e.path << " #" << e.index << " { ";
+                for(const auto& v : e.vals) {
+                    fmt_val(os, v);
+                    os << ", ";
+                }
+                os << "}";
                 ),
             (Struct,
                 os << e.path << " { ";
@@ -441,7 +511,7 @@ namespace {
             m_os << item.m_params.fmt_args() << "(";
             for(unsigned int i = 0; i < item.m_args.size(); i ++)
             {
-                if( i == 0 && item.m_args[i].first.m_binding.m_name == "self" ) {
+                if( i == 0 && item.m_args[i].first.m_bindings.size() > 0 && item.m_args[i].first.m_bindings[0].m_name == "self" ) {
                     m_os << "self=";
                 }
                 m_os << "arg$" << i << ": " << item.m_args[i].second << ", ";

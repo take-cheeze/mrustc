@@ -11,76 +11,117 @@
 #include <algorithm>
 #include "main_bindings.hpp"
 
-const ::HIR::Function& HIR_Expand_ErasedType_GetFunction(const Span& sp, const StaticTraitResolve& resolve, const ::HIR::Path& origin_path, MonomorphStatePtr& monomorph_cb, ::HIR::PathParams& impl_params)
-{
-    const ::HIR::Function*  fcn_ptr = nullptr;
-    switch(origin_path.m_data.tag())
-    {
-    case ::HIR::Path::Data::TAGDEAD:
-        BUG(Span(), "DEAD in ErasedType - " << origin_path);
-    case ::HIR::Path::Data::TAG_UfcsUnknown:
-        BUG(Span(), "UfcsUnknown in ErasedType - " << origin_path);
-    case ::HIR::Path::Data::TAG_Generic: {
-        const auto& pe = origin_path.m_data.as_Generic();
-        monomorph_cb = MonomorphStatePtr(nullptr, nullptr, &pe.m_params);
-        fcn_ptr = &resolve.m_crate.get_function_by_path(sp, pe.m_path);
-        } break;
-    case ::HIR::Path::Data::TAG_UfcsKnown:
-        // NOTE: This isn't possible yet (will it be? or will it expand to an associated type?)
-        TODO(sp, "Replace ErasedType - " << origin_path << " with source (UfcsKnown)");
-        break;
-    case ::HIR::Path::Data::TAG_UfcsInherent: {
-        const auto& pe = origin_path.m_data.as_UfcsInherent();
-        // 1. Find correct impl block for the path
-        const ::HIR::TypeImpl* impl_ptr = nullptr;
-        resolve.m_crate.find_type_impls(pe.type, [&](const auto& ty)->const auto& { return ty; },
-            [&](const auto& impl) {
-                DEBUG("- impl" << impl.m_params.fmt_args() << " " << impl.m_type);
-                auto it = impl.m_methods.find(pe.item);
-                if( it == impl.m_methods.end() )
-                    return false;
-                fcn_ptr = &it->second.data;
-                impl_ptr = &impl;
-                return true;
-            });
-        ASSERT_BUG(sp, fcn_ptr, "Failed to locate function " << origin_path);
-        assert(impl_ptr);
-
-        // 2. Obtain monomorph_cb (including impl params)
-        impl_params.m_types.resize(impl_ptr->m_params.m_types.size());
-        class Matcher: public ::HIR::MatchGenerics
-        {
-            ::HIR::PathParams& impl_params;
-        public:
-            Matcher(::HIR::PathParams& impl_params): impl_params(impl_params) {}
-
-            ::HIR::Compare match_ty(const ::HIR::GenericRef& g, const ::HIR::TypeRef& ty, ::HIR::t_cb_resolve_type _resolve_cb) override {
-                assert( g.binding < impl_params.m_types.size() );
-                impl_params.m_types[g.binding] = ty.clone();
-                return ::HIR::Compare::Equal;
-            }
-            ::HIR::Compare match_val(const ::HIR::GenericRef& g, const ::HIR::Literal& sz) override {
-                TODO(Span(), "HIR_Expand_ErasedType_GetFunction::Matcher::match_val " << g << " with " << sz);
-            }
-        } matcher(impl_params);
-        impl_ptr->m_type .match_test_generics(sp, pe.type, [](const auto& x)->const auto&{return x;}, matcher);
-        for(const auto& t : impl_params.m_types)
-        {
-            if( t == ::HIR::TypeRef() )
-            {
-                TODO(sp, "Handle ErasedType where an impl parameter comes from a bound - " << origin_path);
-            }
-        }
-
-        monomorph_cb = MonomorphStatePtr(&pe.type, &impl_params, &pe.params);
-        } break;
-    }
-    assert(fcn_ptr);
-    return *fcn_ptr;
-}
-
 namespace {
 
+    struct MonomorphCheckLft: public MonomorphiserNop {
+        const HIR::TypeRef& tpl;
+        MonomorphCheckLft(const HIR::TypeRef& tpl): tpl(tpl) {}
+        HIR::LifetimeRef monomorph_lifetime(const Span& sp, const HIR::LifetimeRef& lft) const override {
+            //ASSERT_BUG(sp, lft.binding <= ::HIR::LifetimeRef::STATIC, "Found local/ivar lifetime - " << lft << "\n in " << tpl);
+            return lft;
+        }
+    };
+
+    void expand_erased_type(const Span& sp, const StaticTraitResolve& m_resolve, HIR::TypeRef& ty)
+    {
+        const auto& e = ty.data().as_ErasedType();
+
+        HIR::TypeRef    new_ty;
+        TU_MATCH_HDRA( (e.m_inner), { )
+        TU_ARMA(Fcn, ee) {
+            MonomorphState    monomorph_cb;
+            auto val = m_resolve.get_value(sp, ee.m_origin, monomorph_cb);
+            if( val.is_NotYetKnown() && ee.m_origin.m_data.is_UfcsKnown() )
+            {
+                const auto& v = ee.m_origin.m_data.as_UfcsKnown();
+                auto name = RcString::new_interned(FMT(ATY_PREFIX_ERASED << v.item << "_" << ee.m_index));
+                new_ty = ::HIR::TypeRef::new_path(::HIR::Path(
+                    v.type.clone(),
+                    v.trait.clone(),
+                    name,
+                    v.params.clone()
+                ),{});
+            }
+            else
+            {
+                ASSERT_BUG(sp, val.is_Function(), "ErasedType with Fcn type doesn't point at a function: " << ee.m_origin << ": " << val.tag_str());
+                const auto& fcn = *val.as_Function();
+                const auto& erased_types = fcn.m_code.m_erased_types;
+
+                ASSERT_BUG(sp, ee.m_index < erased_types.size(), "Erased type index out of range for " << ee.m_origin << " - " << ee.m_index << " >= " << erased_types.size());
+                const auto& tpl = erased_types[ee.m_index];
+
+                MonomorphCheckLft(tpl).monomorph_type(sp, tpl);
+
+                new_ty = monomorph_cb.monomorph_type(sp, tpl);
+            }
+            m_resolve.expand_associated_types(sp, new_ty);
+            }
+        TU_ARMA(Alias, ee) {
+            if( ee.inner->type == HIR::TypeRef() ) {
+                ERROR(Span(), E0000, "Erased type alias " << ee.inner->type << " never set?");
+            }
+            MonomorphCheckLft(ee.inner->type).monomorph_type(sp, ee.inner->type);
+            new_ty = MonomorphStatePtr(nullptr, &ee.params, nullptr).monomorph_type(sp, ee.inner->type);
+            m_resolve.expand_associated_types(sp, new_ty);
+            }
+        TU_ARMA(Known, ee) {
+            new_ty = ee.clone();
+            }
+        }
+        DEBUG("> " << ty << " => " << new_ty);
+        ty = mv$(new_ty);
+    }
+
+    void visit_type(const Span& sp, const StaticTraitResolve& resolve, ::HIR::TypeRef& ty) {
+        TRACE_FUNCTION_FR(ty, ty);
+        class V:
+            public ::HIR::Visitor
+        {
+            const Span& sp;
+            const StaticTraitResolve&  m_resolve;
+            bool clear_opaque;
+        public:
+            V(const Span& sp, const StaticTraitResolve& resolve)
+                : sp(sp)
+                , m_resolve(resolve)
+                , clear_opaque(false)
+            {}
+
+            void visit_type(::HIR::TypeRef& ty) override
+            {
+                static const Span   sp;
+                auto saved_clear_opaque = this->clear_opaque;
+                this->clear_opaque = false;
+                if( ty.data().is_ErasedType() )
+                {
+                    TRACE_FUNCTION_FR(ty, ty);
+
+                    expand_erased_type(sp, m_resolve, ty);
+
+                    // Recurse (TODO: Cleanly prevent infinite recursion - TRACE_FUNCTION does crude prevention)
+                    this->visit_type(ty);
+                    this->clear_opaque = true;
+                }
+                else
+                {
+                    ::HIR::Visitor::visit_type(ty);
+                    // If there was an erased type anywhere within this type, then clear an Opaque binding so EAT runs again
+                    if( auto* p = ty.data_mut().opt_Path() ) {
+                        // NOTE: This is both an optimisation, and avoids issues (if all types are cleared, the alias list in
+                        // `StaticTraitResolve` ends up with un-expanded ATYs which leads to expansion not happening when it shoud.
+                        if( this->clear_opaque && p->binding.is_Opaque() ) {
+                            p->binding = HIR::TypePathBinding::make_Unbound({});
+                        }
+                    }
+                }
+                this->clear_opaque |= saved_clear_opaque;
+            }
+        } v(sp, resolve);
+        resolve.expand_associated_types(sp, ty);
+        v.visit_type(ty);
+        resolve.expand_associated_types(sp, ty);
+    }
 
     class ExprVisitor_Extract:
         public ::HIR::ExprVisitorDef
@@ -112,31 +153,7 @@ namespace {
         void visit_type(::HIR::TypeRef& ty) override
         {
             static Span sp;
-
-            if( ty.data().is_ErasedType() )
-            {
-                TRACE_FUNCTION_FR(ty, ty);
-
-                const auto& e = ty.data().as_ErasedType();
-
-                ::HIR::PathParams   impl_params;    // cache.
-                MonomorphStatePtr    monomorph_cb;
-                const auto& fcn = HIR_Expand_ErasedType_GetFunction(sp, m_resolve, e.m_origin, monomorph_cb, impl_params);
-                const auto& erased_types = fcn.m_code.m_erased_types;
-
-                ASSERT_BUG(sp, e.m_index < erased_types.size(), "Erased type index out of range for " << e.m_origin << " - " << e.m_index << " >= " << erased_types.size());
-                const auto& tpl = erased_types[e.m_index];
-
-                auto new_ty = monomorph_cb.monomorph_type(sp, tpl);
-                DEBUG("> " << ty << " => " << new_ty);
-                ty = mv$(new_ty);
-                // Recurse (TODO: Cleanly prevent infinite recursion - TRACE_FUNCTION does crude prevention)
-                visit_type(ty);
-            }
-            else
-            {
-                ::HIR::ExprVisitorDef::visit_type(ty);
-            }
+            ::visit_type(sp, m_resolve, ty);
         }
     };
 
@@ -144,10 +161,10 @@ namespace {
         public ::HIR::Visitor
     {
         StaticTraitResolve  m_resolve;
-        const ::HIR::ItemPath* m_fcn_path = nullptr;
     public:
-        OuterVisitor(const ::HIR::Crate& crate):
-            m_resolve(crate)
+        OuterVisitor(const ::HIR::Crate& crate)
+            : ::HIR::Visitor(&m_resolve)
+            , m_resolve(crate)
         {}
 
         void visit_expr(::HIR::ExprPtr& exp) override
@@ -158,50 +175,21 @@ namespace {
                 ev.visit_root( exp );
             }
         }
-
-        void visit_function(::HIR::ItemPath p, ::HIR::Function& fcn) override
-        {
-            m_fcn_path = &p;
-            ::HIR::Visitor::visit_function(p, fcn);
-            m_fcn_path = nullptr;
-        }
     };
     class OuterVisitor_Fixup:
         public ::HIR::Visitor
     {
         StaticTraitResolve  m_resolve;
     public:
-        OuterVisitor_Fixup(const ::HIR::Crate& crate):
-            m_resolve(crate)
+        OuterVisitor_Fixup(const ::HIR::Crate& crate)
+            : ::HIR::Visitor(&m_resolve)
+            , m_resolve(crate)
         {}
 
         void visit_type(::HIR::TypeRef& ty) override
         {
-            static const Span   sp;
-            if( ty.data().is_ErasedType() )
-            {
-                const auto& e = ty.data().as_ErasedType();
-
-                TRACE_FUNCTION_FR(ty, ty);
-
-                ::HIR::PathParams   impl_params;
-                MonomorphStatePtr    monomorph_cb;
-                const auto& fcn = HIR_Expand_ErasedType_GetFunction(sp, m_resolve, e.m_origin, monomorph_cb, impl_params);
-                const auto& erased_types = fcn.m_code.m_erased_types;
-
-                ASSERT_BUG(sp, e.m_index < erased_types.size(), "Erased type index out of range for " << e.m_origin << " - " << e.m_index << " >= " << erased_types.size());
-                const auto& tpl = erased_types[e.m_index];
-
-                auto new_ty = monomorph_cb.monomorph_type(sp, tpl);
-                DEBUG("> " << ty << " => " << new_ty);
-                ty = mv$(new_ty);
-                // Recurse (TODO: Cleanly prevent infinite recursion - TRACE_FUNCTION does crude prevention)
-                visit_type(ty);
-            }
-            else
-            {
-                ::HIR::Visitor::visit_type(ty);
-            }
+            static Span sp;
+            ::visit_type(sp, m_resolve, ty);
         }
     };
 }
