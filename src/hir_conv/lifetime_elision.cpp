@@ -1098,7 +1098,18 @@ namespace
             // - Try `&self`'s lifetime (if it was an elided lifetime)
             HIR::LifetimeRef    elided_output_lifetime;
             if( item.m_receiver != HIR::Function::Receiver::Free ) {
-                if( const auto* b = item.m_args[0].second.data().opt_Borrow() ) {
+                // A receiver of `Pin<&Self>` or `Pin<&mut Self>` counts as a reference receiver for elision, as in rustc
+                // (the `self: Pin<&mut Self>` of `poll_*` methods): the reference inside the Pin is the receiver's.
+                const HIR::TypeRef* recv_ty = &item.m_args[0].second;
+                if( const auto* pe = recv_ty->data().opt_Path() ) {
+                    if( const auto* g = pe->path.m_data.opt_Generic() ) {
+                        auto comps = g->m_path.components();
+                        if( !comps.empty() && comps.back() == "Pin" && g->m_params.m_types.size() == 1 ) {
+                            recv_ty = &g->m_params.m_types[0];
+                        }
+                    }
+                }
+                if( const auto* b = recv_ty->data().opt_Borrow() ) {
                     // If this was an elided lifetime.
                     if( b->lifetime.is_param() && (b->lifetime.binding >> 8) == 1 && (b->lifetime.binding & 0xFF) >= first_elided_lifetime_idx ) {
                         elided_output_lifetime = b->lifetime;
