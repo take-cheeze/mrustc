@@ -195,7 +195,21 @@ ExprNodeP Parse_ExprBlockLine_WithItems(TokenStream& lex, ::std::shared_ptr<AST:
             Parse_Mod_Item(lex, *local_mod, mv$(item_attrs));
             return ExprNodeP();
         }
-        // fall
+        break;
+    // 'async' - `async [unsafe] fn` is an item. `async {` and `async move {` are expressions.
+    case TOK_RWORD_ASYNC:
+        if( LOOK_AHEAD(lex) == TOK_RWORD_FN || (LOOK_AHEAD(lex) == TOK_RWORD_UNSAFE && lex.lookahead(1) == TOK_RWORD_FN) )
+        {
+            PUTBACK(tok, lex);
+            if( !local_mod ) {
+                local_mod = lex.parse_state().get_current_mod().add_anon();
+                DEBUG("Set module from " << lex.parse_state().module->path() << " to " << local_mod->path() );
+                lex.parse_state().module = local_mod.get();
+            }
+            Parse_Mod_Item(lex, *local_mod, mv$(item_attrs));
+            return ExprNodeP();
+        }
+        break;
     default:
         break;
     }

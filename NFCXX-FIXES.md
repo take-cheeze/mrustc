@@ -15,6 +15,7 @@ Every fix changes mrustc's output, so the nfcxx rewrites in `scripts/mrustc-prep
 | 4 | `&'static` to a generic associated constant holding function pointers fails: `Lifetime bound '#local0: 'static failed`. (`bytes` 1.12.1, `owned_clone`.) | `struct VTable { drop: unsafe fn(*mut ()) }`, `impl<T> Owned<T> { const VTABLE: VTable = VTable { drop: owned_drop::<T> }; }`, `Bytes { vtable: &Owned::<T>::VTABLE }` in a generic `fn make<T>()` | `src/hir_expand/static_borrow_constants.cpp`, `ExprNode_PathValue` visitor: a constant path that is still generic is never promoted (the `monomorphise_path_needed` branch) | open. An experiment that treats generic constants as promotable makes the repro pass and the fork's std build (`make LIBS`) succeed, but the sample suite cannot run here (it needs `alloc_system` and reports `Unknown macro panic`), so it was not committed. Needs a regression run first. |
 | 5 | `f64` and `f32` mismatch in a type check: `Mismatched types - f64 and f32` (zmij 1.0.23, the float formatter of serde_json 1.0.154). | `zmij` 1.0.23 from crates.io | `src/hir/hir_ops.cpp:286` | open |
 | 6 | `No arm matched` in libc 0.2.191's `custom_struct` macro. | libc 0.2.191 (not minimised) | `src/macro_rules/eval.cpp` | open |
+| 7 | An `async fn` inside a function body is parsed as an async block: `async fn inner() {}` in a block gives `Unexpected token TOK_RWORD_FN, expected TOK_BRACE_OPEN`. Found by tokio's `wait_with_output` (`tokio/src/process/mod.rs`). | `fn outer() -> u32 { async fn inner(x: u32) -> u32 { x + 1 } 5 } fn main() { println!("{}", outer()); }` | `src/parse/expr.cpp`, statement parsing: `async [unsafe] fn` is an item, as `unsafe fn` already was | fixed in this branch (`async {` and `async move {` remain expressions) |
 
 Reproductions were run with rustc accepting the program (rustc 1.9x) and mrustc at the base commit.
 
@@ -27,3 +28,4 @@ Reproductions were run with rustc accepting the program (rustc 1.9x) and mrustc 
   i64, compared with rustc's output. Old compiler: 304 wrong. Fixed compiler: 0 wrong. The run-time path is unchanged.
 - #3: the repro above compiled with rustc and printed `3`; the old compiler aborts with `No arm matched` and the fixed one
   prints `3`. `consume_item` had no case for `async`, so its default returned no match.
+- #7: the repro prints `7` with rustc and the fixed compiler. `unsafe` blocks, `async {}` and `async move {}` are unchanged.
