@@ -27,6 +27,14 @@ jobs:
     - run: make -j$(nproc) -f minicargo.mk output/libtest.rlib      # libstd
     - run: make test    # hello_world
     - run: make local_tests -k
+    # mrustc's stderr for a failing sample goes to these logs, not to the job log
+    - name: keep test build logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-logs-${{ matrix.os }}
+        path: output/local_tests/*.log
+        if-no-files-found: ignore
 # rustc_driver - Takes too long
 # - run: RUST_CHECK=1 make -f minicargo.mk output/rustc-build/librustc_driver.rlib
 # rustc (DISABLED: llvm build)
