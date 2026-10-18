@@ -201,6 +201,10 @@ namespace
         TU_ARM(e, Const, v) {
             BUG(Span(), "Stray named constant in MIR after cleanup - " << e);
             } break;
+        TU_ARM(e, Function, v) {
+            // A fn item used as a value: print the mangled name, matching the definition emitted by `emit_function_code`
+            os << "fn " << fmt(*v.p);
+            } break;
         default:
             os << e;
             break;
@@ -825,6 +829,17 @@ namespace
                     {
                     case ::MIR::Statement::TAGDEAD: throw "";
                     TU_ARM(stmt, Assign, se) {
+                        if( se.src.is_Constant() && se.src.as_Constant().is_Function() )
+                        {
+                            // A fn item value only has a name in the dump if it's a function (or constructor) defined here.
+                            // Otherwise (e.g. a `&fn_item` lifted to a `static`) it's a ZST that the C backend doesn't emit.
+                            MonomorphState  ms_tmp;
+                            auto v = m_resolve.get_value(sp, *se.src.as_Constant().as_Function().p, ms_tmp, /*signature_only=*/true);
+                            if( !(v.is_Function() || v.is_EnumConstructor() || v.is_StructConstructor()) ) {
+                                m_of << "/* ZST assign */\n";
+                                continue ;
+                            }
+                        }
                         m_of << "ASSIGN " << fmt(se.dst) << " = ";
                         switch(se.src.tag())
                         {
