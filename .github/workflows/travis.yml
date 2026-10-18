@@ -13,6 +13,11 @@ jobs:
       matrix:
         os: [ubuntu-18.04, ubuntu-20.04, macos-latest]
     runs-on: ${{ matrix.os }}
+    # The std build and the samples must use the same target version. Without this, mrustc runs in 1.29 mode and
+    # samples/test/tait.rs (MaybeUninit, 1.36+) fails to resolve its use.
+    env:
+      MRUSTC_TARGET_VER: "1.90"
+      RUSTC_VERSION: "1.90.0"
 
     steps:
     - uses: actions/checkout@v2
