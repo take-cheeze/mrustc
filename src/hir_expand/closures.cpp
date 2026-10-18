@@ -806,6 +806,14 @@ namespace {
                 //if( const auto* te = tpl.data().opt_Closure() ) {
                 //    this->monomorph_genericpath(sp, te->node->m_obj_path, allow_infer);
                 //}
+                // A `let` that holds an extracted async block keeps the block's type in this body's locals. It is the
+                // block's future struct, as the closure pass maps it (see ExprVisitor_Mutate::visit_type).
+                if( const auto* node_pp = TU_OPT1(tpl.data(), NodeType, .opt_Async()) ) {
+                    if( (*node_pp)->m_obj_path != ::HIR::GenericPath() ) {
+                        auto path = this->monomorph_genericpath(sp, (*node_pp)->m_obj_path, false);
+                        return ::HIR::TypeRef::new_path( mv$(path), ::HIR::TypePathBinding::make_Struct(&*(*node_pp)->m_obj_ptr) );
+                    }
+                }
                 return Monomorphiser::monomorph_type(sp, tpl, allow_infer);
             }
 
