@@ -272,10 +272,27 @@ namespace
                 auto c_start_path = m_resolve.m_crate.get_lang_item_path_opt("mrustc-start");
                 if( c_start_path == ::HIR::SimplePath() )
                 {
-                    m_of << "\tlet m: fn();\n";
+                    auto main_path = m_resolve.m_crate.get_lang_item_path(Span(), "mrustc-main");
+                    const auto& main_fcn = m_resolve.m_crate.get_function_by_path(sp, main_path);
+
+                    // `lang_start<T>(main: fn() -> T, argc, argv, sigpipe)` (1.74+) - mirrors the C backend's `main()`
+                    auto start_path = m_resolve.m_crate.get_lang_item_path(Span(), "start");
+                    auto start_gpath = ::HIR::GenericPath(start_path);
+                    if( TARGETVER_LEAST_1_29 ) {
+                        // With 1.29, this takes main's return type as a type parameter
+                        start_gpath.m_params.m_types.push_back( main_fcn.m_return.clone() );
+                    }
+                    // The `main` argument's type is taken from the monomorphised signature of `start`
+                    const auto& start_fcn = m_resolve.m_crate.get_function_by_path(sp, start_path);
+                    auto main_arg_ty = m_resolve.monomorph_expand(sp, start_fcn.m_args.at(0).second, MonomorphStatePtr(nullptr, nullptr, &start_gpath.m_params));
+                    m_of << "\tlet m: " << fmt(main_arg_ty) << ";\n";
                     m_of << "\t0: {\n";
-                    m_of << "\t\tASSIGN m = ADDROF " << fmt(::HIR::GenericPath(m_resolve.m_crate.get_lang_item_path(Span(), "mrustc-main"))) << ";\n";
-                    m_of << "\t\tCALL RETURN = " << fmt(::HIR::GenericPath(m_resolve.m_crate.get_lang_item_path(Span(), "start"))) << "(m, arg0, arg1) goto 1 else 1\n";
+                    m_of << "\t\tASSIGN m = ADDROF " << fmt(::HIR::GenericPath(main_path)) << ";\n";
+                    m_of << "\t\tCALL RETURN = " << fmt(start_gpath) << "(m, arg0, arg1";
+                    if( TARGETVER_LEAST_1_74 ) {
+                        m_of << ", 0 u8";  // `sigpipe` setting: 0 = Default
+                    }
+                    m_of << ") goto 1 else 1\n";
                 }
                 else
                 {
