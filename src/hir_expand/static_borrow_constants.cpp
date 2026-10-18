@@ -44,6 +44,10 @@ namespace static_borrow_constants {
         bool    m_is_constant;
         // Running state: Cleared if `m_is_constant` is false after a node visit
         bool    m_all_constant;
+        // Result for the root node of the last `visit_node_ptr(ExprPtr&)`
+        bool    m_root_is_constant = false;
+        // Set when promoting a generic constant: a constructor of a type with its own `Drop` impl is not constant
+        bool    m_reject_drop_adts = false;
     public:
         ExprVisitor_Mark(const StaticTraitResolve& resolve, const ::HIR::TypeRef* self_type, const ::HIR::ExprPtr& expr_ptr)
             :m_resolve(resolve)
@@ -68,6 +72,9 @@ namespace static_borrow_constants {
         bool all_constant() const {
             return m_all_constant;
         }
+        bool root_is_constant() const {
+            return m_root_is_constant;
+        }
         void visit_node_ptr(::HIR::ExprPtr& root) {
             const auto& node_ref = *root;
             const char* node_ty = typeid(node_ref).name();
@@ -76,6 +83,8 @@ namespace static_borrow_constants {
 
             m_all_constant = true;
             root->visit(*this);
+            // A composite root restores `m_all_constant` on exit, so its result is in `m_is_constant`
+            m_root_is_constant = m_is_constant;
         }
         void visit_node_ptr(::HIR::ExprNodeP& node) override {
             assert( node );
@@ -223,6 +232,9 @@ namespace static_borrow_constants {
             m_all_constant = true;
             ::HIR::ExprVisitorDef::visit(node);
             m_is_constant = m_all_constant;
+            if( m_reject_drop_adts && adt_has_own_drop(node) ) {
+                m_is_constant = false;
+            }
             m_all_constant = saved_all_constant;
         }
         void visit(::HIR::ExprNode_TupleVariant& node) override {
@@ -230,6 +242,9 @@ namespace static_borrow_constants {
             m_all_constant = true;
             ::HIR::ExprVisitorDef::visit(node);
             m_is_constant = m_all_constant;
+            if( m_reject_drop_adts && adt_has_own_drop(node) ) {
+                m_is_constant = false;
+            }
             m_all_constant = saved_all_constant;
         }
         void visit(::HIR::ExprNode_Tuple& node) override {
@@ -397,15 +412,10 @@ namespace static_borrow_constants {
             {
             case StaticTraitResolve::ValuePtr::TAG_Constant:
                 if( monomorphise_path_needed(node.m_path) ) {
-                    // A generic constant (e.g. `Owned::<T>::VTABLE`) is promotable when its type is
-                    // concrete enough to be checked: any generic type is `Fuzzy` for interior mutability
-                    // and for drop glue, so it is not promoted. The `extract_node` call in the borrow
-                    // visitors keeps the generic parameters, so the promoted static is generic too.
-                    // Types with drop glue are never promoted: a promoted value is never dropped, so
-                    // `&CONST` must keep its temporary. This is type-based; rustc is value-based and also
-                    // promotes some drop types (e.g. `None::<String>`), which are rejected here.
-                    m_is_constant = !is_maybe_interior_mut(node)
-                        && !m_resolve.type_needs_drop_glue(node.span(), node.m_res_type);
+                    // A generic constant (e.g. `Owned::<T>::VTABLE`) is promotable when its value is constant
+                    // (see `is_generic_constant_promotable`). The `extract_node` call in the borrow visitors
+                    // keeps the generic parameters, so the promoted static is generic too.
+                    m_is_constant = is_generic_constant_promotable(node, *v.as_Constant());
                     DEBUG(node.m_path << " (generic) m_is_constant=" << m_is_constant);
                 }
                 else {
@@ -470,6 +480,40 @@ namespace static_borrow_constants {
     private:
         bool is_maybe_interior_mut(const ::HIR::ExprNode& node) const {
             return m_resolve.type_is_interior_mutable(node.span(), node.m_res_type) != HIR::Compare::Unequal;
+        }
+        /// Whether the type of `node` has a `Drop` impl of its own (its fields are not considered)
+        bool adt_has_own_drop(const ::HIR::ExprNode& node) const {
+            ::HIR::PathParams pp;
+            return m_resolve.find_impl(node.span(), m_resolve.m_lang_Drop, &pp, node.m_res_type, [](auto, bool){ return true; }, true);
+        }
+        /// Whether a path to a generic constant (`node`, e.g. `H::<T>::N`) can be promoted.
+        /// The type of a generic constant is `Fuzzy` for interior mutability and for drop glue, so the
+        /// check is on the value instead, as rustc does: the constant's initializer must be constant
+        /// (its constructors and nested calls are checked as usual), the root must not be a call, and
+        /// no struct or variant constructed in the initializer may have a `Drop` impl of its own (as rustc's
+        /// `NeedsDrop` qualifier). Generic fields are not checked: a value that holds one would have to be
+        /// built from a constant expression.
+        bool is_generic_constant_promotable(const ::HIR::ExprNode& node, const ::HIR::Constant& c) const {
+            if( !c.m_value ) {
+                return false;
+            }
+            if( dynamic_cast<const ::HIR::ExprNode_CallPath*>(c.m_value.get()) || dynamic_cast<const ::HIR::ExprNode_CallMethod*>(c.m_value.get()) ) {
+                return false;
+            }
+            if( adt_has_own_drop(node) ) {
+                return false;
+            }
+            auto& value = const_cast<::HIR::ExprPtr&>(c.m_value);
+            ExprVisitor_Mark    ev(m_resolve, nullptr, value);
+            ev.m_reject_drop_adts = true;
+            ev.visit_node_ptr(value);
+            if( const auto* pv = dynamic_cast<const ::HIR::ExprNode_PathValue*>(value.get()) ) {
+                // A path to a unit variant or a function is a constant value (e.g. `None`)
+                MonomorphState  ms;
+                auto vp = m_resolve.get_value(pv->span(), pv->m_path, ms, /*signature_only*/true);
+                return ev.root_is_constant() || vp.is_EnumValue() || vp.is_EnumConstructor() || vp.is_Function();
+            }
+            return ev.root_is_constant();
         }
     };
 
