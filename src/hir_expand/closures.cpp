@@ -806,6 +806,14 @@ namespace {
                 //if( const auto* te = tpl.data().opt_Closure() ) {
                 //    this->monomorph_genericpath(sp, te->node->m_obj_path, allow_infer);
                 //}
+                // A `let` that holds an extracted async block keeps the block's type in this body's locals. It is the
+                // block's future struct, as the closure pass maps it (see ExprVisitor_Mutate::visit_type).
+                if( const auto* node_pp = TU_OPT1(tpl.data(), NodeType, .opt_Async()) ) {
+                    if( (*node_pp)->m_obj_path != ::HIR::GenericPath() ) {
+                        auto path = this->monomorph_genericpath(sp, (*node_pp)->m_obj_path, false);
+                        return ::HIR::TypeRef::new_path( mv$(path), ::HIR::TypePathBinding::make_Struct(&*(*node_pp)->m_obj_ptr) );
+                    }
+                }
                 return Monomorphiser::monomorph_type(sp, tpl, allow_infer);
             }
 
@@ -1482,6 +1490,27 @@ namespace {
             void visit(::HIR::ExprNode_Variable& node) override
             {
                 node.m_slot = m_variable_rewrites.at(node.m_slot);
+            }
+            /// An async block that is already extracted (inside this body): only its captures are still here, and they
+            /// name variables of this body. Their types were monomorphised when the inner block was extracted, so they are
+            /// not monomorphised again (the lifetimes in them are already numbered for the inner block).
+            void visit(HIR::ExprNode_AsyncBlock& node) override {
+                if( node.m_code ) {
+                    ::HIR::ExprVisitorDef::visit(node);
+                    return ;
+                }
+                for(auto& cap : node.m_captures)
+                    rewrite_capture(cap);
+            }
+            void rewrite_capture(::HIR::ExprNodeP& cap)
+            {
+                if( auto* b = dynamic_cast<::HIR::ExprNode_Borrow*>(&*cap) ) {
+                    rewrite_capture(b->m_value);
+                    return ;
+                }
+                auto* var = dynamic_cast<::HIR::ExprNode_Variable*>(&*cap);
+                ASSERT_BUG(cap->span(), var, "Unexpected async block capture node " << cap->type_name());
+                var->m_slot = m_variable_rewrites.at(var->m_slot);
             }
             void visit(HIR::ExprNode_ConstParam& node) override {
                 node.m_binding = m_monomorph.get_value(node.span(), HIR::GenericRef("", node.m_binding)).as_Generic().binding;
