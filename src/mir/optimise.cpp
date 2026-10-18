@@ -1485,11 +1485,21 @@ bool MIR_Optimise_Inlining(::MIR::TypeResolve& state, ::MIR::Function& fcn, bool
             DEBUG("- Insert argument lval assignments");
             for(auto& val : cloner.const_assignments)
             {
+                // A `Borrow` argument (`&place` passed directly to the call) is copied too: the new local is a
+                // reference to the same place, and its type is the reference type.
                 ::HIR::TypeRef  tmp;
-                auto ty = val.is_Constant() ? state.get_const_type(val.as_Constant()) : state.get_lvalue_type(tmp, val.as_LValue()).clone();
+                ::HIR::TypeRef  ty;
+                if( val.is_Constant() )
+                    ty = state.get_const_type(val.as_Constant());
+                else if( val.is_LValue() )
+                    ty = state.get_lvalue_type(tmp, val.as_LValue()).clone();
+                else
+                    ty = ::HIR::TypeRef::new_borrow(val.as_Borrow().type, state.get_lvalue_type(tmp, val.as_Borrow().val).clone());
                 auto lv = ::MIR::LValue::new_Local( static_cast<unsigned>(fcn.locals.size()) );
                 fcn.locals.push_back( mv$(ty) );
-                auto rval = val.is_Constant() ? ::MIR::RValue(mv$(val.as_Constant())) : ::MIR::RValue( mv$(val.as_LValue()) );
+                auto rval = val.is_Constant() ? ::MIR::RValue(mv$(val.as_Constant()))
+                    : val.is_LValue() ? ::MIR::RValue( mv$(val.as_LValue()) )
+                    : ::MIR::RValue::make_Borrow({ val.as_Borrow().type, false, mv$(val.as_Borrow().val) });
                 auto stmt = ::MIR::Statement::make_Assign({ mv$(lv), mv$(rval) });
                 DEBUG("++ " << stmt);
                 new_blocks[0].statements.insert( new_blocks[0].statements.begin(), mv$(stmt) );
