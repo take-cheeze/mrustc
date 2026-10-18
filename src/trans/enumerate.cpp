@@ -1541,6 +1541,22 @@ void Trans_Enumerate_FillFrom_PathMono(EnumState& state, ::HIR::Path path_mono)
 {
     Span    sp;
     TRACE_FUNCTION_F(path_mono);
+    // A method's late-bound lifetimes can survive monomorphisation of a caller's path (`poll_notified<'M0, 'M1>`, from an
+    // `Option<&mut Context<'_>>` argument). Trans does not use lifetimes, so they are erased before the duplicate check.
+    struct EraseLifetimeParams: public Monomorphiser {
+        ::HIR::TypeRef get_type(const Span& sp, const ::HIR::GenericRef& g) const override {
+            return ::HIR::TypeRef(g);
+        }
+        ::HIR::ConstGeneric get_value(const Span& sp, const ::HIR::GenericRef& g) const override {
+            return ::HIR::ConstGeneric(g);
+        }
+        ::HIR::LifetimeRef get_lifetime(const Span& sp, const ::HIR::GenericRef& g) const override {
+            return ::HIR::LifetimeRef();
+        }
+    };
+    if( monomorphise_path_needed(path_mono, /*ignore_lifetimes=*/false) ) {
+        path_mono = EraseLifetimeParams().monomorph_path(sp, path_mono);
+    }
     // Don't want duplicates of lifetime-generic items
     ASSERT_BUG(sp, !monomorphise_path_needed(path_mono, /*ignore_lifetimes=*/false), "Path " << path_mono << " is generic");
     // TODO: If already in the list, return early
