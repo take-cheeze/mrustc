@@ -185,13 +185,15 @@ namespace {
 
             auto entry_block = out_builder.pause_cur_block();
             // if state is 0, then drop captures (this is the pre-run state)
+            // - By-value captures are mapped (they are moved out of the field by the body), and are owned by the
+            //   generator until it runs, so they are dropped here. Once it runs, the body's drops (via the drop flags
+            //   of the saved state) take over, so a moved capture is not dropped twice.
             arms.push_back(out_builder.new_bb_unlinked());
             out_builder.set_cur_block(arms.back());
             size_t arg_count = 1 + (TARGETVER_LEAST_1_74 ? 1 : 0);
             for(size_t i = 0; i < n_captures; i ++)
             {
-                // TODO: State tracking on captures, what if a by-value capture is moved?
-                if( mappings.count(arg_count+i) == 0 ) {
+                if( mappings.count(arg_count+i) != 0 ) {
                     out_builder.push_stmt_drop(sp, ::MIR::LValue::new_Field(self.clone(), 1+i));
                 }
             }
