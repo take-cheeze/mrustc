@@ -82,7 +82,7 @@ int main(int argc, char* argv[])
     opt.mode = "monomir";
     {
         auto ph = DebugTimedPhase("Codegen");
-        Trans_Codegen(opts.output, CodegenOutput::Object, opt, *file->m_crate, std::move(tl), "");
+        Trans_Codegen(opts.output, CodegenOutput::Object, opt, std::move(file->m_crate), std::move(tl), "");
     }
 
     return 0;
