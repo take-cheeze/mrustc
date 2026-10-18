@@ -327,6 +327,9 @@ DEF_VISIT_H(ExprNode_AsyncBlock, node) {
     }
     else
     {
+        // Extracted: the body has moved into the coroutine, and the captures are what is left in this function
+        for(auto& cap : node.m_captures)
+            visit_node_ptr(cap);
     }
 }
 
