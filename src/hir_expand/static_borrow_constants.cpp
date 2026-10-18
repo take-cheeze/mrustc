@@ -413,13 +413,18 @@ namespace static_borrow_constants {
             case StaticTraitResolve::ValuePtr::TAG_Constant:
                 if( monomorphise_path_needed(node.m_path) ) {
                     // A generic constant (e.g. `Owned::<T>::VTABLE`) is promotable when its value is constant
-                    // (see `is_generic_constant_promotable`). The `extract_node` call in the borrow visitors
+                    // (see `is_constant_value_promotable`). The `extract_node` call in the borrow visitors
                     // keeps the generic parameters, so the promoted static is generic too.
-                    m_is_constant = is_generic_constant_promotable(node, *v.as_Constant());
+                    m_is_constant = is_constant_value_promotable(node, *v.as_Constant());
                     DEBUG(node.m_path << " (generic) m_is_constant=" << m_is_constant);
                 }
                 else {
                     m_is_constant = !is_maybe_interior_mut(node);
+                    // A constant whose type has drop glue is promoted only when its value is promotable (rustc's
+                    // value-based `NeedsDrop`), so its `Drop` still runs. `const X: Option<D> = None` is still promoted.
+                    if( m_is_constant && m_resolve.type_needs_drop_glue(node.span(), node.m_res_type) ) {
+                        m_is_constant = is_constant_value_promotable(node, *v.as_Constant());
+                    }
                     DEBUG(node.m_path << " m_is_constant=" << m_is_constant);
                 }
                 break;
@@ -486,14 +491,13 @@ namespace static_borrow_constants {
             ::HIR::PathParams pp;
             return m_resolve.find_impl(node.span(), m_resolve.m_lang_Drop, &pp, node.m_res_type, [](auto, bool){ return true; }, true);
         }
-        /// Whether a path to a generic constant (`node`, e.g. `H::<T>::N`) can be promoted.
-        /// The type of a generic constant is `Fuzzy` for interior mutability and for drop glue, so the
-        /// check is on the value instead, as rustc does: the constant's initializer must be constant
+        /// Whether a path to a constant (`node`, e.g. `H::<T>::N`) can be promoted when its type has drop glue (a generic
+        /// type is `Fuzzy` for it). The check is on the value, as rustc does: the constant's initializer must be constant
         /// (its constructors and nested calls are checked as usual), the root must not be a call, and
         /// no struct or variant constructed in the initializer may have a `Drop` impl of its own (as rustc's
         /// `NeedsDrop` qualifier). Generic fields are not checked: a value that holds one would have to be
         /// built from a constant expression.
-        bool is_generic_constant_promotable(const ::HIR::ExprNode& node, const ::HIR::Constant& c) const {
+        bool is_constant_value_promotable(const ::HIR::ExprNode& node, const ::HIR::Constant& c) const {
             if( !c.m_value ) {
                 return false;
             }
