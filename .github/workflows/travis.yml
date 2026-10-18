@@ -16,6 +16,15 @@ jobs:
 
     steps:
     - uses: actions/checkout@v2
+    # macOS only: the std build and the samples must use the same target version. Without this, mrustc runs in 1.29
+    # mode and samples/test/tait.rs (MaybeUninit, 1.36+) fails to resolve its use. The std goes to output-1.90.0.
+    # The Linux legs keep their default (empty OUTDIR_SUF, so output/).
+    - name: target 1.90 (macOS)
+      if: startsWith(matrix.os, 'macos')
+      run: |
+        echo "MRUSTC_TARGET_VER=1.90" >> "$GITHUB_ENV"
+        echo "RUSTC_VERSION=1.90.0" >> "$GITHUB_ENV"
+        echo "OUTDIR_SUF=-1.90.0" >> "$GITHUB_ENV"
     - name: Install packages
       run: sudo apt install g++ zlib1g-dev valgrind
       if: startsWith(matrix.os, 'ubuntu')
@@ -24,9 +33,17 @@ jobs:
     - run: make -j$(nproc) -C tools/minicargo
     - run: make -j$(nproc) -C tools/mir_opt_test
     - run: make -j$(nproc) -C tools/mir_opt_test run
-    - run: make -j$(nproc) -f minicargo.mk output/libtest.rlib      # libstd
+    - run: make -j$(nproc) -f minicargo.mk output${OUTDIR_SUF}/libtest.rlib      # libstd
     - run: make test    # hello_world
     - run: make local_tests -k
+    # mrustc's stderr for a failing sample goes to these logs, not to the job log
+    - name: keep test build logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-logs-${{ matrix.os }}
+        path: output/local_tests/*.log
+        if-no-files-found: ignore
 # rustc_driver - Takes too long
 # - run: RUST_CHECK=1 make -f minicargo.mk output/rustc-build/librustc_driver.rlib
 # rustc (DISABLED: llvm build)
