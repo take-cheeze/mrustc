@@ -18,6 +18,8 @@ jobs:
     env:
       MRUSTC_TARGET_VER: "1.90"
       RUSTC_VERSION: "1.90.0"
+      # The std goes to output-1.90.0 (minicargo.mk), and the Makefile's local_tests reads the same suffix.
+      OUTDIR_SUF: "-1.90.0"
 
     steps:
     - uses: actions/checkout@v2
