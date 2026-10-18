@@ -1483,6 +1483,27 @@ namespace {
             {
                 node.m_slot = m_variable_rewrites.at(node.m_slot);
             }
+            /// An async block that is already extracted (inside this body): only its captures are still here, and they
+            /// name variables of this body. Their types were monomorphised when the inner block was extracted, so they are
+            /// not monomorphised again (the lifetimes in them are already numbered for the inner block).
+            void visit(HIR::ExprNode_AsyncBlock& node) override {
+                if( node.m_code ) {
+                    ::HIR::ExprVisitorDef::visit(node);
+                    return ;
+                }
+                for(auto& cap : node.m_captures)
+                    rewrite_capture(cap);
+            }
+            void rewrite_capture(::HIR::ExprNodeP& cap)
+            {
+                if( auto* b = dynamic_cast<::HIR::ExprNode_Borrow*>(&*cap) ) {
+                    rewrite_capture(b->m_value);
+                    return ;
+                }
+                auto* var = dynamic_cast<::HIR::ExprNode_Variable*>(&*cap);
+                ASSERT_BUG(cap->span(), var, "Unexpected async block capture node " << cap->type_name());
+                var->m_slot = m_variable_rewrites.at(var->m_slot);
+            }
             void visit(HIR::ExprNode_ConstParam& node) override {
                 node.m_binding = m_monomorph.get_value(node.span(), HIR::GenericRef("", node.m_binding)).as_Generic().binding;
             }
