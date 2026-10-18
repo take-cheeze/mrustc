@@ -23,6 +23,16 @@ enum class Lookup
 
 namespace {
     const RcString rcstring_crate_builtins = RcString::new_interned(CRATE_BUILTINS);
+
+    /// Number of glob probes in progress (the path resolution done to find what a glob imports).
+    /// A probe can run into a glob cycle, where a component is not bound yet; that is not an error
+    /// (the probe finds nothing), and the same path is resolved again outside the probe.
+    unsigned int s_glob_probe_depth = 0;
+    struct GlobProbeScope
+    {
+        GlobProbeScope()  { s_glob_probe_depth++; }
+        ~GlobProbeScope() { s_glob_probe_depth--; }
+    };
 }
 
 
@@ -631,7 +641,10 @@ void Resolve_Use_Mod(const ::AST::Crate& crate, ::AST::Module& mod, ::AST::Path 
                     if( ::std::find(resolve_stack_ptrs.begin(), resolve_stack_ptrs.end(), &imp_data) == resolve_stack_ptrs.end() )
                     {
                         resolve_stack_ptrs.push_back( &imp_data );
-                        bindings_ = Resolve_Use_GetBinding(sp2, crate, mod.path(), Resolve_Use_AbsolutisePath(sp2, crate, mod.path(), imp_e.path), parent_modules, /*type_only=*/true);
+                        {
+                            GlobProbeScope  probe;
+                            bindings_ = Resolve_Use_GetBinding(sp2, crate, mod.path(), Resolve_Use_AbsolutisePath(sp2, crate, mod.path(), imp_e.path), parent_modules, /*type_only=*/true);
+                        }
                         if( bindings_.type.is_Unbound() ) {
                             DEBUG("Recursion detected, skipping " << imp_e.path);
                             resolve_stack_ptrs.pop_back();
@@ -660,10 +673,13 @@ void Resolve_Use_Mod(const ::AST::Crate& crate, ::AST::Module& mod, ::AST::Path 
                 TU_ARMA(Module, e) {
                     if( e.module_ ) {
                         // TODO: Prevent infinite recursion?
-                        static ::std::vector<const AST::Module*>  s_use_glob_mod_stack;
-                        if( ::std::find(s_use_glob_mod_stack.begin(), s_use_glob_mod_stack.end(), &*e.module_) == s_use_glob_mod_stack.end() )
+                        // Keyed on the module and the name looked up: a glob cycle asks for a different name
+                        // in the same module (e.g. `linux` while resolving `j1939`), which is not a loop.
+                        static ::std::vector<std::pair<const AST::Module*, RcString>>  s_use_glob_mod_stack;
+                        auto glob_ent = std::make_pair(&*e.module_, des_item_name);
+                        if( ::std::find(s_use_glob_mod_stack.begin(), s_use_glob_mod_stack.end(), glob_ent) == s_use_glob_mod_stack.end() )
                         {
-                            s_use_glob_mod_stack.push_back( &*e.module_ );
+                            s_use_glob_mod_stack.push_back( glob_ent );
                             rv.merge_from( Resolve_Use_GetBinding_Mod(span, crate, mod.path(), *e.module_, des_item_name, {}) );
                             s_use_glob_mod_stack.pop_back();
                         }
@@ -1151,6 +1167,12 @@ namespace {
         default:
             ERROR(span, E0000, "Unexpected item type " << b.type.binding.tag_str() << " in import of " << path);
         TU_ARMA(Unbound, e) {
+            if( s_glob_probe_depth > 0 ) {
+                // Inside a glob probe, an unbound component is not an error: the probe finds nothing
+                // (it can be a glob cycle that is not resolved yet). A use outside a probe still errors.
+                DEBUG("Component " << i << " of " << path << " not bound during a glob probe");
+                return ::AST::Path::Bindings();
+            }
             ERROR(span, E0000, "Cannot find component " << i << " of " << path << " (" << b.type.binding << ")");
             }
         TU_ARMA(Crate, e) {

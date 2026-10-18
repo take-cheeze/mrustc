@@ -1930,11 +1930,16 @@ namespace {
             RcString::new_interned("Output"),
             ::HIR::TraitPath::AtyEqual { future_path.m_path.clone(), {}, std::move(rv.m_return) }
         ));
+        // The future captures every in-scope lifetime (as rustc does for `async fn`, in every edition), so use the
+        // 2024 rule. The default (`OmittedOld`) only captures lifetimes named in the bounds, which is none here, so
+        // the future would be `'static`.
         rv.m_return = ::HIR::TypeRef(::HIR::TypeData::make_ErasedType(::HIR::TypeData_ErasedType {
             true,
             ::make_vec1(std::move(future_path)),
             {},
-            ::HIR::TypeData_ErasedType_Inner::Data_Fcn { ::HIR::Path(::HIR::SimplePath()), 0 }
+            ::HIR::TypeData_ErasedType_Inner::Data_Fcn { ::HIR::Path(::HIR::SimplePath()), 0 },
+            ::HIR::PathParams(),
+            ::HIR::TypeData_ErasedType::Use::Omitted2024
         }));
     }
 

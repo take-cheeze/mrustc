@@ -1325,6 +1325,11 @@ void Parse_Impl_Item(TokenStream& lex, AST::Impl& impl)
             TU_MATCH_HDRA((item.data), {)
             default:
                 TODO(lex.point_span(), "Interpolated item into impl: " << item.data.tag_str());
+            // A macro invocation in the fragment (a macro that expands to impl items): expanded with the impl's items.
+            TU_ARMA(MacroInv, e) {
+                impl.add_macro_invocation( std::move(e) );
+                impl.items().back().attrs = std::move(item.attrs);
+                }
             TU_ARMA(Function, e) {
                 impl.add_function(item.span, std::move(item.attrs), item.vis, false, item.name, std::move(e) );
                 }

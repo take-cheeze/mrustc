@@ -672,6 +672,10 @@ namespace {
                     <<  " if(a.hi==0&&a.lo<m)   break;"
                     <<  " if(i>=64&&a.hi<m) break;"
                     <<  " if( m & (i >= 64 ? a.hi : a.lo) ) of |= add128_o(*o, b, o);"
+                    // The top bit of b is shifted out below. The product overflows if a has a bit above i to use it.
+                    <<  " bool top = b.hi >> 63;"
+                    <<  " bool above = (i + 1 < 64) ? ((a.lo >> (i + 1)) != 0 || a.hi != 0) : (i + 1 < 128 && (a.hi >> (i + 1 - 64)) != 0);"
+                    <<  " if( top && above ) of = true;"
                     <<  " b.hi = (b.hi << 1) | (b.lo >> 63);"
                     <<  " b.lo = (b.lo << 1);"
                     << " }"
