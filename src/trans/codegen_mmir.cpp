@@ -201,6 +201,10 @@ namespace
         TU_ARM(e, Const, v) {
             BUG(Span(), "Stray named constant in MIR after cleanup - " << e);
             } break;
+        TU_ARM(e, Function, v) {
+            // A fn item used as a value: print the mangled name, matching the definition emitted by `emit_function_code`
+            os << "fn " << fmt(*v.p);
+            } break;
         default:
             os << e;
             break;
@@ -272,10 +276,27 @@ namespace
                 auto c_start_path = m_resolve.m_crate.get_lang_item_path_opt("mrustc-start");
                 if( c_start_path == ::HIR::SimplePath() )
                 {
-                    m_of << "\tlet m: fn();\n";
+                    auto main_path = m_resolve.m_crate.get_lang_item_path(Span(), "mrustc-main");
+                    const auto& main_fcn = m_resolve.m_crate.get_function_by_path(sp, main_path);
+
+                    // `lang_start<T>(main: fn() -> T, argc, argv, sigpipe)` (1.74+) - mirrors the C backend's `main()`
+                    auto start_path = m_resolve.m_crate.get_lang_item_path(Span(), "start");
+                    auto start_gpath = ::HIR::GenericPath(start_path);
+                    if( TARGETVER_LEAST_1_29 ) {
+                        // With 1.29, this takes main's return type as a type parameter
+                        start_gpath.m_params.m_types.push_back( main_fcn.m_return.clone() );
+                    }
+                    // The `main` argument's type is taken from the monomorphised signature of `start`
+                    const auto& start_fcn = m_resolve.m_crate.get_function_by_path(sp, start_path);
+                    auto main_arg_ty = m_resolve.monomorph_expand(sp, start_fcn.m_args.at(0).second, MonomorphStatePtr(nullptr, nullptr, &start_gpath.m_params));
+                    m_of << "\tlet m: " << fmt(main_arg_ty) << ";\n";
                     m_of << "\t0: {\n";
-                    m_of << "\t\tASSIGN m = ADDROF " << fmt(::HIR::GenericPath(m_resolve.m_crate.get_lang_item_path(Span(), "mrustc-main"))) << ";\n";
-                    m_of << "\t\tCALL RETURN = " << fmt(::HIR::GenericPath(m_resolve.m_crate.get_lang_item_path(Span(), "start"))) << "(m, arg0, arg1) goto 1 else 1\n";
+                    m_of << "\t\tASSIGN m = ADDROF " << fmt(::HIR::GenericPath(main_path)) << ";\n";
+                    m_of << "\t\tCALL RETURN = " << fmt(start_gpath) << "(m, arg0, arg1";
+                    if( TARGETVER_LEAST_1_74 ) {
+                        m_of << ", 0 u8";  // `sigpipe` setting: 0 = Default
+                    }
+                    m_of << ") goto 1 else 1\n";
                 }
                 else
                 {
@@ -808,6 +829,17 @@ namespace
                     {
                     case ::MIR::Statement::TAGDEAD: throw "";
                     TU_ARM(stmt, Assign, se) {
+                        if( se.src.is_Constant() && se.src.as_Constant().is_Function() )
+                        {
+                            // A fn item value only has a name in the dump if it's a function (or constructor) defined here.
+                            // Otherwise (e.g. a `&fn_item` lifted to a `static`) it's a ZST that the C backend doesn't emit.
+                            MonomorphState  ms_tmp;
+                            auto v = m_resolve.get_value(sp, *se.src.as_Constant().as_Function().p, ms_tmp, /*signature_only=*/true);
+                            if( !(v.is_Function() || v.is_EnumConstructor() || v.is_StructConstructor()) ) {
+                                m_of << "/* ZST assign */\n";
+                                continue ;
+                            }
+                        }
                         m_of << "ASSIGN " << fmt(se.dst) << " = ";
                         switch(se.src.tag())
                         {
