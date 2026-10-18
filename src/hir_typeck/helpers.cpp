@@ -5187,6 +5187,47 @@ bool TraitResolution::find_method(const Span& sp,
         }
     }
 
+    // 4b. A custom receiver can have a trait object as `Self` somewhere inside the receiver type, e.g.
+    //     `self: Pin<&mut Self>` on a `Pin<&mut dyn Trait>`. `get_inner_type` only looks at the type itself,
+    //     a reference to it, or a `Box`, so look for trait objects in the type and let the receiver pick `Self`.
+    {
+        ::std::vector<const ::HIR::TypeRef*>   trait_objects;
+        visit_ty_with(ty, [&](const ::HIR::TypeRef& t)->bool {
+            if( t.data().is_TraitObject() ) {
+                trait_objects.push_back(&t);
+            }
+            return false;   // Keep visiting, there can be more than one
+            });
+        bool found_trait_object = false;
+        for(const auto* tobj_p : trait_objects)
+        {
+            const auto& e = tobj_p->data().as_TraitObject();
+            const auto& trait = this->m_crate.get_trait_by_path(sp, e.m_trait.m_path.m_path);
+
+            ::HIR::GenericPath final_trait_path;
+            const auto* fcn_ptr = this->trait_contains_method(sp, e.m_trait.m_path, trait, ::HIR::TypeRef::new_self(), method_name,  final_trait_path);
+            if( !fcn_ptr || fcn_ptr->m_receiver != ::HIR::Function::Receiver::Custom ) {
+                continue ;
+            }
+            if(const auto* self_ty_p = check_method_receiver(sp, *fcn_ptr, ty, access))
+            {
+                DEBUG("- Found trait " << final_trait_path << " (trait object in custom receiver)");
+                if(e.m_trait.m_hrtbs) {
+                    auto pps = e.m_trait.m_hrtbs->make_empty_params(true);
+                    final_trait_path.m_params = MonomorphHrlsOnly(pps).monomorph_path_params(sp, final_trait_path.m_params, true);
+                }
+                possibilities.push_back(::std::make_pair(borrow_type, ::HIR::Path(self_ty_p->clone(), mv$(final_trait_path), method_name, {}) ));
+                DEBUG("++ " << possibilities.back());
+                rv = true;
+                found_trait_object = true;
+            }
+        }
+        if( found_trait_object )
+        {
+            return rv;
+        }
+    }
+
     // 5. Mutually exclusive searches
     // - Erased type - `impl Trait`
     if( const auto* ityp = get_inner_type(ty, [](const auto& t){ return t.data().is_ErasedType(); }) )

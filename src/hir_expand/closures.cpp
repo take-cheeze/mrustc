@@ -806,6 +806,14 @@ namespace {
                 //if( const auto* te = tpl.data().opt_Closure() ) {
                 //    this->monomorph_genericpath(sp, te->node->m_obj_path, allow_infer);
                 //}
+                // A `let` that holds an extracted async block keeps the block's type in this body's locals. It is the
+                // block's future struct, as the closure pass maps it (see ExprVisitor_Mutate::visit_type).
+                if( const auto* node_pp = TU_OPT1(tpl.data(), NodeType, .opt_Async()) ) {
+                    if( (*node_pp)->m_obj_path != ::HIR::GenericPath() ) {
+                        auto path = this->monomorph_genericpath(sp, (*node_pp)->m_obj_path, false);
+                        return ::HIR::TypeRef::new_path( mv$(path), ::HIR::TypePathBinding::make_Struct(&*(*node_pp)->m_obj_ptr) );
+                    }
+                }
                 return Monomorphiser::monomorph_type(sp, tpl, allow_infer);
             }
 
@@ -1483,6 +1491,27 @@ namespace {
             {
                 node.m_slot = m_variable_rewrites.at(node.m_slot);
             }
+            /// An async block that is already extracted (inside this body): only its captures are still here, and they
+            /// name variables of this body. Their types were monomorphised when the inner block was extracted, so they are
+            /// not monomorphised again (the lifetimes in them are already numbered for the inner block).
+            void visit(HIR::ExprNode_AsyncBlock& node) override {
+                if( node.m_code ) {
+                    ::HIR::ExprVisitorDef::visit(node);
+                    return ;
+                }
+                for(auto& cap : node.m_captures)
+                    rewrite_capture(cap);
+            }
+            void rewrite_capture(::HIR::ExprNodeP& cap)
+            {
+                if( auto* b = dynamic_cast<::HIR::ExprNode_Borrow*>(&*cap) ) {
+                    rewrite_capture(b->m_value);
+                    return ;
+                }
+                auto* var = dynamic_cast<::HIR::ExprNode_Variable*>(&*cap);
+                ASSERT_BUG(cap->span(), var, "Unexpected async block capture node " << cap->type_name());
+                var->m_slot = m_variable_rewrites.at(var->m_slot);
+            }
             void visit(HIR::ExprNode_ConstParam& node) override {
                 node.m_binding = m_monomorph.get_value(node.span(), HIR::GenericRef("", node.m_binding)).as_Generic().binding;
             }
@@ -1779,12 +1808,17 @@ namespace {
 
             auto cr_vars = coroutine_vars(node.span(), node.m_avu_cache, 2, monomorph_cb);
 
+            // The output type of the body, as it was before the rewrite below (which monomorphises the body's types in place)
+            auto body_output_ty = node.m_code->m_res_type.clone();
             {
                 ExprVisitor_GeneratorRewrite visitor_rewrite(monomorph_cb, cr_vars.variable_rewrites);
                 visitor_rewrite.visit_node_ptr(node.m_code);
             }
 
             monomorph_cb.add_bounds(sp, m_resolve);
+            // Monomorphise the output now, while parameters can still be added. The rewritten body already has the
+            // monomorphised form, so it must not be monomorphised again after `freeze` (that would add a parameter).
+            auto return_ty = monomorph_cb.monomorph_type(sp, body_output_ty);
 
             // Create state index enum
             auto state_idx_type = m_out.new_type("async_state_idx#", m_new_type_suffix, ::HIR::Enum {
@@ -1850,7 +1884,6 @@ namespace {
                 ::HIR::TypeRef::new_path( ::HIR::GenericPath(lang_Context, ::HIR::PathParams(::HIR::LifetimeRef())), &m_resolve.m_crate.get_struct_by_path(sp, lang_Context) )
             );
 
-            auto return_ty = node.m_code->m_res_type.clone();
             auto body_node = std::move(node.m_code);
             {
                 DEBUG("-- Fixing types in body code");
@@ -1885,14 +1918,14 @@ namespace {
             fcn_resume.m_args.push_back(std::make_pair( HIR::Pattern(), cr_vars.new_locals[1].clone() ));
             // - `-> Poll<{Return}>`
             ::HIR::PathParams   ret_params;
-            ret_params.m_types.push_back( monomorph_cb.monomorph_type(sp, return_ty) );
+            ret_params.m_types.push_back( return_ty.clone() );
             auto lang_Poll = m_resolve.m_crate.get_lang_item_path(sp, "Poll");
             fcn_resume.m_return = ::HIR::TypeRef::new_path( ::HIR::GenericPath(lang_Poll, std::move(ret_params)), &m_resolve.m_crate.get_enum_by_path(sp, lang_Poll) );
             // - ` { ... }`
             // Emit as a top-level generator
             // - It has a populated body, non-zero `m_obj_ptr`, and unset `m_obj_path`
             auto v = ::std::make_unique<::HIR::ExprNode_GeneratorWrapper>(sp, HIR::TypeRef(), std::move(body_node), false, false, /*future*/true);
-            v->m_return   = monomorph_cb.monomorph_type(sp, return_ty);
+            v->m_return   = return_ty.clone();
             v->m_capture_usages = std::move(cr_vars.capture_usages);
             v->m_res_type = fcn_resume.m_return.clone();
             v->m_obj_ptr = node.m_obj_ptr;
@@ -1908,7 +1941,7 @@ namespace {
             ::HIR::TraitImpl    impl;
             impl.m_params = std::move(params);
             impl.m_type = ::HIR::TypeRef::new_path( ::HIR::GenericPath(gen_struct_path, impl.m_params.make_nop_params(0)), &gen_struct_ref );
-            impl.m_types.insert(std::make_pair( RcString::new_interned("Output"), ::HIR::TraitImpl::ImplEnt<HIR::TypeRef> { false, monomorph_cb.monomorph_type(sp, return_ty) } ));
+            impl.m_types.insert(std::make_pair( RcString::new_interned("Output"), ::HIR::TraitImpl::ImplEnt<HIR::TypeRef> { false, return_ty.clone() } ));
             impl.m_methods.insert(std::make_pair( RcString::new_interned("poll"), ::HIR::TraitImpl::ImplEnt<HIR::Function> { false, std::move(fcn_resume) } ));
             m_out.trait_impls.push_back(std::make_pair("future_trait", std::move(impl)));
         }
