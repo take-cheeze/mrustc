@@ -660,10 +660,13 @@ void Resolve_Use_Mod(const ::AST::Crate& crate, ::AST::Module& mod, ::AST::Path 
                 TU_ARMA(Module, e) {
                     if( e.module_ ) {
                         // TODO: Prevent infinite recursion?
-                        static ::std::vector<const AST::Module*>  s_use_glob_mod_stack;
-                        if( ::std::find(s_use_glob_mod_stack.begin(), s_use_glob_mod_stack.end(), &*e.module_) == s_use_glob_mod_stack.end() )
+                        // Keyed on the module and the name looked up: a glob cycle asks for a different name
+                        // in the same module (e.g. `linux` while resolving `j1939`), which is not a loop.
+                        static ::std::vector<std::pair<const AST::Module*, RcString>>  s_use_glob_mod_stack;
+                        auto glob_ent = std::make_pair(&*e.module_, des_item_name);
+                        if( ::std::find(s_use_glob_mod_stack.begin(), s_use_glob_mod_stack.end(), glob_ent) == s_use_glob_mod_stack.end() )
                         {
-                            s_use_glob_mod_stack.push_back( &*e.module_ );
+                            s_use_glob_mod_stack.push_back( glob_ent );
                             rv.merge_from( Resolve_Use_GetBinding_Mod(span, crate, mod.path(), *e.module_, des_item_name, {}) );
                             s_use_glob_mod_stack.pop_back();
                         }
