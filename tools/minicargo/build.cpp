@@ -109,9 +109,11 @@ struct RunState
     ::std::string get_build_script_exe(const PackageManifest& manifest) const {
         return get_output_dir(true) / get_build_script_out(manifest) + "_run" EXESUF;
     }
-    /// Get `OUT_DIR`: where a package's build script writes its generated sources.
+    /// Get `OUT_DIR`: where a package's build script writes its generated sources. Laid out as cargo's
+    /// (`<output>/build/<package>/out`): build scripts find the profile directory, where the executables are, as the
+    /// parent of the first ancestor of OUT_DIR named `build` (mold 3 puts its `mold-wrapper.so` beside `mold` so).
     ::helpers::path get_build_script_out_dir(const PackageManifest& manifest) const {
-        return get_output_dir(true) / get_build_script_out(manifest);
+        return get_output_dir(true) / "build" / get_build_script_out(manifest) / "out";
     }
     /// Get the output file for a crate (e.g. libfoo.rlib, or foo.exe)
     ::helpers::path get_crate_path(const PackageManifest& manifest, const PackageTarget& target, bool is_for_host, const char** crate_type, ::std::string* out_crate_suffix) const;
@@ -1216,7 +1218,9 @@ RunnableJob Job_RunScript::start()
 
     auto script_exe_abs = script_exe.to_absolute();
 
-    // - Run the script and put output in the right dir
+    // - Run the script and put output in the right dir (`<output>/build/<package>/out`, see get_build_script_out_dir)
+    os_support::mkdir(out_dir.parent().parent());
+    os_support::mkdir(out_dir.parent());
     os_support::mkdir(out_dir);
     // Environment variables (key-value list)
     StringListKV    env;
