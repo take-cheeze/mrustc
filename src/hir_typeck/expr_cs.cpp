@@ -18,6 +18,19 @@
 #include "hir_conv/main_bindings.hpp"
 
 namespace {
+    // A pattern path without arguments (`S { .. }`) can arrive with the type arguments but not the const ones
+    // (`S<T, const N: bool>`): every omitted argument is inferred.
+    void pattern_pad_params(const ::HIR::GenericParams& defs, ::HIR::PathParams& params)
+    {
+        if( params.m_lifetimes.size() < defs.m_lifetimes.size() )
+            params.m_lifetimes.resize( defs.m_lifetimes.size() );
+        while( params.m_types.size() < defs.m_types.size() )
+            params.m_types.push_back( ::HIR::TypeRef() );
+        while( params.m_values.size() < defs.m_values.size() )
+            params.m_values.push_back( ::HIR::ConstGeneric() );
+    }
+}
+namespace {
     inline HIR::ExprNodeP mk_exprnodep(HIR::ExprNode* en, ::HIR::TypeRef ty){ en->m_res_type = mv$(ty); return HIR::ExprNodeP(en); }
 
     inline ::HIR::SimplePath get_parent_path(const ::HIR::SimplePath& sp) {
@@ -961,7 +974,15 @@ namespace {
             // - If running in a mode after stablise (before defaults), fall
             //   back to trait if the inherent is still ambigious.
             ::std::vector<::std::pair<TraitResolution::AutoderefBorrow, ::HIR::Path>> possible_methods;
-            unsigned int deref_count = this->context.m_resolve.autoderef_find_method(node.span(), node.m_traits, node.m_trait_param_ivars, ty, node.m_method,  possible_methods);
+            bool fuzzy_inherent = false;
+            unsigned int deref_count = this->context.m_resolve.autoderef_find_method(node.span(), node.m_traits, node.m_trait_param_ivars, ty, node.m_method,  possible_methods, &fuzzy_inherent);
+            // An inherent impl that only matches by equating inference variables (`impl<T> Either<T,T>` for
+            // `Either<_1,_2>`, whose arms are not unified yet) may not apply once they are known; rustc would have
+            // fallen back to a trait method then. Wait for the types, unless nothing else can make progress.
+            if( deref_count != ~0u && fuzzy_inherent && !this->m_is_fallback ) {
+                DEBUG("Inherent method only matched with inference variables, waiting");
+                return ;
+            }
         try_again:
             if( deref_count != ~0u )
             {
@@ -2631,12 +2652,14 @@ void Context::handle_pattern(const Span& sp, ::HIR::Pattern& pat, const ::HIR::T
                     TU_ARMA(Struct, be) {
                         auto& p = e.path.m_data.as_Generic();
                         assert(be);
+                        pattern_pad_params(be->m_params, p.m_params);
                         context.add_ivars_params( p.m_params );
                         possible_type = ::HIR::TypeRef::new_path(p.clone(), ::HIR::TypePathBinding(be));
                         }
                     TU_ARMA(Enum, be) {
                         auto& p = e.path.m_data.as_Generic();
                         assert(be.ptr);
+                        pattern_pad_params(be.ptr->m_params, p.m_params);
                         context.add_ivars_params( p.m_params );
                         possible_type = ::HIR::TypeRef::new_path(get_parent_path(p), ::HIR::TypePathBinding(be.ptr));
                         }
@@ -2649,12 +2672,14 @@ void Context::handle_pattern(const Span& sp, ::HIR::Pattern& pat, const ::HIR::T
                     TU_ARMA(Struct, be) {
                         auto& p = e.path.m_data.as_Generic();
                         assert(be);
+                        pattern_pad_params(be->m_params, p.m_params);
                         context.add_ivars_params( p.m_params );
                         possible_type = ::HIR::TypeRef::new_path(p.clone(), ::HIR::TypePathBinding(be));
                         }
                     TU_ARMA(Enum, be) {
                         auto& p = e.path.m_data.as_Generic();
                         assert(be.ptr);
+                        pattern_pad_params(be.ptr->m_params, p.m_params);
                         context.add_ivars_params( p.m_params );
                         possible_type = ::HIR::TypeRef::new_path(get_parent_path(p), ::HIR::TypePathBinding(be.ptr));
                         }
@@ -2667,12 +2692,14 @@ void Context::handle_pattern(const Span& sp, ::HIR::Pattern& pat, const ::HIR::T
                     TU_ARMA(Struct, be) {
                         auto& p = e.path.m_data.as_Generic();
                         assert(be);
+                        pattern_pad_params(be->m_params, p.m_params);
                         context.add_ivars_params( p.m_params );
                         possible_type = ::HIR::TypeRef::new_path(p.clone(), ::HIR::TypePathBinding(be));
                         }
                     TU_ARMA(Enum, be) {
                         auto& p = e.path.m_data.as_Generic();
                         assert(be.ptr);
+                        pattern_pad_params(be.ptr->m_params, p.m_params);
                         context.add_ivars_params( p.m_params );
                         possible_type = ::HIR::TypeRef::new_path(get_parent_path(p), ::HIR::TypePathBinding(be.ptr));
                         }
@@ -3295,12 +3322,14 @@ void Context::handle_pattern_direct_inner(const Span& sp, ::HIR::Pattern& pat, c
             TU_ARMA(Struct, be) {
                 auto& p = path.m_data.as_Generic();
                 assert(be);
+                pattern_pad_params(be->m_params, p.m_params);
                 context.add_ivars_params( p.m_params );
                 return ::HIR::TypeRef::new_path(p.clone(), ::HIR::TypePathBinding(be));
                 }
             TU_ARMA(Enum, be) {
                 auto& p = path.m_data.as_Generic();
                 assert(be.ptr);
+                pattern_pad_params(be.ptr->m_params, p.m_params);
                 context.add_ivars_params( p.m_params );
                 return ::HIR::TypeRef::new_path(get_parent_path(p), ::HIR::TypePathBinding(be.ptr));
                 }
@@ -5014,7 +5043,8 @@ namespace {
                         }
 
                         // Continue on with coercion (now that node_ptr is updated)
-                        switch( check_unsize_tys(context, sp, dep->inner, se.inner, context_mut, &node_ptr) )
+                        // - No node pointer: raw pointers unsize, but never deref-coerce (`*mut Wrapper` is not `*mut Wrapper::Target`)
+                        switch( check_unsize_tys(context, sp, dep->inner, se.inner, context_mut, nullptr) )
                         {
                         case CoerceResult::Fail:
                             return CoerceResult::Fail;
@@ -5069,8 +5099,8 @@ namespace {
                 }
                 ASSERT_BUG(sp, dep->type == se.type, "Pointer strength mismatch");
 
-                // Call unsizing code
-                return check_unsize_tys(context, sp, dep->inner, se.inner, context_mut, node_ptr_ptr);
+                // Call unsizing code (raw pointers never deref-coerce, so no node pointer)
+                return check_unsize_tys(context, sp, dep->inner, se.inner, context_mut, nullptr);
             }
             else
             {

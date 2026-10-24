@@ -1079,6 +1079,30 @@ namespace MIR { namespace eval {
             {
                 const auto& s = *ent.as_Static();
 
+                // A generic static (a borrow of a generic constant promoted to a static, `&Self::R_TLSDESC` in a
+                // trait's provided constant): its value depends on the parameters, so it is evaluated per path, as a
+                // generic constant is, not once into `m_value_res`. Imported ones have no `m_value_res` at all.
+                if( s.m_params.is_generic() && (s.m_value || s.m_value.m_mir) )
+                {
+                    if(out_ty) {
+                        *out_ty = const_ms.monomorph_type(state.sp, s.m_type);
+                    }
+                    auto it = s.m_monomorph_cache.find(p);
+                    if( it == s.m_monomorph_cache.end() )
+                    {
+                        auto& item = const_cast<::HIR::Static&>(s);
+                        ::HIR::ItemPath mod_ip { item.m_value.m_state->m_mod_path };
+                        auto nvs = NewvalState(item.m_value.m_state->m_module, mod_ip, FMT("static" << &item << "#"));
+                        auto eval = ::HIR::Evaluator(item.m_value.span(), root_resolve.m_crate, nvs);
+                        eval.resolve.set_both_generics_raw(impl_params_def, &s.m_params);
+                        DEBUG("- Evaluate monomorphed static " << p);
+                        auto ty = const_ms.monomorph_type( item.m_value.span(), item.m_type );
+                        auto val = eval.evaluate_constant(::HIR::ItemPath(p), item.m_value, std::move(ty), std::move(const_ms));
+                        it = item.m_monomorph_cache.insert(std::make_pair(p.clone(), std::move(val))).first;
+                    }
+                    return StaticRefPtr::allocate(std::move(p), &it->second);
+                }
+
                 if( !s.m_value_generated )
                 {
                     // If there's no MIR and no HIR then this is an external static (which can only be borrowed)
@@ -3407,6 +3431,14 @@ namespace {
                 switch(pc)
                 {
                 case ::HIR::Visitor::PathContext::VALUE: {
+                    // An enum variant constructor (`E::<true>::V(..)`) is not a value item of a module: it takes the
+                    // enum's parameters.
+                    if( p.m_path.components().size() >= 2 ) {
+                        const auto& parent = m_crate.get_typeitem_by_path(sp, p.m_path, false, /*ignore_last_node=*/true);
+                        if( const auto* e = parent.opt_Enum() ) {
+                            return e->m_params;
+                        }
+                    }
                     auto& vi = m_crate.get_valitem_by_path(sp, p.m_path);
                     TU_MATCH_HDRA( (vi), { )
                     TU_ARMA(Import, e)  BUG(sp, "Module Import");

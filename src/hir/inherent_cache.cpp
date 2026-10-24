@@ -235,7 +235,9 @@ void HIR::InherentCache::find(const Span& sp, const RcString& name, const HIR::T
         if( fcn.m_receiver == HIR::Function::Receiver::Custom ) {
             if( fcn.m_receiver_type.match_test_generics(sp, ty, ResolvePlaceholdersNop(), getself) ) {
                 ASSERT_BUG(sp, getself.detected_self_ty, "Unable to determine receiver type when matching " << fcn.m_receiver_type << " and " << ty);
-                cb(*getself.detected_self_ty, impl);
+                // The match walks the receiver as written (`&mut &mut _1` for `self: &mut &'a mut Self`): resolve the
+                // `Self` it found, as the other receivers do, so the method path does not name an inference variable.
+                cb(ty_res.get_type(sp, *getself.detected_self_ty), impl);
             }
         }
         else {

@@ -190,6 +190,8 @@ class PackageRef
     bool m_optional = false;
     bool m_public = false;
     ::std::string   m_path;
+    // Git URL (the source must be vendored: `cargo vendor` copies git dependencies too)
+    ::std::string   m_git;
 
     // Features requested by this reference
     bool    m_use_default_features = true;
@@ -220,7 +222,7 @@ public:
 
     const bool has_path() const { return m_path != ""; }
     const ::std::string& path() const { return m_path; }
-    const bool has_git() const { return false; }
+    const bool has_git() const { return m_git != ""; }
 
     const PackageManifest& get_package() const {
         if(!m_manifest) throw ::std::runtime_error("Manifest not loaded for package " + m_name);
@@ -335,6 +337,7 @@ class WorkspaceManifest
     ::std::map< ::std::string, ::helpers::path> m_patches;
 
     Edition m_edition = Edition::Unspec;
+    ::std::string   m_version;  // [workspace.package] version, for `version.workspace = true`
     struct Dependencies {
         ::std::vector<PackageRef>   main;
         ::std::vector<PackageRef>   build;
@@ -347,6 +350,7 @@ public:
     static WorkspaceManifest load_from_toml(const ::helpers::path& workspace_manifest_path);
 
     Edition edition() const { return m_edition; }
+    const ::std::string& version() const { return m_version; }
     const ::std::map< ::std::string, ::helpers::path>& patches() const { return m_patches; }
     const ::std::vector<PackageRef>& dependencies() const { return m_dependencies.main; }
     const ::std::vector<PackageRef>& build_dependencies() const { return m_dependencies.build; }

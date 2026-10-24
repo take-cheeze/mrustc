@@ -3701,7 +3701,9 @@ bool TraitResolution::find_trait_impls_crate(const Span& sp,
         {
             if( const auto* e = ty.data().opt_Generic() )
             {
-                if( e->binding == g.binding && e->name == g.name )
+                // `GenericRef` equality: the binding, and the name only for placeholders. A method generic can be
+                // named differently in the trait and in the impl (`fn fold_with<F>` / `fn fold_with<G>`).
+                if( *e == g )
                 {
                     return ::HIR::Compare::Equal;
                 }
@@ -3747,7 +3749,7 @@ bool TraitResolution::find_trait_impls_crate(const Span& sp,
         {
             if( const auto* e = v.opt_Generic() )
             {
-                if( e->binding == g.binding && e->name == g.name )
+                if( *e == g )
                 {
                     return ::HIR::Compare::Equal;
                 }
@@ -4719,7 +4721,8 @@ const ::HIR::TypeRef* TraitResolution::autoderef(const Span& sp, const ::HIR::Ty
 
 unsigned int TraitResolution::autoderef_find_method(const Span& sp,
         const HIR::t_trait_list& traits, const ::std::vector<unsigned>& ivars, const ::HIR::TypeRef& top_ty, const RcString& method_name,
-        /* Out -> */::std::vector<::std::pair<AutoderefBorrow,::HIR::Path>>& possibilities
+        /* Out -> */::std::vector<::std::pair<AutoderefBorrow,::HIR::Path>>& possibilities,
+        bool* out_fuzzy_inherent
         ) const
 {
     try {
@@ -4761,24 +4764,24 @@ unsigned int TraitResolution::autoderef_find_method(const Span& sp,
         DEBUG(deref_count << ": " << ty);
 
         // Non-referenced
-        if( this->find_method(sp, traits, ivars, ty, method_name,  cur_access, AutoderefBorrow::None, possibilities) )
+        if( this->find_method(sp, traits, ivars, ty, method_name,  cur_access, AutoderefBorrow::None, possibilities, out_fuzzy_inherent) )
         {
             DEBUG("FOUND *{" << deref_count << "}, fcn_path = " << possibilities.back().second);
         }
 
         // Auto-ref
         auto borrow_ty = ::HIR::TypeRef::new_borrow(::HIR::BorrowType::Shared, ty.clone());
-        if( this->find_method(sp, traits, ivars, borrow_ty, method_name,  MethodAccess::Move, AutoderefBorrow::Shared, possibilities) )
+        if( this->find_method(sp, traits, ivars, borrow_ty, method_name,  MethodAccess::Move, AutoderefBorrow::Shared, possibilities, out_fuzzy_inherent) )
         {
             DEBUG("FOUND & *{" << deref_count << "}, fcn_path = " << possibilities.back().second);
         }
         borrow_ty.get_unique().as_Borrow().type = ::HIR::BorrowType::Unique;
-        if( cur_access >= MethodAccess::Unique && this->find_method(sp, traits, ivars, borrow_ty, method_name,  MethodAccess::Move, AutoderefBorrow::Unique, possibilities) )
+        if( cur_access >= MethodAccess::Unique && this->find_method(sp, traits, ivars, borrow_ty, method_name,  MethodAccess::Move, AutoderefBorrow::Unique, possibilities, out_fuzzy_inherent) )
         {
             DEBUG("FOUND &mut *{" << deref_count << "}, fcn_path = " << possibilities.back().second);
         }
         borrow_ty.get_unique().as_Borrow().type = ::HIR::BorrowType::Owned;
-        if( cur_access >= MethodAccess::Move && this->find_method(sp, traits, ivars, borrow_ty, method_name,  MethodAccess::Move, AutoderefBorrow::Owned, possibilities) )
+        if( cur_access >= MethodAccess::Move && this->find_method(sp, traits, ivars, borrow_ty, method_name,  MethodAccess::Move, AutoderefBorrow::Owned, possibilities, out_fuzzy_inherent) )
         {
             DEBUG("FOUND &move *{" << deref_count << "}, fcn_path = " << possibilities.back().second);
         }
@@ -4941,7 +4944,8 @@ const ::HIR::TypeRef* TraitResolution::check_method_receiver(const Span& sp, con
 
 bool TraitResolution::find_method(const Span& sp,
     const HIR::t_trait_list& traits, const ::std::vector<unsigned>& ivars, const ::HIR::TypeRef& ty, const RcString& method_name, MethodAccess access,
-    AutoderefBorrow borrow_type, /* Out -> */::std::vector<::std::pair<AutoderefBorrow,::HIR::Path>>& possibilities
+    AutoderefBorrow borrow_type, /* Out -> */::std::vector<::std::pair<AutoderefBorrow,::HIR::Path>>& possibilities,
+    bool* out_fuzzy_inherent
     ) const
 {
     bool rv = false;
@@ -4975,7 +4979,10 @@ bool TraitResolution::find_method(const Span& sp,
         auto cmp = ftic_check_params(sp, ::HIR::SimplePath(), nullptr, self_ty, impl.m_params, {}, impl.m_type, impl_params);
         if( cmp != HIR::Compare::Unequal )
         {
-            DEBUG("Found `impl" << impl.m_params.fmt_args() << " " << impl.m_type << "` fn " << method_name/* << " - " << top_ty*/);
+            DEBUG("Found `impl" << impl.m_params.fmt_args() << " " << impl.m_type << "` fn " << method_name/* << " - " << top_ty*/ << (cmp == HIR::Compare::Fuzzy ? " (fuzzy)" : ""));
+            if( cmp == HIR::Compare::Fuzzy && out_fuzzy_inherent ) {
+                *out_fuzzy_inherent = true;
+            }
             possibilities.push_back(::std::make_pair( borrow_type, ::HIR::Path(self_ty.clone(), method_name, {}) ));
             DEBUG("++ " << possibilities.back());
             rv = true;

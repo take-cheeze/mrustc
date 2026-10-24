@@ -98,6 +98,9 @@ namespace {
         )
     {
         TRACE_FUNCTION_FR(param_defs.fmt_args() << " -> " << params << " (fill_infer=" << fill_infer << ")", params);
+        // `S<u8>` for `S<T, const N: bool = false>` names `S<u8, false>`: once any type argument is written, an
+        // omitted const argument takes its default, as an omitted type argument does. Only a bare `S` infers them.
+        const bool had_type_args = !params.m_types.empty();
         if( params.m_lifetimes.size() != param_defs.m_lifetimes.size() )
         {
             if( params.m_lifetimes.size() == 0 && fill_infer ) {
@@ -131,7 +134,7 @@ namespace {
         }
         if( params.m_values.size() != param_defs.m_values.size() )
         {
-            if( params.m_values.size() == 0 && fill_infer ) {
+            if( params.m_values.size() == 0 && fill_infer && !had_type_args ) {
                 params.m_values.resize(param_defs.m_values.size());
             }
             else if( params.m_values.size() > param_defs.m_values.size() ) {

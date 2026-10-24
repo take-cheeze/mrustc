@@ -1200,7 +1200,7 @@ namespace static_borrow_constants {
                         new_static.m_value_res = ::std::move(value);
                         DEBUG(path << " = " << new_static.m_value_res);
                         m_current_module.m_value_items.insert(std::make_pair( name, box$(HIR::VisEnt<HIR::ValueItem> {
-                                HIR::Publicity::new_none(), // Should really be private, but we're well after checking
+                                HIR::Publicity::new_global(), // Global: generic code instantiated in another crate can refer to it (mold 3), so the defining crate must emit it
                                 HIR::ValueItem(::std::move(new_static))
                             })) );
                         return path;
@@ -1246,7 +1246,7 @@ namespace static_borrow_constants {
                         ? HIR::ValueItem(H::to_const(new_static))
                         : HIR::ValueItem(std::move(new_static_pair.data));
                     mod.m_value_items.insert(std::make_pair( mv$(new_static_pair.path.components().back()), box$(HIR::VisEnt<HIR::ValueItem> {
-                        HIR::Publicity::new_none(), // Should really be private, but we're well after checking
+                        HIR::Publicity::new_global(), // Global: generic code instantiated in another crate can refer to it (mold 3), so the defining crate must emit it
                         std::move(new_ent)
                         })) );
                 }
@@ -1451,7 +1451,7 @@ void HIR_Expand_StaticBorrowConstants_Expr(const ::HIR::Crate& crate, const ::HI
                 new_static.m_value_res = ::std::move(value);
                 DEBUG(path << " = " << new_static.m_value_res);
                 crate.m_new_values.push_back(std::make_pair( name, box$(HIR::VisEnt<HIR::ValueItem> {
-                    HIR::Publicity::new_none(), // Should really be private, but we're well after checking
+                    HIR::Publicity::new_global(), // Global: generic code instantiated in another crate can refer to it (mold 3), so the defining crate must emit it
                     HIR::ValueItem(::std::move(new_static))
                 }) ));
 
@@ -1482,7 +1482,7 @@ void HIR_Expand_StaticBorrowConstants_Expr(const ::HIR::Crate& crate, const ::HI
             ? HIR::ValueItem(HIR::Constant { std::move(new_static.m_params), std::move(new_static.m_type), std::move(new_static.m_value) })
             : HIR::ValueItem(std::move(new_static))
             ;
-        auto boxed = box$(( ::HIR::VisEnt< ::HIR::ValueItem> { ::HIR::Publicity::new_none(), std::move(vi) } ));
+        auto boxed = box$(( ::HIR::VisEnt< ::HIR::ValueItem> { ::HIR::Publicity::new_global(), std::move(vi) } ));   // Global, as above
         crate.m_new_values.push_back( ::std::make_pair(name, mv$(boxed)) );
         {
             auto& e = crate.m_new_values.back().second->ent;
