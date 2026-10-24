@@ -961,7 +961,15 @@ namespace {
             // - If running in a mode after stablise (before defaults), fall
             //   back to trait if the inherent is still ambigious.
             ::std::vector<::std::pair<TraitResolution::AutoderefBorrow, ::HIR::Path>> possible_methods;
-            unsigned int deref_count = this->context.m_resolve.autoderef_find_method(node.span(), node.m_traits, node.m_trait_param_ivars, ty, node.m_method,  possible_methods);
+            bool fuzzy_inherent = false;
+            unsigned int deref_count = this->context.m_resolve.autoderef_find_method(node.span(), node.m_traits, node.m_trait_param_ivars, ty, node.m_method,  possible_methods, &fuzzy_inherent);
+            // An inherent impl that only matches by equating inference variables (`impl<T> Either<T,T>` for
+            // `Either<_1,_2>`, whose arms are not unified yet) may not apply once they are known; rustc would have
+            // fallen back to a trait method then. Wait for the types, unless nothing else can make progress.
+            if( deref_count != ~0u && fuzzy_inherent && !this->m_is_fallback ) {
+                DEBUG("Inherent method only matched with inference variables, waiting");
+                return ;
+            }
         try_again:
             if( deref_count != ~0u )
             {
