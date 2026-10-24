@@ -1332,8 +1332,17 @@ void PackageManifest::load_build_script(const ::std::string& path)
         std::getline(is, line);
         if( line.compare(0, 5+1, "cargo:") == 0 )
         {
-            size_t start = 5+1;
-            size_t eq_pos = line.find_first_of('=');
+            // `cargo::KEY=VALUE` is the Rust 1.77 syntax of `cargo:KEY=VALUE`; its custom metadata is
+            // `cargo::metadata=KEY=VALUE` (the old syntax took any unknown KEY as metadata).
+            bool new_syntax = line.compare(0, 6+1, "cargo::") == 0;
+            size_t start = new_syntax ? 6+1 : 5+1;
+            if( new_syntax && line.compare(start, 8+1, "metadata=") == 0 ) {
+                start += 8+1;
+            }
+            size_t eq_pos = line.find_first_of('=', start);
+            if( eq_pos == ::std::string::npos ) {
+                continue;
+            }
             ::helpers::string_view  key { line.c_str() + start, eq_pos - start };
             ::helpers::string_view  value { line.c_str() + eq_pos + 1, line.size() - eq_pos - 1 };
 
