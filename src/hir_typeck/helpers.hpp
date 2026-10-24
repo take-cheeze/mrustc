@@ -288,7 +288,9 @@ public:
     /// \return Number of times deref was applied (or ~0 if _ was hit)
     unsigned int autoderef_find_method(const Span& sp,
             const HIR::t_trait_list& traits, const ::std::vector<unsigned>& ivars, const ::HIR::TypeRef& top_ty, const RcString& method_name,
-            /* Out -> */::std::vector<::std::pair<AutoderefBorrow,::HIR::Path>>& possibilities
+            /* Out -> */::std::vector<::std::pair<AutoderefBorrow,::HIR::Path>>& possibilities,
+            /// Set when an inherent impl only matched by fixing inference variables (`impl<T> E<T,T>` for `E<_1,_2>`)
+            bool* out_fuzzy_inherent=nullptr
             ) const;
     /// Locate the named field by applying auto-dereferencing.
     /// \return Number of times deref was applied (or ~0 if _ was hit)
@@ -317,7 +319,8 @@ public:
     friend ::std::ostream& operator<<(::std::ostream& os, const AllowedReceivers& x);
     bool find_method(const Span& sp,
             const HIR::t_trait_list& traits, const ::std::vector<unsigned>& ivars, const ::HIR::TypeRef& ty, const RcString& method_name, MethodAccess access,
-            AutoderefBorrow borrow_type, /* Out -> */::std::vector<::std::pair<AutoderefBorrow,::HIR::Path>>& possibilities
+            AutoderefBorrow borrow_type, /* Out -> */::std::vector<::std::pair<AutoderefBorrow,::HIR::Path>>& possibilities,
+            bool* out_fuzzy_inherent=nullptr
             ) const;
 
     /// Locates a named method in a trait, and returns the path of the trait that contains it (with fixed parameters)

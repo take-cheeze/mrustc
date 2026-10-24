@@ -137,28 +137,38 @@ HIR::LifetimeRef LowerHIR_LifetimeRef(const ::AST::LifetimeRef& r)
                 mv$(bound_trait_path)
                 }));
 
-            for(auto& bound : tp_bounds)
-            {
-                const auto& name = bound.first;
-                const auto& src_trait = bound.second.source_trait;
-                const auto& params = bound.second.aty_params;
-                for(auto& trait : bound.second.traits)
+            // `T: Tr<A: B>` becomes `<T as Tr>::A: B`. `B` can have bounds of its own (`Tr<A: Tr2<C: D>>`), which become
+            // `<<T as Tr>::A as Tr2>::C: D`, and so on.
+            std::function<void(const ::HIR::TypeRef&, decltype(tp_bounds)&)> push_aty_bounds;
+            push_aty_bounds = [&](const ::HIR::TypeRef& type, decltype(tp_bounds)& tp_bounds) {
+                for(auto& bound : tp_bounds)
                 {
-                    std::unique_ptr<HIR::GenericParams> hrls;
-                    if( !e.outer_hrbs.empty() ) {
-                        hrls = box$(LowerHIR_HigherRankedBounds(e.outer_hrbs));
+                    const auto& name = bound.first;
+                    const auto& src_trait = bound.second.source_trait;
+                    const auto& params = bound.second.aty_params;
+                    auto aty_type = ::HIR::TypeRef::new_path( ::HIR::Path(type.clone(), src_trait.clone(), name, params.clone()), {} );
+                    for(auto& trait : bound.second.traits)
+                    {
+                        auto inner_bounds = mv$(trait.m_trait_bounds);
+                        trait.m_trait_bounds.clear();
+                        std::unique_ptr<HIR::GenericParams> hrls;
+                        if( !e.outer_hrbs.empty() ) {
+                            hrls = box$(LowerHIR_HigherRankedBounds(e.outer_hrbs));
+                        }
+                        if( !e.inner_hrbs.empty() ) {
+                            hrls = box$(LowerHIR_HigherRankedBounds(e.inner_hrbs));
+                        }
+                        rv.m_bounds.push_back(::HIR::GenericBound::make_TraitBound({
+                            std::move(hrls),
+                            aty_type.clone(),
+                            std::move(trait)
+                            }));
+                        push_aty_bounds(aty_type, inner_bounds);
                     }
-                    if( !e.inner_hrbs.empty() ) {
-                        hrls = box$(LowerHIR_HigherRankedBounds(e.inner_hrbs));
-                    }
-                    rv.m_bounds.push_back(::HIR::GenericBound::make_TraitBound({
-                        std::move(hrls),
-                        ::HIR::TypeRef::new_path( ::HIR::Path(type.clone(), src_trait.clone(), name, params.clone()), {} ),
-                        std::move(trait)
-                        }));
+                    bound.second.traits.clear();
                 }
-                bound.second.traits.clear();
-            }
+            };
+            push_aty_bounds(type, tp_bounds);
             }
         TU_ARMA(MaybeTrait, e) {
             auto type = LowerHIR_Type(e.type);
@@ -873,8 +883,9 @@ namespace {
                 //if(src_trait == ::HIR::GenericPath())
                 //    ERROR(sp, E0000, "Unable to find source trait for " << b->first << " in " << bound_trait_path.m_path);
                 auto it = rv.m_trait_bounds.insert(std::make_pair(name_args.first, ::HIR::TraitPath::AtyBound { std::move(src_trait), std::move(name_args.second), {} }));
+                // Nested bounds (`Tr<A: Tr2<C: D>>`) are kept; the generic bound lowering expands them.
                 for(const auto& trait : assoc.second) {
-                    it.first->second.traits.push_back( LowerHIR_TraitPath(sp, trait, {}, /*ignore_bounds*/false) );
+                    it.first->second.traits.push_back( LowerHIR_TraitPath(sp, trait, {}, /*ignore_bounds*/true) );
                 }
 
             }

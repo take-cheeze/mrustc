@@ -186,7 +186,7 @@ WorkspaceManifest WorkspaceManifest::load_from_toml(const ::helpers::path& works
             {
                 // Resolver version, doesn't really matter for minicargo?
             }
-            else if( key == "members" || key == "exclude" )
+            else if( key == "members" || key == "exclude" || key == "default-members" )
             {
                 // Ignore members list, for now.
             }
@@ -197,6 +197,9 @@ WorkspaceManifest WorkspaceManifest::load_from_toml(const ::helpers::path& works
                 const auto& key = key_val.path[2];
                 if( key == "edition" ) {
                     parse_edition(rv.m_edition, eh, key_val.value);
+                }
+                else if( key == "version" ) {
+                    rv.m_version = key_val.value.as_string();
                 }
                 else if( key == "rust-version" ) {
                     // Ignore, that's future-me's problem
@@ -484,9 +487,23 @@ void PackageManifest::fill_from_kv(ErrorHandler& eh, const WorkspaceManifest* wm
             }
             else if( key == "version" )
             {
+                ::std::string   ver;
+                if( key_val.path.size() == 3 && key_val.path[2] == "workspace" ) {
+                    // `version.workspace = true`
+                    if( !wm || wm->version() == "" ) {
+                        eh.error("`version.workspace` present, but no workspace specified a version");
+                    }
+                    if( !key_val.value.as_bool() ) {
+                        eh.error("`version.workspace = false` is not valid");
+                    }
+                    ver = wm->version();
+                }
+                else {
+                    ver = key_val.value.as_string();
+                }
                 try
                 {
-                    rv.m_version = PackageVersion::from_string(key_val.value.as_string());
+                    rv.m_version = PackageVersion::from_string(ver);
                     rv.m_version.patch_set = true;
                 }
                 catch(const ::std::invalid_argument& e)
@@ -1003,13 +1020,14 @@ void PackageRef::fill_from_kv(
         }
         else if( attr == "git" )
         {
-            // Load from git repo.
-            eh.todo("Support git dependencies");
+            // Git repo: the package is found by name in the vendor directory (`cargo vendor` copies git
+            // dependencies there, at the revision of the lock file).
+            assert(key_val.path.size() == base_idx+1);
+            this->m_git = key_val.value.as_string();
         }
-        else if( attr == "branch" )
+        else if( attr == "branch" || attr == "rev" || attr == "tag" )
         {
-            // Specify git branch
-            eh.todo("Support git dependencies (branch)");
+            // The revision is the vendored copy's (see `git` above).
         }
         else if( attr == "version" )
         {
@@ -1314,8 +1332,17 @@ void PackageManifest::load_build_script(const ::std::string& path)
         std::getline(is, line);
         if( line.compare(0, 5+1, "cargo:") == 0 )
         {
-            size_t start = 5+1;
-            size_t eq_pos = line.find_first_of('=');
+            // `cargo::KEY=VALUE` is the Rust 1.77 syntax of `cargo:KEY=VALUE`; its custom metadata is
+            // `cargo::metadata=KEY=VALUE` (the old syntax took any unknown KEY as metadata).
+            bool new_syntax = line.compare(0, 6+1, "cargo::") == 0;
+            size_t start = new_syntax ? 6+1 : 5+1;
+            if( new_syntax && line.compare(start, 8+1, "metadata=") == 0 ) {
+                start += 8+1;
+            }
+            size_t eq_pos = line.find_first_of('=', start);
+            if( eq_pos == ::std::string::npos ) {
+                continue;
+            }
             ::helpers::string_view  key { line.c_str() + start, eq_pos - start };
             ::helpers::string_view  value { line.c_str() + eq_pos + 1, line.size() - eq_pos - 1 };
 
@@ -1427,10 +1454,15 @@ std::shared_ptr<PackageManifest> PackageRef::load_manifest_raw(Repository& repo,
     // If the path isn't set, check for:
     // - Git (checkout and use)
     // - Version and repository (check vendored, check cache, download into cache)
-    if( this->has_git() )
+    if( this->has_git() && !this->has_path() )
     {
-        DEBUG("Load dependency " << this->name() << " from git");
-        throw ::std::runtime_error("TODO: PackageRef::load_manifest_raw - Git");
+        // No checkout: use the vendored copy (any version, unless one is also given).
+        DEBUG("Load dependency " << this->name() << " from git " << m_git << " (vendored)");
+        auto rv = repo.find(this->name(), this->get_version(), filter_cb);
+        if( !rv ) {
+            throw ::std::runtime_error(format("Git dependency ", this->name(), " (", m_git, ") is not in the vendor directory"));
+        }
+        return rv;
     }
 
     if( !this->get_version().m_bounds.empty() )

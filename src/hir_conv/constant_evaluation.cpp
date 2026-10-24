@@ -3407,6 +3407,14 @@ namespace {
                 switch(pc)
                 {
                 case ::HIR::Visitor::PathContext::VALUE: {
+                    // An enum variant constructor (`E::<true>::V(..)`) is not a value item of a module: it takes the
+                    // enum's parameters.
+                    if( p.m_path.components().size() >= 2 ) {
+                        const auto& parent = m_crate.get_typeitem_by_path(sp, p.m_path, false, /*ignore_last_node=*/true);
+                        if( const auto* e = parent.opt_Enum() ) {
+                            return e->m_params;
+                        }
+                    }
                     auto& vi = m_crate.get_valitem_by_path(sp, p.m_path);
                     TU_MATCH_HDRA( (vi), { )
                     TU_ARMA(Import, e)  BUG(sp, "Module Import");

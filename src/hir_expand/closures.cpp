@@ -935,6 +935,49 @@ namespace {
                             return true;
                         }
                     }
+                    // Const generics count as type generics do: `Class<IS_64>: ElfClass` is needed when `IS_64` is used.
+                    auto check_value = [&](const ::HIR::ConstGeneric& v)->bool {
+                        if( v.is_Generic() ) {
+                            if( contains(constructor_path_params.m_values, v) ) {
+                                if( rv == TypeNeed::NoGenerics ) {
+                                    rv = TypeNeed::Required;
+                                }
+                            }
+                            else {
+                                rv = TypeNeed::UsesOthers;
+                                return true;
+                            }
+                        }
+                        return false;
+                    };
+                    auto check_values = [&](const ::HIR::PathParams& pp)->bool {
+                        for(const auto& v : pp.m_values) {
+                            if( check_value(v) )
+                                return true;
+                        }
+                        return false;
+                    };
+                    if( const auto* te = t.data().opt_Path() ) {
+                        TU_MATCH_HDRA( (te->path.m_data), {)
+                        TU_ARMA(Generic, pe) {
+                            if( check_values(pe.m_params) ) return true;
+                            }
+                        TU_ARMA(UfcsKnown, pe) {
+                            if( check_values(pe.trait.m_params) || check_values(pe.params) ) return true;
+                            }
+                        TU_ARMA(UfcsInherent, pe) {
+                            if( check_values(pe.impl_params) || check_values(pe.params) ) return true;
+                            }
+                        TU_ARMA(UfcsUnknown, pe) {
+                            if( check_values(pe.params) ) return true;
+                            }
+                        }
+                    }
+                    if( const auto* te = t.data().opt_Array() ) {
+                        if( const auto* se = te->size.opt_Unevaluated() ) {
+                            if( check_value(*se) ) return true;
+                        }
+                    }
                     return false;
                 };
             }
@@ -1597,8 +1640,10 @@ namespace {
                 rv.new_locals.push_back( monomorph_cb.monomorph_type(sp, m_variable_types.at(cap.first)) );
 
                 rv.capture_usages.push_back(cap.second);
-                auto cap_ty = monomorph_cb.monomorph_type(sp, m_variable_types.at(cap.first));
-                rv.struct_ents.push_back(HIR::VisEnt<HIR::TypeRef> { HIR::Publicity::new_none(), cap_ty.clone() });
+                // The struct entry uses the new type's parameters; the capture expression stays in the creating
+                // function, so it keeps the variable's own type (a `'M1` there is `'I1` in the struct).
+                auto cap_ty = m_variable_types.at(cap.first).clone();
+                rv.struct_ents.push_back(HIR::VisEnt<HIR::TypeRef> { HIR::Publicity::new_none(), monomorph_cb.monomorph_type(sp, cap_ty) });
                 rv.capture_nodes.push_back(HIR::ExprNodeP(new ::HIR::ExprNode_Variable(sp, "", cap.first)));
                 switch(cap.second)
                 {
