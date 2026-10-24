@@ -1401,6 +1401,27 @@ bool StaticTraitResolve::find_impl__check_crate_raw(
                     DEBUG("- Placeholder param within " << b_ty_mono << ", magic success");
                     rv = true;
                 }
+                // The same for a projection of a placeholder in the trait's parameters: in `C: UnindexedConsumer<U::Item>`
+                // before `F: Fn(T) -> U`, `U` is only known from a later bound (rayon 1.12, `FlatMapIterConsumer`).
+                // Only projections: a placeholder in an associated type binding (`I: TrustedLen<Item = &[T; N]>`) or as
+                // a parameter itself can be checked, and must still fail (`Flatten<Iter<Option<_>>>` is not TrustedLen).
+                if(!rv) {
+                    auto is_placeholder_projection = [](const HIR::TypeRef& ty)->bool {
+                        if( const auto* te = ty.data().opt_Path() ) {
+                            if( const auto* pe = te->path.m_data.opt_UfcsKnown() ) {
+                                return visit_ty_with(pe->type, [](const HIR::TypeRef& t){ return t.data().is_Generic() && t.data().as_Generic().is_placeholder(); });
+                            }
+                        }
+                        return false;
+                    };
+                    for(const auto& t : b_tp_mono.m_path.m_params.m_types) {
+                        if( visit_ty_with(t, is_placeholder_projection) ) {
+                            DEBUG("- Projection of a placeholder within " << b_tp_mono << ", magic success");
+                            rv = true;
+                            break;
+                        }
+                    }
+                }
                 if( !rv ) {
                     DEBUG("> Fail - " << b_ty_mono << ": " << b_tp_mono);
                     return false;
