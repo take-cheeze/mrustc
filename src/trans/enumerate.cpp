@@ -16,6 +16,7 @@
 #include <hir_typeck/static.hpp>    // StaticTraitResolve
 #include <hir/item_path.hpp>
 #include <deque>
+#include <cstring>
 #include <algorithm>
 #include "target.hpp"
 #include "mangling.hpp"
@@ -343,6 +344,13 @@ namespace {
         for(auto& vi : mod.m_value_items)
         {
             bool emit = is_visible && vi.second->publicity.is_global();
+            // A static lifted from a constant (static_borrow_constants) is private, so that glob imports do not see
+            // it (`pub use core::alloc::*` would import core's into alloc). Generic code instantiated in another crate
+            // can still refer to it (mold 3's `const R_FUNCALL: &'static [u32]` in a trait impl), so it is always
+            // emitted.
+            if( ::std::strncmp(vi.first.c_str(), "lifted#", 7) == 0 ) {
+                emit = true;
+            }
             auto p = mod_path + vi.first;
             if( ::std::any_of(state.crate.m_lang_items.begin(), state.crate.m_lang_items.end(), [&](const auto& e){ return e.second == p; }) ) {
                 emit = true;
