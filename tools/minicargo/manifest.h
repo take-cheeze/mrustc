@@ -190,6 +190,8 @@ class PackageRef
     bool m_optional = false;
     bool m_public = false;
     ::std::string   m_path;
+    // Git URL (the source must be vendored: `cargo vendor` copies git dependencies too)
+    ::std::string   m_git;
 
     // Features requested by this reference
     bool    m_use_default_features = true;
@@ -220,7 +222,7 @@ public:
 
     const bool has_path() const { return m_path != ""; }
     const ::std::string& path() const { return m_path; }
-    const bool has_git() const { return false; }
+    const bool has_git() const { return m_git != ""; }
 
     const PackageManifest& get_package() const {
         if(!m_manifest) throw ::std::runtime_error("Manifest not loaded for package " + m_name);

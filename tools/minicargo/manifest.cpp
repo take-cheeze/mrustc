@@ -1003,13 +1003,14 @@ void PackageRef::fill_from_kv(
         }
         else if( attr == "git" )
         {
-            // Load from git repo.
-            eh.todo("Support git dependencies");
+            // Git repo: the package is found by name in the vendor directory (`cargo vendor` copies git
+            // dependencies there, at the revision of the lock file).
+            assert(key_val.path.size() == base_idx+1);
+            this->m_git = key_val.value.as_string();
         }
-        else if( attr == "branch" )
+        else if( attr == "branch" || attr == "rev" || attr == "tag" )
         {
-            // Specify git branch
-            eh.todo("Support git dependencies (branch)");
+            // The revision is the vendored copy's (see `git` above).
         }
         else if( attr == "version" )
         {
@@ -1427,10 +1428,15 @@ std::shared_ptr<PackageManifest> PackageRef::load_manifest_raw(Repository& repo,
     // If the path isn't set, check for:
     // - Git (checkout and use)
     // - Version and repository (check vendored, check cache, download into cache)
-    if( this->has_git() )
+    if( this->has_git() && !this->has_path() )
     {
-        DEBUG("Load dependency " << this->name() << " from git");
-        throw ::std::runtime_error("TODO: PackageRef::load_manifest_raw - Git");
+        // No checkout: use the vendored copy (any version, unless one is also given).
+        DEBUG("Load dependency " << this->name() << " from git " << m_git << " (vendored)");
+        auto rv = repo.find(this->name(), this->get_version(), filter_cb);
+        if( !rv ) {
+            throw ::std::runtime_error(format("Git dependency ", this->name(), " (", m_git, ") is not in the vendor directory"));
+        }
+        return rv;
     }
 
     if( !this->get_version().m_bounds.empty() )
