@@ -5043,7 +5043,8 @@ namespace {
                         }
 
                         // Continue on with coercion (now that node_ptr is updated)
-                        switch( check_unsize_tys(context, sp, dep->inner, se.inner, context_mut, &node_ptr) )
+                        // - No node pointer: raw pointers unsize, but never deref-coerce (`*mut Wrapper` is not `*mut Wrapper::Target`)
+                        switch( check_unsize_tys(context, sp, dep->inner, se.inner, context_mut, nullptr) )
                         {
                         case CoerceResult::Fail:
                             return CoerceResult::Fail;
@@ -5098,8 +5099,8 @@ namespace {
                 }
                 ASSERT_BUG(sp, dep->type == se.type, "Pointer strength mismatch");
 
-                // Call unsizing code
-                return check_unsize_tys(context, sp, dep->inner, se.inner, context_mut, node_ptr_ptr);
+                // Call unsizing code (raw pointers never deref-coerce, so no node pointer)
+                return check_unsize_tys(context, sp, dep->inner, se.inner, context_mut, nullptr);
             }
             else
             {
