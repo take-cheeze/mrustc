@@ -3701,7 +3701,9 @@ bool TraitResolution::find_trait_impls_crate(const Span& sp,
         {
             if( const auto* e = ty.data().opt_Generic() )
             {
-                if( e->binding == g.binding && e->name == g.name )
+                // `GenericRef` equality: the binding, and the name only for placeholders. A method generic can be
+                // named differently in the trait and in the impl (`fn fold_with<F>` / `fn fold_with<G>`).
+                if( *e == g )
                 {
                     return ::HIR::Compare::Equal;
                 }
@@ -3747,7 +3749,7 @@ bool TraitResolution::find_trait_impls_crate(const Span& sp,
         {
             if( const auto* e = v.opt_Generic() )
             {
-                if( e->binding == g.binding && e->name == g.name )
+                if( *e == g )
                 {
                     return ::HIR::Compare::Equal;
                 }
