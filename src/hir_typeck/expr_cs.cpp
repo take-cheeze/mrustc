@@ -18,6 +18,19 @@
 #include "hir_conv/main_bindings.hpp"
 
 namespace {
+    // A pattern path without arguments (`S { .. }`) can arrive with the type arguments but not the const ones
+    // (`S<T, const N: bool>`): every omitted argument is inferred.
+    void pattern_pad_params(const ::HIR::GenericParams& defs, ::HIR::PathParams& params)
+    {
+        if( params.m_lifetimes.size() < defs.m_lifetimes.size() )
+            params.m_lifetimes.resize( defs.m_lifetimes.size() );
+        while( params.m_types.size() < defs.m_types.size() )
+            params.m_types.push_back( ::HIR::TypeRef() );
+        while( params.m_values.size() < defs.m_values.size() )
+            params.m_values.push_back( ::HIR::ConstGeneric() );
+    }
+}
+namespace {
     inline HIR::ExprNodeP mk_exprnodep(HIR::ExprNode* en, ::HIR::TypeRef ty){ en->m_res_type = mv$(ty); return HIR::ExprNodeP(en); }
 
     inline ::HIR::SimplePath get_parent_path(const ::HIR::SimplePath& sp) {
@@ -2639,12 +2652,14 @@ void Context::handle_pattern(const Span& sp, ::HIR::Pattern& pat, const ::HIR::T
                     TU_ARMA(Struct, be) {
                         auto& p = e.path.m_data.as_Generic();
                         assert(be);
+                        pattern_pad_params(be->m_params, p.m_params);
                         context.add_ivars_params( p.m_params );
                         possible_type = ::HIR::TypeRef::new_path(p.clone(), ::HIR::TypePathBinding(be));
                         }
                     TU_ARMA(Enum, be) {
                         auto& p = e.path.m_data.as_Generic();
                         assert(be.ptr);
+                        pattern_pad_params(be.ptr->m_params, p.m_params);
                         context.add_ivars_params( p.m_params );
                         possible_type = ::HIR::TypeRef::new_path(get_parent_path(p), ::HIR::TypePathBinding(be.ptr));
                         }
@@ -2657,12 +2672,14 @@ void Context::handle_pattern(const Span& sp, ::HIR::Pattern& pat, const ::HIR::T
                     TU_ARMA(Struct, be) {
                         auto& p = e.path.m_data.as_Generic();
                         assert(be);
+                        pattern_pad_params(be->m_params, p.m_params);
                         context.add_ivars_params( p.m_params );
                         possible_type = ::HIR::TypeRef::new_path(p.clone(), ::HIR::TypePathBinding(be));
                         }
                     TU_ARMA(Enum, be) {
                         auto& p = e.path.m_data.as_Generic();
                         assert(be.ptr);
+                        pattern_pad_params(be.ptr->m_params, p.m_params);
                         context.add_ivars_params( p.m_params );
                         possible_type = ::HIR::TypeRef::new_path(get_parent_path(p), ::HIR::TypePathBinding(be.ptr));
                         }
@@ -2675,12 +2692,14 @@ void Context::handle_pattern(const Span& sp, ::HIR::Pattern& pat, const ::HIR::T
                     TU_ARMA(Struct, be) {
                         auto& p = e.path.m_data.as_Generic();
                         assert(be);
+                        pattern_pad_params(be->m_params, p.m_params);
                         context.add_ivars_params( p.m_params );
                         possible_type = ::HIR::TypeRef::new_path(p.clone(), ::HIR::TypePathBinding(be));
                         }
                     TU_ARMA(Enum, be) {
                         auto& p = e.path.m_data.as_Generic();
                         assert(be.ptr);
+                        pattern_pad_params(be.ptr->m_params, p.m_params);
                         context.add_ivars_params( p.m_params );
                         possible_type = ::HIR::TypeRef::new_path(get_parent_path(p), ::HIR::TypePathBinding(be.ptr));
                         }
@@ -3303,12 +3322,14 @@ void Context::handle_pattern_direct_inner(const Span& sp, ::HIR::Pattern& pat, c
             TU_ARMA(Struct, be) {
                 auto& p = path.m_data.as_Generic();
                 assert(be);
+                pattern_pad_params(be->m_params, p.m_params);
                 context.add_ivars_params( p.m_params );
                 return ::HIR::TypeRef::new_path(p.clone(), ::HIR::TypePathBinding(be));
                 }
             TU_ARMA(Enum, be) {
                 auto& p = path.m_data.as_Generic();
                 assert(be.ptr);
+                pattern_pad_params(be.ptr->m_params, p.m_params);
                 context.add_ivars_params( p.m_params );
                 return ::HIR::TypeRef::new_path(get_parent_path(p), ::HIR::TypePathBinding(be.ptr));
                 }
