@@ -2533,7 +2533,47 @@ namespace {
                                 m_hrls.pop_back();
                             }
                         }
-                    } v { state, ep->m_span, ep.m_bindings, tpl.data().as_ErasedType().m_use.m_lifetimes };
+                    };
+                    // The bounds are the `use<..>` lifetimes, and the lifetimes inside the types the opaque type is
+                    // generic over: type parameters are always captured. For an `impl Trait` from a trait method, the
+                    // origin is `<&'a [T] as Trait<T>>::method`, so `'a` (from `Self`) is allowed.
+                    auto dst_lfts = tpl.data().as_ErasedType().m_use.m_lifetimes;
+                    {
+                        struct LftCollect: public HIR::Visitor {
+                            ThinVector<HIR::LifetimeRef>& out;
+                            unsigned type_depth = 0;
+                            LftCollect(ThinVector<HIR::LifetimeRef>& out): out(out) {}
+                            void add(const HIR::LifetimeRef& l) {
+                                if( l.is_hrl() || l.binding == HIR::LifetimeRef::UNKNOWN || l.binding == HIR::LifetimeRef::INFER )
+                                    return;
+                                for(const auto& e : out)
+                                    if( e == l )
+                                        return;
+                                out.push_back(l);
+                            }
+                            void visit_type(HIR::TypeRef& ty) override {
+                                type_depth ++;
+                                if( const auto* e = ty.data().opt_Borrow() )
+                                    add(e->lifetime);
+                                if( const auto* e = ty.data().opt_TraitObject() )
+                                    add(e->m_lifetime);
+                                HIR::Visitor::visit_type(ty);
+                                type_depth --;
+                            }
+                            void visit_path_params(HIR::PathParams& pp) override {
+                                // Only lifetimes inside a type (the type's own parameters), not the item's lifetime
+                                // parameters themselves (those are captured only when listed in `use<..>`).
+                                if( type_depth > 0 ) {
+                                    for(const auto& l : pp.m_lifetimes)
+                                        add(l);
+                                }
+                                HIR::Visitor::visit_path_params(pp);
+                            }
+                        } lc { dst_lfts };
+                        auto origin = e->m_origin.clone();
+                        lc.visit_path(origin, HIR::Visitor::PathContext::VALUE);
+                    }
+                    V v { state, ep->m_span, ep.m_bindings, dst_lfts };
 
                     DEBUG("Checking erased: " << ep.m_erased_types[e->m_index]);
                     DEBUG("vs " << tpl);
