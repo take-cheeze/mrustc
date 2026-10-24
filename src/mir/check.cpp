@@ -391,6 +391,13 @@ void MIR_Validate_ValState(::MIR::TypeResolve& state, const ::MIR::Function& fcn
                 return ;
         if( block_start_states.at(idx) == vs )
             return ;
+        // The path is only for error messages. A block revisited while the states converge inherits its
+        // predecessor's path, so in a large function it grows with every step (141k entries in a function of mold
+        // 3), and every queued block holds a copy: keep the most recent blocks only.
+        static const size_t MAX_PATH = 256;
+        if( src_path.size() >= MAX_PATH ) {
+            src_path.erase(src_path.begin(), src_path.begin() + (src_path.size() - MAX_PATH / 2));
+        }
         src_path.push_back(idx);
         // TODO: Update the target block, and only visit if we've induced a change
         to_visit_blocks.push_back( ToVisit { idx, mv$(src_path), (can_move ? mv$(vs) : ValStates(vs)) } );
