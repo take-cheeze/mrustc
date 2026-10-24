@@ -5735,6 +5735,13 @@ namespace {
                             m_of << se.params[f.index].as_Reg().spec.as_Explicit();
                             continue;
                         }
+                        bool is_x86 = Target_GetCurSpec().m_arch.m_name == "x86" || Target_GetCurSpec().m_arch.m_name == "x86_64";
+                        bool is_vreg = false;   // x86 xmm/ymm/zmm class: `x`/`y`/`z` select the vector width
+                        if( const auto* r = se.params[f.index].opt_Reg() ) {
+                            if( const auto* c = r->spec.opt_Class() ) {
+                                is_vreg = (*c == AsmCommon::RegisterClass::x86_xmm || *c == AsmCommon::RegisterClass::x86_ymm || *c == AsmCommon::RegisterClass::x86_zmm);
+                            }
+                        }
                         switch( f.modifier )
                         {
                         case '\0':
@@ -5744,6 +5751,29 @@ namespace {
                             break;
                         case 'e':
                             m_of << 'k';    // x86: `k` selects eax instead of rax
+                            break;
+                        case 'x':
+                            if( is_x86 )
+                                m_of << (is_vreg ? 'x' : 'w');  // x86: xmm0, or ax (`w`, 16 bits)
+                            else
+                                m_of << 'x';    // aarch64: x0, the same letter in GCC
+                            break;
+                        case 'l':
+                            m_of << 'b';    // x86: al
+                            break;
+                        case 'h':
+                            m_of << 'h';    // x86: ah
+                            break;
+                        case 'y':
+                            m_of << 't';    // x86: ymm0
+                            break;
+                        case 'z':
+                            m_of << 'g';    // x86: zmm0
+                            break;
+                        case 'w':
+                            if( is_x86 )
+                                MIR_TODO(mir_res, "Asm2 GCC: modifier " << f.modifier << " - " << stmt);
+                            m_of << 'w';    // aarch64: w0
                             break;
                         default:
                             MIR_TODO(mir_res, "Asm2 GCC: modifier " << f.modifier << " - " << stmt);
