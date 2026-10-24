@@ -277,7 +277,10 @@ public:
                 break;
             }
             GET_CHECK_TOK(tok, lex, TOK_COMMA);
-        } while( lex.lookahead(0) == TOK_STRING || lex.lookahead(0) == TOK_HASH );
+            // A template piece is a string literal or a macro that expands to one (`concat!(...)`); operands start
+            // with an identifier followed by `(` or `=`.
+        } while( lex.lookahead(0) == TOK_STRING || lex.lookahead(0) == TOK_HASH
+            || (lex.lookahead(0) == TOK_IDENT && lex.lookahead(1) == TOK_EXCLAM) );
 
 
         std::vector<AST::ExprNode_Asm2::Param>  params;
@@ -374,7 +377,7 @@ public:
                     dir = AsmCommon::Direction::InOut;
                 }
                 else {
-                    ERROR(sp, E0000, "Unknown asm fragment - `" << tok.ident().name << "`");
+                    ERROR(sp, E0000, "Unknown asm fragment - `" << v << "`");
                 }
 
                 GET_CHECK_TOK(tok, lex, TOK_PAREN_OPEN);
