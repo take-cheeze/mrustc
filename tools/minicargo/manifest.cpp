@@ -186,7 +186,7 @@ WorkspaceManifest WorkspaceManifest::load_from_toml(const ::helpers::path& works
             {
                 // Resolver version, doesn't really matter for minicargo?
             }
-            else if( key == "members" || key == "exclude" )
+            else if( key == "members" || key == "exclude" || key == "default-members" )
             {
                 // Ignore members list, for now.
             }
@@ -197,6 +197,9 @@ WorkspaceManifest WorkspaceManifest::load_from_toml(const ::helpers::path& works
                 const auto& key = key_val.path[2];
                 if( key == "edition" ) {
                     parse_edition(rv.m_edition, eh, key_val.value);
+                }
+                else if( key == "version" ) {
+                    rv.m_version = key_val.value.as_string();
                 }
                 else if( key == "rust-version" ) {
                     // Ignore, that's future-me's problem
@@ -484,9 +487,23 @@ void PackageManifest::fill_from_kv(ErrorHandler& eh, const WorkspaceManifest* wm
             }
             else if( key == "version" )
             {
+                ::std::string   ver;
+                if( key_val.path.size() == 3 && key_val.path[2] == "workspace" ) {
+                    // `version.workspace = true`
+                    if( !wm || wm->version() == "" ) {
+                        eh.error("`version.workspace` present, but no workspace specified a version");
+                    }
+                    if( !key_val.value.as_bool() ) {
+                        eh.error("`version.workspace = false` is not valid");
+                    }
+                    ver = wm->version();
+                }
+                else {
+                    ver = key_val.value.as_string();
+                }
                 try
                 {
-                    rv.m_version = PackageVersion::from_string(key_val.value.as_string());
+                    rv.m_version = PackageVersion::from_string(ver);
                     rv.m_version.patch_set = true;
                 }
                 catch(const ::std::invalid_argument& e)

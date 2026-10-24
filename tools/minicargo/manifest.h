@@ -337,6 +337,7 @@ class WorkspaceManifest
     ::std::map< ::std::string, ::helpers::path> m_patches;
 
     Edition m_edition = Edition::Unspec;
+    ::std::string   m_version;  // [workspace.package] version, for `version.workspace = true`
     struct Dependencies {
         ::std::vector<PackageRef>   main;
         ::std::vector<PackageRef>   build;
@@ -349,6 +350,7 @@ public:
     static WorkspaceManifest load_from_toml(const ::helpers::path& workspace_manifest_path);
 
     Edition edition() const { return m_edition; }
+    const ::std::string& version() const { return m_version; }
     const ::std::map< ::std::string, ::helpers::path>& patches() const { return m_patches; }
     const ::std::vector<PackageRef>& dependencies() const { return m_dependencies.main; }
     const ::std::vector<PackageRef>& build_dependencies() const { return m_dependencies.build; }
