@@ -976,8 +976,15 @@ namespace
                         se.options.fmt(m_of);
                         m_of << ")";
                         } break;
-                    TU_ARM(stmt, ScopeEnd, se) { (void)se;
-                        continue ;
+                    TU_ARM(stmt, ScopeEnd, se) {
+                        // The storage ends of locals, for a borrow checker that reads this dump (nfcxx).
+                        // Printed only on request, so other readers of the format are unaffected.
+                        static const bool print_scope_end = getenv("MRUSTC_MMIR_SCOPE_END") != nullptr;
+                        if( !print_scope_end || se.slots.empty() )
+                            continue ;
+                        m_of << "SCOPEEND";
+                        for(auto slot : se.slots)
+                            m_of << " var" << slot;
                         } break;
                     TU_ARM(stmt, Drop, se) {
                         m_of << "DROP " << fmt(se.slot);

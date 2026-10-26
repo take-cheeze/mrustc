@@ -807,7 +807,7 @@ int main(int argc, char *argv[])
         // - Generate monomorphised versions of all functions
         CompilePhaseV("Trans Monomorph", [&]() { Trans_Monomorphise_List(*hir_crate, items); });
         // - Do post-monomorph inlining
-        CompilePhaseV("MIR Optimise Inline", [&]() { MIR_OptimiseCrate_Inlining(*hir_crate, items, false); });
+        CompilePhaseV("MIR Optimise Inline", [&]() { MIR_OptimiseCrate_Inlining(*hir_crate, items, false, !params.debug.disable_mir_optimisations); });
 
         // - Expand constants in HIR (using ones that were monomorphised above)
         CompilePhaseV("MIR Cleanup 2", [&]() {
@@ -839,7 +839,7 @@ int main(int argc, char *argv[])
 
 
         // - Do post-monomorph inlining
-        CompilePhaseV("MIR Optimise Inline PostSave", [&]() { MIR_OptimiseCrate_Inlining(*hir_crate, items, true); });
+        CompilePhaseV("MIR Optimise Inline PostSave", [&]() { MIR_OptimiseCrate_Inlining(*hir_crate, items, true, !params.debug.disable_mir_optimisations); });
         // - Clean up ununused functions
         CompilePhaseV("Trans Enumerate Cleanup", [&]() { Trans_Enumerate_Cleanup(*hir_crate, items); });
 

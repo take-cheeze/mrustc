@@ -931,22 +931,17 @@ void MirBuilder::terminate_scope(const Span& sp, ScopeHandle scope, bool emit_cl
         // 2. Emit drops for all non-moved variables (share with below)
         drop_scope_values(scope_def);
 
-        // Emit ScopeEnd for all controlled values
-        #if 0
-        ::MIR::Statement::Data_ScopeEnd se;
-        if(const auto* e = scope_def.data.opt_Variables() ) {
-            se.vars = e->vars;
+        // Emit ScopeEnd for all controlled values. The statement has no effect on code generation;
+        // it is emitted only on request (nfcxx's borrow checker reads it from the monomir dump).
+        static const bool emit_scope_end = getenv("MRUSTC_MMIR_SCOPE_END") != nullptr;
+        if( emit_scope_end ) {
+            if(const auto* e = scope_def.data.opt_Owning() ) {
+                // Only push the ScopeEnd if there were variables to end
+                if( !e->slots.empty() ) {
+                    this->push_stmt(sp, ::MIR::Statement::make_ScopeEnd({ e->slots }));
+                }
+            }
         }
-        else if(const auto* e = scope_def.data.opt_Temporaries()) {
-            se.tmps = e->temporaries;
-        }
-        else {
-        }
-        // Only push the ScopeEnd if there were variables to end
-        if( !se.vars.empty() || !se.tmps.empty() ) {
-            this->push_stmt(sp, ::MIR::Statement( mv$(se) ));
-        }
-        #endif
     }
 
     // 3. Pop scope (last because `drop_scope_values` uses the stack)

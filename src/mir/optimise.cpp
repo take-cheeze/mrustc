@@ -6245,7 +6245,7 @@ void MIR_OptimiseCrate(::HIR::Crate& crate, bool do_minimal_optimisation)
     ov.visit_crate(crate);
 }
 
-void MIR_OptimiseCrate_Inlining(const ::HIR::Crate& crate, TransList& list, bool post_save)
+void MIR_OptimiseCrate_Inlining(const ::HIR::Crate& crate, TransList& list, bool post_save, bool do_inline)
 {
     TRACE_FUNCTION;
 
@@ -6322,14 +6322,15 @@ void MIR_OptimiseCrate_Inlining(const ::HIR::Crate& crate, TransList& list, bool
 
             if( mono_fcn.code )
             {
-                did_inline_on_pass |= MIR_OptimiseInline(resolve, ip, *mono_fcn.code, mono_fcn.arg_tys, mono_fcn.ret_ty, list);
+                if( do_inline )
+                    did_inline_on_pass |= MIR_OptimiseInline(resolve, ip, *mono_fcn.code, mono_fcn.arg_tys, mono_fcn.ret_ty, list);
 
                 MIR_Cleanup(resolve, ip, *mono_fcn.code, mono_fcn.arg_tys, mono_fcn.ret_ty);
             }
             else if( hir_fcn.m_code )
             {
                 auto& mir = hir_fcn.m_code.get_mir_or_error_mut(Span());
-                bool did_opt = MIR_OptimiseInline(resolve, ip, mir, hir_fcn.m_args, hir_fcn.m_return, list);
+                bool did_opt = do_inline && MIR_OptimiseInline(resolve, ip, mir, hir_fcn.m_args, hir_fcn.m_return, list);
                 mir.trans_enum_state = ::MIR::EnumCachePtr();   // Clear MIR enum cache
                 did_inline_on_pass |= did_opt;
 
